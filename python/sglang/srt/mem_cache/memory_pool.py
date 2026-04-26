@@ -2159,10 +2159,21 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             end_layer=end_layer,
         )
 
-        # Pre-allocated eps tensor so set_mla_kv_buffer doesn't allocate per
-        # call. Used as the zero-guard in dequant_scale = norm / max(qnorm, eps).
-        self._eps = torch.tensor(
-            1e-6, dtype=torch.bfloat16, device=self.device
+        # Zero-guard thresholds for the dequant-scale division. Matches the
+        # PR #23135 fused Triton kernel semantics exactly:
+        #   safe_qnorm = tl.where(qnorm > 1e-10, qnorm, 1.0)
+        #   dscale     = norm / safe_qnorm
+        # We use torch.where (NOT torch.maximum) so that when qnorm is tiny
+        # we REPLACE it with 1.0 (not clamp to some eps). Using torch.maximum
+        # with eps=1e-6 would divide by 1e-6 and produce huge dequant scales
+        # for near-zero quantized-vector norms — this was observed to
+        # produce garbage model output at end-to-end inference while still
+        # passing a cosine-similarity round-trip test.
+        self._qnorm_threshold = torch.tensor(
+            1e-10, dtype=torch.bfloat16, device=self.device
+        )
+        self._qnorm_replacement = torch.tensor(
+            1.0, dtype=torch.bfloat16, device=self.device
         )
 
     def _create_buffers(self):
@@ -2399,9 +2410,18 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             cfg.k_boundaries,
             self.turboquant_bits,
         )
-        # dequant_scale = norms / max(quant_norms, eps). Match MHA pool semantics.
-        # `self._eps` is preallocated at __init__ to avoid per-call allocation.
-        dequant_scale = norms / torch.maximum(quant_norms, self._eps)
+        # dequant_scale = norms / (qnorm if qnorm > 1e-10 else 1.0).
+        # Matches the PR #23135 fused Triton kernel math exactly (turboquant_quantize.py
+        # lines 63-65). torch.where replaces tiny qnorms with 1.0 rather than
+        # clamping to a small eps; clamping to 1e-6 produced dequant_scale
+        # magnitudes ~1e6× too large and broke end-to-end inference even
+        # though the in-memory round-trip still passed cosine-sim checks.
+        safe_qnorm = torch.where(
+            quant_norms > self._qnorm_threshold,
+            quant_norms,
+            self._qnorm_replacement,
+        )
+        dequant_scale = norms / safe_qnorm
 
         # Write packed nope + scale at loc.
         self.kv_nope_packed_buffer[layer_id_rel][loc] = packed
