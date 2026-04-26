@@ -2287,16 +2287,37 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         import logging
         logger = logging.getLogger(__name__)
         logger.info("TurboQuant: fusing inverse WHT rotation into o_proj weights...")
+        # Dtypes that are safe to rotate in-place: only real floating-point
+        # weights whose elementwise algebra matches the rotation math.
+        # Quantized / packed formats (FP8 with external scales, INT4/INT8 packed
+        # as int32/uint8 via compressed-tensors or GPTQ/AWQ/Marlin, etc.) cannot
+        # be safely rotated because the packed integer values do not represent
+        # a linear space that rotation preserves. Corrupting these silently
+        # breaks the model with no obvious error message.
+        _safe_fuse_dtypes = (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        )
         fused = 0
-        skipped_fp8 = False
+        skipped_quantized = 0
+        skipped_other = 0
         for _, mod in self.model.named_modules():
             if hasattr(mod, "o_proj") and hasattr(mod.o_proj, "weight"):
                 w = mod.o_proj.weight
-                # FP8 quantized weights have associated scale factors.
-                # Fusing rotation would corrupt the weight-scale relationship.
-                # Skip fusion and use runtime inverse rotation instead.
-                if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                    skipped_fp8 = True
+                # Skip any non-real-float dtype. This covers FP8 (both variants),
+                # INT4/INT8/UINT8 packed quant formats, and anything exotic.
+                if w.dtype not in _safe_fuse_dtypes:
+                    skipped_quantized += 1
+                    continue
+                # Additional guard: modules using quantized weight methods often
+                # expose qweight/qzeros/scales siblings even when .weight is a
+                # shim. If any of those attrs exist on the layer, skip.
+                if any(
+                    hasattr(mod.o_proj, attr)
+                    for attr in ("qweight", "qzeros", "scales", "weight_scale")
+                ):
+                    skipped_quantized += 1
                     continue
                 n_heads = w.shape[1] // tq_cfg.head_dim
                 if w.shape[1] % tq_cfg.head_dim == 0 and n_heads > 0:
@@ -2305,14 +2326,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         wf = tq_cfg.fuse_inverse_rotation_into_o_proj(wt, n_heads)
                         w.data.copy_(wf.t().contiguous())
                         fused += 1
-        if skipped_fp8:
+                else:
+                    skipped_other += 1
+        if skipped_quantized > 0:
             logger.info(
-                "TurboQuant: skipping rotation fusion (FP8 weights), "
-                "using runtime inverse rotation"
+                f"TurboQuant: skipping rotation fusion on {skipped_quantized} "
+                f"quantized o_proj layers (FP8 / INT4 / packed). "
+                f"Using runtime inverse rotation for those layers."
             )
-        elif fused > 0:
-            tq_cfg.output_rotation_fused = True
-            logger.info("TurboQuant: fused inverse rotation into %d o_proj layers", fused)
+        if skipped_other > 0:
+            logger.warning(
+                f"TurboQuant: {skipped_other} o_proj layers had unexpected "
+                f"shape and were skipped."
+            )
+        if fused > 0:
+            # Only mark as fused if ALL o_proj layers were fused. If some were
+            # skipped, the model has mixed-state o_proj layers and we must use
+            # runtime inverse rotation to stay correct.
+            if skipped_quantized == 0 and skipped_other == 0:
+                tq_cfg.output_rotation_fused = True
+                logger.info(
+                    "TurboQuant: fused inverse rotation into %d o_proj layers", fused
+                )
+            else:
+                logger.info(
+                    "TurboQuant: fused %d layers but skipped %d; "
+                    "using runtime inverse rotation for correctness.",
+                    fused,
+                    skipped_quantized + skipped_other,
+                )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""
