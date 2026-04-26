@@ -2376,9 +2376,15 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             f"qk_rope_head_dim {self.qk_rope_head_dim}"
         )
 
-        # Ensure inputs match the expected dtype for the quantize kernel.
-        # batched_quantize handles bf16/fp16 — cast if the model sends fp32.
-        if cache_k_nope.dtype not in (torch.bfloat16, torch.float16):
+        # Cast inputs to bfloat16 unconditionally for storage consistency.
+        # batched_quantize internally runs fp32, so no accuracy cost from
+        # a bf16 input; but its output `norms` tensor takes on the input
+        # dtype (line 164 of kv_turboquant.py: norms.to(x.dtype)). If we
+        # allowed fp16 input through, `norms` would be fp16 and the later
+        # division `norms / torch.maximum(quant_norms, self._eps)` would
+        # raise a dtype-mismatch error since `self._eps` is bf16.
+        # Casting here keeps all downstream arithmetic in bf16.
+        if cache_k_nope.dtype != torch.bfloat16:
             cache_k_nope = cache_k_nope.to(torch.bfloat16)
         if cache_k_rope.dtype != torch.bfloat16:
             cache_k_rope = cache_k_rope.to(torch.bfloat16)
