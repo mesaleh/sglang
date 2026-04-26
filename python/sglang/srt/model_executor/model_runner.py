@@ -2298,6 +2298,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         import logging
         logger = logging.getLogger(__name__)
+        # Skip on MLA path: MLATokenToKVPoolTurboQuant._dequant_nope already
+        # applies the inverse WHT on read, so downstream attention sees
+        # un-rotated KV and produces un-rotated output. Pre-rotating o_proj
+        # here would double-inverse-rotate via the compensation path and
+        # corrupt the output projection, producing token-salad despite
+        # numerically correct pool round-trip. For MHA TurboQuant the kernel
+        # returns attention output in rotated space and o_proj pre-rotation
+        # is the correct fusion, but that contract does not hold on MLA.
+        if self.use_mla_backend:
+            logger.info(
+                "TurboQuant+MLA: skipping o_proj rotation fusion "
+                "(MLA pool dequantizes+inverse-rotates on read; attention "
+                "output is already in original domain)."
+            )
+            return
         logger.info("TurboQuant: fusing inverse WHT rotation into o_proj weights...")
         # Dtypes that are safe to rotate in-place: only real floating-point
         # weights whose elementwise algebra matches the rotation math.
