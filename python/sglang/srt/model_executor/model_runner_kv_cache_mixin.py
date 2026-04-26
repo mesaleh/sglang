@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    MLATokenToKVPoolTurboQuant,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -438,7 +439,27 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if hasattr(self, "turboquant_bits"):
+                # MLA + TurboQuant: compressed nope + raw rope + per-token scale.
+                # The pool class itself enforces k_bits == 4 (raises otherwise),
+                # matching the sizing assumption in pool_configurator.py.
+                self.token_to_kv_pool = MLATokenToKVPoolTurboQuant(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    turboquant_bits=self.turboquant_bits,
+                    turboquant_k_bits=getattr(self, "turboquant_k_bits", 0),
+                    turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
+                    turboquant_uniform=getattr(self, "turboquant_uniform", False),
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
                     page_size=self.page_size,

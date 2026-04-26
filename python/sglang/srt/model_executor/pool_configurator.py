@@ -120,22 +120,48 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                cell_size = (cell_size // 2) + (
-                    (
-                        (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                        // scale_block_size
-                    )
+            if hasattr(mr, "turboquant_bits"):
+                # MLA + TurboQuant: nope half is packed k-bit + per-token scale,
+                # rope half stays uncompressed bf16. Matches storage layout in
+                # MLATokenToKVPoolTurboQuant.
+                #   nope_packed:  (lora_rank // 2) bytes    (4-bit: 2 values/byte)
+                #   scale:        2 bytes                   (bf16, one per token)
+                #   rope_raw:     qk_rope_head_dim * 2 bytes (bf16 unmodified)
+                # Only 4-bit is supported for MLA in this first implementation
+                # (the pool class raises on k_bits != 4). We assert here so the
+                # sizing math cannot silently diverge from what the pool creates.
+                k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+                assert k_bits == 4, (
+                    f"MLA TurboQuant pool sizing currently assumes 4-bit; "
+                    f"got k_bits={k_bits}. Update both sites together."
+                )
+                lora = model_config.kv_lora_rank
+                rope = model_config.qk_rope_head_dim
+                # 4-bit packed nope: 2 values per byte => lora // 2 bytes.
+                nope_packed_bytes = lora // 2
+                # Per-token dequant scale for nope (bf16).
+                scale_bytes = 2
+                # Raw rope (bf16).
+                rope_bytes = rope * 2
+                per_layer_per_token = nope_packed_bytes + scale_bytes + rope_bytes
+                cell_size = per_layer_per_token * num_layers
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                     * num_layers
                     * kv_size
                 )
+                if is_float4_e2m1fn_x2(kv_cache_dtype):
+                    # kv_scale_buffer
+                    scale_block_size = 16
+                    cell_size = (cell_size // 2) + (
+                        (
+                            (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                            // scale_block_size
+                        )
+                        * num_layers
+                        * kv_size
+                    )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
             if is_deepseek_nsa(model_config.hf_config):
