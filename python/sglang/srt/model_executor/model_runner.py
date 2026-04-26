@@ -2091,24 +2091,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.turboquant_v_bits = bits
                 self.turboquant_bits = bits
             self.kv_cache_dtype = torch.bfloat16
-            # TurboQuant fused decode kernel is Triton-only.
-            # Only override DECODE backend to triton; prefill keeps default (fa3/flashinfer)
-            # for maximum prefill throughput. Prefill reads from shared dequant buffer (bf16),
-            # which is compatible with any attention backend.
-            if self.server_args.decode_attention_backend is None or \
-               self.server_args.decode_attention_backend != "triton":
-                prev = self.server_args.decode_attention_backend or "default"
-                self.server_args.decode_attention_backend = "triton"
+            # TurboQuant fused decode kernel is Triton-only and MHA-only (from PR #23135).
+            # On the MLA path (e.g. Kimi K2.6, DeepSeek-V2), MLATokenToKVPoolTurboQuant
+            # dequantizes on read into a shared bf16 buffer, so flashmla / flashinfer-mla
+            # see ordinary bf16 tensors and need no TurboQuant awareness. Forcing the
+            # triton decode backend here would route MLA decode through an MHA-only
+            # kernel and produce garbage. Only override DECODE backend to triton on MHA.
+            if not self.use_mla_backend:
+                if self.server_args.decode_attention_backend is None or \
+                   self.server_args.decode_attention_backend != "triton":
+                    prev = self.server_args.decode_attention_backend or "default"
+                    self.server_args.decode_attention_backend = "triton"
+                    logger.info(
+                        f"TurboQuant: overriding decode-attention-backend={prev} → triton "
+                        f"(fused decode kernel). Prefill backend unchanged for optimal throughput."
+                    )
+            else:
                 logger.info(
-                    f"TurboQuant: overriding decode-attention-backend={prev} → triton "
-                    f"(fused decode kernel). Prefill backend unchanged for optimal throughput."
+                    "TurboQuant+MLA: keeping decode-attention-backend="
+                    f"{self.server_args.decode_attention_backend or 'default'} "
+                    "(MLA pool dequantizes on read; fused Triton decode kernel is MHA-only)."
                 )
             # Fused decode kernel supports symmetric and asymmetric 2-bit and 4-bit.
+            # On MLA path we never use the fused decode kernel, so CUDA graph stays
+            # governed by the chosen MLA backend (flashmla, flashinfer-mla) — not by
+            # has_fused. Only gate CUDA graph on the MHA path.
             has_fused = (
                 self.turboquant_k_bits in (2, 4)
                 and self.turboquant_v_bits in (2, 4)
             )
-            if not has_fused:
+            if not self.use_mla_backend and not has_fused:
                 if not self.server_args.disable_cuda_graph:
                     logger.warning(
                         f"TurboQuant K={self.turboquant_k_bits}bit V={self.turboquant_v_bits}bit: "
