@@ -2050,6 +2050,459 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
 
+class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
+    """TurboQuant KV cache for MLA (DeepSeek-V2/V3, Kimi K2-family) models.
+
+    MLA stores a shared latent per token of shape (kv_lora_rank + qk_rope_head_dim).
+    For Kimi K2.6: kv_lora_rank=512, qk_rope_head_dim=64, total=576.
+
+    Design:
+      - NOPE half (kv_lora_rank = 512): compressed via WHT rotation + k-bit
+        scalar quantization (TurboQuant, paper arXiv:2504.19874).
+      - ROPE half (qk_rope_head_dim = 64): stored UNCOMPRESSED in bfloat16.
+        Rotary phase does not tolerate random rotation; skipping it is the
+        safe default (closed PR #21628 reached the same conclusion via
+        SGLANG_KV_CACHE_TURBOQUANT_ROPE=0).
+
+    Effective compression at 4-bit nope, bf16 rope:
+        (lora_rank * 4 bits + rope_dim * 16 bits + scale overhead) /
+        ((lora_rank + rope_dim) * 16 bits)
+      = (512 * 0.5 + 64 * 2 + 2) B  /  (576 * 2 B)
+      = 386 / 1152  ≈  0.335  → ~3x compression vs bf16, ~1.5x vs fp8.
+
+    Storage layout (per layer):
+      - kv_nope_packed_buffer: (size+page, 1, lora_rank // 2) uint8
+          packed 4-bit nope indices (2 values per byte at 4-bit)
+      - kv_nope_scale_buffer: (size+page, 1) bfloat16
+          one dequant-scale (norm / max(qnorm, eps)) per token
+      - kv_rope_buffer: (size+page, 1, qk_rope_head_dim) bfloat16
+          raw rope values
+
+    Correctness approach:
+      This class overrides get_key_buffer / get_value_buffer / get_mla_kv_buffer
+      to dequantize on-demand into bf16 tensors with the same shapes attention
+      backends currently expect. No attention-backend changes required to boot.
+      Performance cost: dequant runs every attention call rather than once.
+      Acceptable for a first-cut validation; G3 (backend integration) will
+      add fused paths later.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        turboquant_bits: int = 4,
+        turboquant_k_bits: int = 0,
+        turboquant_v_bits: int = 0,
+        turboquant_uniform: bool = False,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        # For MLA, V is derived from the same latent as K (no separate V buffer).
+        # We honor turboquant_v_bits for API symmetry with the MHA pool, but
+        # apply a single bit_width to the nope-half latent.
+        # If the caller asked for asymmetric K/V bits, we warn and use K bits.
+        k_bits = turboquant_k_bits or turboquant_bits
+        v_bits = turboquant_v_bits or turboquant_bits
+        if v_bits != k_bits:
+            logger.warning(
+                "MLA TurboQuant: asymmetric K/V bits not meaningful (single "
+                "shared latent). Using k_bits=%d for the nope-half; ignoring "
+                "v_bits=%d.",
+                k_bits,
+                v_bits,
+            )
+        if k_bits != 4:
+            # 2-bit path is not yet wired for MLA; guard explicitly.
+            raise NotImplementedError(
+                f"MLA TurboQuant currently supports only 4-bit; got {k_bits}."
+            )
+        self.turboquant_bits = k_bits
+
+        # Build a TurboQuantConfig for the NOPE dim only. The WHT sign vectors
+        # and codebook all key off this dim; RoPE is stored raw, so no config
+        # is needed for it.
+        from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+        self.tq_config = TurboQuantConfig(
+            bit_width=k_bits,
+            head_dim=kv_lora_rank,
+            device=device,
+            k_bit_width=k_bits,
+            v_bit_width=k_bits,
+            uniform=turboquant_uniform,
+        )
+
+        # Guard: dim constraints for packing (2 values per byte at 4-bit).
+        # kv_lora_rank must be even. For Kimi K2.6 it is 512 (even).
+        if kv_lora_rank % 2 != 0:
+            raise ValueError(
+                f"MLA TurboQuant 4-bit requires kv_lora_rank even; got {kv_lora_rank}."
+            )
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        # Pre-allocated eps tensor so set_mla_kv_buffer doesn't allocate per
+        # call. Used as the zero-guard in dequant_scale = norm / max(qnorm, eps).
+        self._eps = torch.tensor(
+            1e-6, dtype=torch.bfloat16, device=self.device
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                lora = self.kv_lora_rank
+                rope = self.qk_rope_head_dim
+                packed_dim = lora // 2  # 4-bit: 2 values per byte
+
+                # Packed nope: uint8, 2 x 4-bit values per byte.
+                self.kv_nope_packed_buffer = [
+                    torch.zeros(
+                        (m, 1, packed_dim),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # Per-token dequant scale for nope (norm / max(quant_norm, eps)).
+                # Stored as bf16 to match MHA pool convention.
+                self.kv_nope_scale_buffer = [
+                    torch.zeros(
+                        (m, 1),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # RoPE stored uncompressed in bf16 (raw rotary values).
+                self.kv_rope_buffer = [
+                    torch.zeros(
+                        (m, 1, rope),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        # The parent MLATokenToKVPool.__init__ reads `self.kv_buffer` to build
+        # data_ptrs after _create_buffers returns. We don't have a single
+        # per-layer fused KV buffer, so alias kv_buffer to the packed nope
+        # buffer — external consumers that index data_ptrs (e.g. disagg) will
+        # see pointers to the compressed nope storage. Clients that need the
+        # full bf16 KV layout should call get_mla_kv_buffer / get_key_buffer,
+        # which dequantize on demand.
+        self.kv_buffer = self.kv_nope_packed_buffer
+
+    def _clear_buffers(self):
+        # Clear the alias first (breaks the reference cycle before we drop
+        # the real buffers), then drop each underlying buffer.
+        if hasattr(self, "kv_buffer"):
+            del self.kv_buffer
+        del self.kv_nope_packed_buffer
+        del self.kv_nope_scale_buffer
+        del self.kv_rope_buffer
+
+    def get_kv_size_bytes(self):
+        total = 0
+        for i in range(self.layer_num):
+            total += self.kv_nope_packed_buffer[i].nbytes
+            total += self.kv_nope_scale_buffer[i].nbytes
+            total += self.kv_rope_buffer[i].nbytes
+        return total
+
+    # ------------------------------------------------------------------
+    # On-demand dequant helpers
+    # ------------------------------------------------------------------
+
+    def _dequant_nope(
+        self,
+        packed: torch.Tensor,
+        dequant_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dequantize packed nope indices back to original-domain bf16.
+
+        Matches the semantics of the PR #23135 fused decode kernel:
+          value = centroid[index] * dequant_scale     (in rotated domain)
+          out   = inverse_WHT(value)                  (original domain)
+
+        We deliberately do NOT use `batched_dequantize` from the
+        kv_turboquant module: that helper normalizes reconstructed vectors
+        to unit norm before scaling by its `norms` argument. Our stored
+        `dequant_scale` = norm / max(quant_norm, eps) already absorbs the
+        norm-correction step, so applying batched_dequantize's internal
+        y_hat_norm pass would double-normalize and produce wrong magnitudes.
+
+        Args:
+            packed: (n, 1, lora_rank // 2) uint8 packed 4-bit indices.
+            dequant_scale: (n, 1) bf16 per-token scale.
+
+        Returns:
+            (n, 1, lora_rank) bfloat16 in the original (un-rotated) domain.
+        """
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            batched_dequantize_rotspace,
+        )
+
+        cfg = self.tq_config
+
+        # Step 1: unpack + centroid-lookup + multiply by dequant_scale
+        # (this stays in WHT-rotated space, matches the fused kernel's math).
+        x_rot = batched_dequantize_rotspace(
+            packed,
+            dequant_scale,
+            cfg.k_centroids,
+            self.turboquant_bits,
+            head_dim=self.kv_lora_rank,
+        )  # (n, 1, lora_rank) bf16
+
+        # Step 2: inverse WHT back to the original domain.
+        # Forward was D2 @ H_norm @ D1; inverse is D1 @ H_norm @ D2.
+        # cfg.inverse_rotate_output fuses the (signs2 * H * signs1) path
+        # into a single CUDA kernel via hadamard_transform_with_signs.
+        # Matches the same transform used by the fused decode kernel's Q
+        # path, keeping decode-space and dequant-space consistent.
+        y = cfg.inverse_rotate_output(x_rot)
+        # inverse_rotate_output returns fp32 regardless of input dtype;
+        # cast back to bf16 for downstream attention consumers.
+        return y.to(torch.bfloat16)
+
+    def _dequant_nope_full(self, layer_id_rel: int) -> torch.Tensor:
+        """Full-pool dequant — used by get_key_buffer fallbacks.
+
+        Shape: (size+page, 1, kv_lora_rank), dtype bf16.
+        Expensive: runs inverse WHT over every slot in the pool.
+        """
+        packed = self.kv_nope_packed_buffer[layer_id_rel]  # (m, 1, packed_dim)
+        scale = self.kv_nope_scale_buffer[layer_id_rel]  # (m, 1)
+        return self._dequant_nope(packed, scale)
+
+    def _get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        """Reconstruct the (nope||rope) layout that the baseline MLA pool
+        exposes: shape (size+page, 1, lora_rank+rope_dim), dtype bf16.
+
+        This is the expensive path: full inverse WHT on the entire pool
+        per call. Use only where callers expect the combined layout.
+        """
+        layer_id_rel = layer_id - self.start_layer
+        nope = self._dequant_nope_full(layer_id_rel)  # (m, 1, lora)
+        rope = self.kv_rope_buffer[layer_id_rel]  # (m, 1, rope)
+        return torch.cat([nope, rope], dim=-1)  # (m, 1, lora+rope)
+
+    # ------------------------------------------------------------------
+    # Overrides of MLATokenToKVPool accessors
+    # ------------------------------------------------------------------
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._get_fused_kv_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        # Baseline MLA returns kv_buffer[..., :kv_lora_rank] for V.
+        return self._dequant_nope_full(layer_id - self.start_layer)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """Single-tensor write (split into nope/rope and route to MLA path)."""
+        # cache_k is the full (tokens, 1, lora+rope) latent in the MLA convention.
+        # cache_v is ignored (MLA reuses latent for V).
+        assert cache_k.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim, (
+            f"set_kv_buffer expected dim {self.kv_lora_rank + self.qk_rope_head_dim}; "
+            f"got {cache_k.shape[-1]}"
+        )
+        cache_k_nope = cache_k[..., : self.kv_lora_rank].contiguous()
+        cache_k_rope = cache_k[..., self.kv_lora_rank:].contiguous()
+        self.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        """Quantize nope, store rope raw."""
+        from sglang.srt.layers.quantization.kv_turboquant import batched_quantize
+
+        layer_id_rel = layer.layer_id - self.start_layer
+
+        # Upstream shape conventions for MLA write callers vary: some pass
+        # (tokens, hidden) and some pass (tokens, 1, hidden). Normalize to
+        # (tokens, 1, hidden) for our quantizer.
+        if cache_k_nope.dim() == 2:
+            cache_k_nope = cache_k_nope.unsqueeze(1)
+        if cache_k_rope.dim() == 2:
+            cache_k_rope = cache_k_rope.unsqueeze(1)
+
+        assert cache_k_nope.shape[-1] == self.kv_lora_rank, (
+            f"nope last-dim {cache_k_nope.shape[-1]} != kv_lora_rank {self.kv_lora_rank}"
+        )
+        assert cache_k_rope.shape[-1] == self.qk_rope_head_dim, (
+            f"rope last-dim {cache_k_rope.shape[-1]} != "
+            f"qk_rope_head_dim {self.qk_rope_head_dim}"
+        )
+
+        # Ensure inputs match the expected dtype for the quantize kernel.
+        # batched_quantize handles bf16/fp16 — cast if the model sends fp32.
+        if cache_k_nope.dtype not in (torch.bfloat16, torch.float16):
+            cache_k_nope = cache_k_nope.to(torch.bfloat16)
+        if cache_k_rope.dtype != torch.bfloat16:
+            cache_k_rope = cache_k_rope.to(torch.bfloat16)
+
+        # Quantize nope
+        cfg = self.tq_config
+        packed, norms, quant_norms = batched_quantize(
+            cache_k_nope,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            self.turboquant_bits,
+        )
+        # dequant_scale = norms / max(quant_norms, eps). Match MHA pool semantics.
+        # `self._eps` is preallocated at __init__ to avoid per-call allocation.
+        dequant_scale = norms / torch.maximum(quant_norms, self._eps)
+
+        # Write packed nope + scale at loc.
+        self.kv_nope_packed_buffer[layer_id_rel][loc] = packed
+        self.kv_nope_scale_buffer[layer_id_rel][loc] = dequant_scale
+
+        # Write rope raw at loc.
+        self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Dequantize the requested tokens' nope and pass rope through.
+
+        This is the row-gathered fast path: we dequant only the rows at `loc`
+        rather than the whole pool. Still O(n * lora_rank * log(lora_rank))
+        for the inverse WHT, but with n = loc.shape[0] rather than size+page.
+        """
+        layer_id_rel = layer.layer_id - self.start_layer
+        dst_dtype = dst_dtype or torch.bfloat16
+
+        packed_rows = self.kv_nope_packed_buffer[layer_id_rel][loc]  # (n, 1, packed_dim)
+        scale_rows = self.kv_nope_scale_buffer[layer_id_rel][loc]  # (n, 1)
+        rope_rows = self.kv_rope_buffer[layer_id_rel][loc]  # (n, 1, rope_dim)
+
+        nope = self._dequant_nope(packed_rows, scale_rows)
+
+        if nope.dtype != dst_dtype:
+            nope = nope.to(dst_dtype)
+        if rope_rows.dtype != dst_dtype:
+            rope_rows = rope_rows.to(dst_dtype)
+        return nope, rope_rows
+
+    def get_contiguous_buf_infos(self):
+        """Disaggregation support — return packed-nope pointers per layer.
+
+        Note: consumers that expect the baseline (lora+rope) bf16 layout
+        will see only the packed nope here. Full KV transfer across
+        disagg boundaries is not yet supported for TurboQuant MLA;
+        this method returns something coherent so bookkeeping paths don't
+        crash, but cross-instance KV migration will need a proper
+        serialize/deserialize path in a later change.
+        """
+        kv_data_ptrs = [
+            self.kv_nope_packed_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        kv_data_lens = [
+            self.kv_nope_packed_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        kv_item_lens = [
+            self.kv_nope_packed_buffer[i][0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_cpu_copy(self, indices, **kwargs):
+        """Copy quantized buffers to CPU. Keeps them in their compressed
+        form on the host so round-trip stays symmetric (CPU -> GPU preserves
+        quantized storage). Full-bf16 reconstruction only happens in
+        get_mla_kv_buffer / get_key_buffer at actual attention time.
+        """
+        torch.cuda.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            layer_chunks = []
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                packed_cpu = self.kv_nope_packed_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                scale_cpu = self.kv_nope_scale_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                rope_cpu = self.kv_rope_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                layer_chunks.append((packed_cpu, scale_cpu, rope_cpu))
+            kv_cache_cpu.append(layer_chunks)
+        torch.cuda.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+        """Inverse of get_cpu_copy: restore quantized buffers from host."""
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                packed_cpu, scale_cpu, rope_cpu = kv_cache_cpu[layer_id][
+                    i // chunk_size
+                ]
+                dev = self.kv_nope_packed_buffer[0].device
+                self.kv_nope_packed_buffer[layer_id][chunk_indices] = packed_cpu.to(
+                    dev, non_blocking=True
+                )
+                self.kv_nope_scale_buffer[layer_id][chunk_indices] = scale_cpu.to(
+                    dev, non_blocking=True
+                )
+                self.kv_rope_buffer[layer_id][chunk_indices] = rope_cpu.to(
+                    dev, non_blocking=True
+                )
+        torch.cuda.synchronize()
+
+
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
