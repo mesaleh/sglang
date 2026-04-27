@@ -637,3 +637,204 @@ class FlashMLAMultiStepDraftBackend:
             )
 
         self.common_template(forward_batch, call_fn)
+
+
+class TurboQuantMLABackend(FlashMLABackend):
+    """MLA decode backend that reads packed TurboQuant KV directly via a fused
+    Triton kernel, avoiding the per-call full-pool dequant that Stage A pays.
+
+    Subclasses FlashMLABackend. Inherits:
+      - __init__  (we re-use all the paging / metadata setup)
+      - init_forward_metadata (decode + extend + target_verify)
+      - init_cuda_graph_state / capture / replay
+      - forward_extend (falls through to parent — Stage A dequant-on-read path)
+
+    Overrides only forward_decode. Extend paths keep using the Stage A
+    dequant-on-read + flashmla kernel: flashmla's forward_extend calls
+    pool.get_key_buffer() which returns the un-rotated bf16 view Stage A
+    produces, so it Just Works. Only decode swaps to our fused path.
+
+    Selection: set env SGLANG_TQ_MLA_FUSED_DECODE=1 and the model runner's
+    attention-backend dispatch returns this class. See server_args.py
+    _handle_attention_backend_selection for the wire-up.
+
+    Design doc: OmniSec/Inference/Performance Optimization/
+      Design - Stage C (fused Triton MLA decode on packed KV).md
+    """
+
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
+        kv_last_page_len_buf: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
+        )
+
+        # Assert the pool is TurboQuant-MLA (hard requirement — this backend
+        # reads packed buffers directly). Use isinstance per hicache lesson
+        # (Kernel Engineering Rule KE-11 style — explicit type check).
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        assert isinstance(model_runner.token_to_kv_pool, MLATokenToKVPoolTurboQuant), (
+            f"TurboQuantMLABackend requires MLATokenToKVPoolTurboQuant device "
+            f"pool; got {type(model_runner.token_to_kv_pool).__name__}. "
+            f"Set --kv-cache-dtype turboquant_4bit."
+        )
+
+        # Hold refs for convenience in forward_decode.
+        self._tq_pool = model_runner.token_to_kv_pool
+        self._tq_config = self._tq_pool.tq_config
+
+        # Pre-allocated stage-1 output + LSE. Sized for max_bs * max_q_heads *
+        # max_kv_splits * lora_rank. Re-used across forwards; stable address
+        # under CUDA graph capture.
+        # We allocate lazily on first forward_decode (we don't know max_bs
+        # here at init time in a CG-safe way).
+        self._stage1_logits = None
+        self._stage1_lse = None
+
+    def _ensure_stage1_buffers(self, bs: int, max_kv_splits: int, device, dtype=torch.float32):
+        """Lazy-alloc stage-1 partials buffer. Grows if larger bs arrives;
+        steady-state address is stable so CUDA graph capture sees fixed size
+        (because bs is itself a capture-time constant)."""
+        q_heads = self.num_q_heads
+        lora_rank = self.kv_lora_rank
+        needed_logits_shape = (bs, q_heads, max_kv_splits, lora_rank)
+        needed_lse_shape = (bs, q_heads, max_kv_splits)
+        if (
+            self._stage1_logits is None
+            or tuple(self._stage1_logits.shape) != needed_logits_shape
+        ):
+            self._stage1_logits = torch.empty(
+                needed_logits_shape, dtype=dtype, device=device
+            )
+            self._stage1_lse = torch.empty(
+                needed_lse_shape, dtype=dtype, device=device
+            )
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+    ):
+        # Write K to the pool (set_mla_kv_buffer path) — unchanged from parent.
+        cache_loc = forward_batch.out_cache_loc
+        if k is not None:
+            assert v is not None
+            if save_kv_cache:
+                forward_batch.token_to_kv_pool.set_kv_buffer(
+                    layer, cache_loc, k, v
+                )
+
+        from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
+            tq_mla_decode_attention_fwd,
+        )
+
+        bs = forward_batch.batch_size
+        q_heads = layer.tp_q_head_num
+        lora_rank = self.kv_lora_rank
+        rope_dim = self.qk_rope_head_dim
+        full_dim = lora_rank + rope_dim  # = head_dim = 576 for Kimi K2.6
+
+        # Q comes in shape (bs, q_heads * full_dim) or (bs, 1, q_heads, full_dim).
+        # Reshape to (bs, q_heads, full_dim), then split nope | rope.
+        reshape_q = q.view(bs, q_heads, full_dim)
+        q_nope = reshape_q[:, :, :lora_rank].contiguous()
+        q_rope = reshape_q[:, :, lora_rank:].contiguous()
+
+        # --- Fix 2 (Phase 1 findings): rotate Q_nope into WHT domain ---
+        # This is the move that activates the orthogonality trick, letting the
+        # kernel dot rotated Q against rotated K without needing per-row
+        # inverse Hadamard.
+        q_nope_rot = self._tq_config.rotate_query(q_nope)
+
+        # Pool references (current layer). Kernel reads these directly.
+        layer_id_rel = layer.layer_id - self._tq_pool.start_layer
+        k_nope_packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+        k_scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
+        k_rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
+        k_centroids = self._tq_config.k_centroids
+        uniform = getattr(self._tq_config, "uniform", False)
+
+        # Paging metadata already computed in init_forward_metadata:
+        # block_kv_indices is (bs, max_seqlen_pad) of pool-row indices.
+        # Flatten to 1D and build a kv_indptr that the fused kernel expects.
+        block_kv_indices = self.forward_metadata.block_kv_indices[:bs]
+        # Construct kv_indptr [0, seq_lens[0], seq_lens[0]+seq_lens[1], ...].
+        # Staying device-side for CG-compat (Kernel Engineering Rule KE-4).
+        seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
+        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=seq_lens.device)
+        # Pattern from triton_backend.py line 277: assignment does implicit
+        # int64→int32 cast; `out=` would be stricter about dtype match.
+        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
+        # Flatten block_kv_indices with seq-len masking — real indices first.
+        # The fused kernel uses kv_indices[kv_indptr[b]..kv_indptr[b+1]] per batch.
+        # block_kv_indices is shape (bs, max_seqlen_pad); flatten with mask.
+        # Since seq_lens[b] <= max_seqlen_pad, only the first seq_lens[b] entries
+        # of block_kv_indices[b] are real; flattening preserves that structure
+        # if we slice to seq_lens per batch and concat. But flattening the full
+        # block_kv_indices and indexing via kv_indptr is only correct when
+        # each batch's row has exactly max_seqlen_pad entries — not true here.
+        # Workaround: build a packed flat kv_indices tensor the kernel reads.
+        # Total length = sum(seq_lens) — device-side cumsum gives us that.
+        #
+        # For v1 correctness, keep it simple: use block_kv_indices as-is with a
+        # per-batch starting offset = b * max_seqlen_pad, and pass seq_lens
+        # instead of kv_indptr. But our kernel expects flat kv_indices+indptr.
+        #
+        # Choose the flat packing. Since seq_lens is dynamic per request, we
+        # build kv_indices by gathering valid entries from block_kv_indices.
+        max_seqlen_pad = block_kv_indices.shape[1]
+        positions = torch.arange(max_seqlen_pad, device=seq_lens.device, dtype=torch.int32)
+        valid_mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)  # (bs, max_seqlen_pad)
+        kv_indices = block_kv_indices[valid_mask].contiguous().to(torch.int32)
+
+        # num_kv_splits: reuse flashmla metadata for the split count.
+        num_kv_splits = self.forward_metadata.num_splits[:bs].to(torch.int32)
+        # max_kv_splits: an upper bound to size the stage-1 output.
+        max_kv_splits = int(num_kv_splits.max().item()) if bs > 0 else 1
+        # ^ NOTE: .item() here is a host-sync and NOT CG-compatible. For v1 we
+        # accept it (CUDA graphs will be off on this backend until Phase 3).
+        # Remove before shipping with graphs on.
+
+        # Stage-1 output buffers
+        self._ensure_stage1_buffers(bs, max_kv_splits, q_nope.device)
+
+        # Output in rotated nope space (stage-2 writes here)
+        o_rotated = torch.empty(
+            (bs, q_heads, lora_rank), dtype=q_nope.dtype, device=q_nope.device
+        )
+
+        tq_mla_decode_attention_fwd(
+            q_nope_rotated=q_nope_rot,
+            q_rope=q_rope,
+            k_nope_packed=k_nope_packed,
+            k_scale=k_scale,
+            k_rope=k_rope,
+            k_centroids=k_centroids,
+            o=o_rotated,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            att_logits=self._stage1_logits,
+            att_lse=self._stage1_lse,
+            num_kv_splits=num_kv_splits,
+            max_kv_splits=max_kv_splits,
+            sm_scale=layer.scaling,
+            logit_cap=getattr(layer, "logit_cap", 0.0) or 0.0,
+            uniform=uniform,
+        )
+
+        # --- Fix 1 (Phase 1 findings): un-rotate the output ---
+        # Kernel output is in rotated nope space. Apply inverse Hadamard once
+        # on the small (bs, q_heads, lora_rank) tensor via the CUDA helper.
+        o = self._tq_config.inverse_rotate_output(o_rotated).to(q_nope.dtype)
+
+        # Flashmla backend returns (bs * q_heads, v_head_dim). Match that.
+        return o.view(-1, q_heads * lora_rank)

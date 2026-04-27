@@ -119,6 +119,26 @@ def create_flex_attention_backend(runner):
 
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
+    """Create the flashmla backend. Promoted to TurboQuantMLABackend when
+    both SGLANG_TQ_MLA_FUSED_DECODE=1 is set AND the pool is
+    MLATokenToKVPoolTurboQuant. Default remains FlashMLABackend unchanged.
+    """
+    import os as _os
+
+    if _os.environ.get("SGLANG_TQ_MLA_FUSED_DECODE", "0") == "1":
+        try:
+            from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+        except ImportError:
+            MLATokenToKVPoolTurboQuant = None
+        if MLATokenToKVPoolTurboQuant is not None and isinstance(
+            runner.token_to_kv_pool, MLATokenToKVPoolTurboQuant
+        ):
+            from sglang.srt.layers.attention.flashmla_backend import (
+                TurboQuantMLABackend,
+            )
+
+            return TurboQuantMLABackend(runner)
+
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
     return FlashMLABackend(runner)
