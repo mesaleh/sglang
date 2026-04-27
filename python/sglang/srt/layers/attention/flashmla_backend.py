@@ -12,7 +12,10 @@ import triton
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
-from sglang.srt.layers.attention.utils import create_flashmla_kv_indices_triton
+from sglang.srt.layers.attention.utils import (
+    create_flashinfer_kv_indices_triton,
+    create_flashmla_kv_indices_triton,
+)
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -766,38 +769,33 @@ class TurboQuantMLABackend(FlashMLABackend):
         k_centroids = self._tq_config.k_centroids
         uniform = getattr(self._tq_config, "uniform", False)
 
-        # Paging metadata already computed in init_forward_metadata:
-        # block_kv_indices is (bs, max_seqlen_pad) of pool-row indices.
-        # Flatten to 1D and build a kv_indptr that the fused kernel expects.
-        block_kv_indices = self.forward_metadata.block_kv_indices[:bs]
-        # Construct kv_indptr [0, seq_lens[0], seq_lens[0]+seq_lens[1], ...].
-        # Staying device-side for CG-compat (Kernel Engineering Rule KE-4).
+        # Build TOKEN-indexed flat kv_indices for the fused kernel.
+        #
+        # IMPORTANT: cannot reuse self.forward_metadata.block_kv_indices here.
+        # That tensor is PAGE-indexed (page_id = pool_row // PAGE_SIZE=64),
+        # produced by create_flashmla_kv_indices_triton for flashmla's native
+        # page-based reader (`k_cache.view(-1, PAGE_SIZE, ...)` with block_table).
+        # Our kernel reads individual pool rows, so we need per-TOKEN pool
+        # indices. Same pattern as triton_backend.py init_forward_metadata.
         seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
         kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=seq_lens.device)
-        # Pattern from triton_backend.py line 277: assignment does implicit
-        # int64→int32 cast; `out=` would be stricter about dtype match.
+        # Assignment does implicit int64→int32 cast (pattern from triton_backend.py).
         kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-        # Flatten block_kv_indices with seq-len masking — real indices first.
-        # The fused kernel uses kv_indices[kv_indptr[b]..kv_indptr[b+1]] per batch.
-        # block_kv_indices is shape (bs, max_seqlen_pad); flatten with mask.
-        # Since seq_lens[b] <= max_seqlen_pad, only the first seq_lens[b] entries
-        # of block_kv_indices[b] are real; flattening preserves that structure
-        # if we slice to seq_lens per batch and concat. But flattening the full
-        # block_kv_indices and indexing via kv_indptr is only correct when
-        # each batch's row has exactly max_seqlen_pad entries — not true here.
-        # Workaround: build a packed flat kv_indices tensor the kernel reads.
-        # Total length = sum(seq_lens) — device-side cumsum gives us that.
-        #
-        # For v1 correctness, keep it simple: use block_kv_indices as-is with a
-        # per-batch starting offset = b * max_seqlen_pad, and pass seq_lens
-        # instead of kv_indptr. But our kernel expects flat kv_indices+indptr.
-        #
-        # Choose the flat packing. Since seq_lens is dynamic per request, we
-        # build kv_indices by gathering valid entries from block_kv_indices.
-        max_seqlen_pad = block_kv_indices.shape[1]
-        positions = torch.arange(max_seqlen_pad, device=seq_lens.device, dtype=torch.int32)
-        valid_mask = positions.unsqueeze(0) < seq_lens.unsqueeze(1)  # (bs, max_seqlen_pad)
-        kv_indices = block_kv_indices[valid_mask].contiguous().to(torch.int32)
+        # Total tokens across batch. .item() is a host-sync — acceptable for v1
+        # since CUDA graphs are off on this backend anyway (Phase 3 cleans this).
+        total_kv_tokens = int(kv_indptr[bs].item())
+        kv_indices = torch.empty(
+            total_kv_tokens, dtype=torch.int32, device=seq_lens.device
+        )
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            forward_batch.req_pool_indices[:bs],
+            seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
 
         # num_kv_splits: reuse flashmla metadata for the split count.
         num_kv_splits = self.forward_metadata.num_splits[:bs].to(torch.int32)
