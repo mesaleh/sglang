@@ -80,7 +80,7 @@ If an upstream PR is still open and we've taken it as a seed (see [Kimi K2.6 Tur
 - **No AI attribution.** Per Omniva's working agreement (see vault `CLAUDE.md` files), nothing in commit messages, MR descriptions, or PR bodies references Claude, AI assistants, or co-authored-by.
 - **No backports of corporate context** unless the commit absolutely needs it. Commits should read as stand-alone engineering work — a future contributor from elsewhere in Omniva (or the open-source community, if the commit gets upstreamed) shouldn't need internal-doc pointers to understand the change.
 
-## What's currently on `omniva-main`
+## What's currently on `omniva-main` (after feat/mla-hicache-transfer merge, 2026-04-26)
 
 As of 2026-04-26, `omniva-main` has 9 commits on top of upstream `sgl-project/sglang:main`:
 
