@@ -691,13 +691,22 @@ class TurboQuantMLABackend(FlashMLABackend):
         self._tq_pool = model_runner.token_to_kv_pool
         self._tq_config = self._tq_pool.tq_config
 
-        # Pre-allocated stage-1 output + LSE. Sized for max_bs * max_q_heads *
-        # max_kv_splits * lora_rank. Re-used across forwards; stable address
-        # under CUDA graph capture.
-        # We allocate lazily on first forward_decode (we don't know max_bs
-        # here at init time in a CG-safe way).
-        self._stage1_logits = None
-        self._stage1_lse = None
+        # Fixed stage-1 split count. Compile-time constant — avoids a
+        # per-forward `.item()` host sync on max_kv_splits, which is one
+        # of the two host syncs that blocked CUDA graph capture in v1.
+        # Same pattern as triton_backend.py's static_kv_splits fallback.
+        self._tq_max_kv_splits = 8
+
+        # Persistent CG-safe buffers. Pre-allocated in init_cuda_graph_state
+        # at max_bs and filled at replay time (which runs before the captured
+        # graph launches). forward_decode reads these with zero allocation.
+        # Non-CG path also uses them via _ensure_fallback_buffers.
+        self._tq_kv_indices = None         # (max_bs * max_context_len,) int32
+        self._tq_kv_indptr = None          # (max_bs + 1,) int32
+        self._tq_num_kv_splits = None      # (max_bs,) int32 — filled with _tq_max_kv_splits
+        self._tq_stage1_logits = None      # (max_bs, q_heads, max_kv_splits, lora_rank) fp32
+        self._tq_stage1_lse = None         # (max_bs, q_heads, max_kv_splits) fp32
+        self._tq_o_rotated = None          # (max_bs, q_heads, lora_rank) bf16
 
         # Boot-time visibility: confirms this class (not base FlashMLABackend)
         # is actually instantiated in the live pod. One-line per rank at init.
@@ -705,26 +714,238 @@ class TurboQuantMLABackend(FlashMLABackend):
         logging.getLogger(__name__).info(
             "TurboQuantMLABackend active (Stage C fused Triton MLA decode)."
         )
-        self._first_decode_logged = False
 
-    def _ensure_stage1_buffers(self, bs: int, max_kv_splits: int, device, dtype=torch.float32):
-        """Lazy-alloc stage-1 partials buffer. Grows if larger bs arrives;
-        steady-state address is stable so CUDA graph capture sees fixed size
-        (because bs is itself a capture-time constant)."""
+    def _tq_ensure_buffers(self, max_bs: int, device):
+        """Allocate all Stage C hot-path buffers sized for max_bs.
+
+        Called from init_cuda_graph_state (when CG enabled) and lazily from
+        init_forward_metadata on non-CG path. Buffer addresses are stable
+        across forwards so CUDA graph capture sees fixed memory regions.
+
+        Grows on demand: if a larger max_bs arrives (e.g. CG init fires
+        after a smaller-bs warmup allocated buffers), we reallocate at the
+        larger size. Buffers are never shrunk.
+        """
+        if (
+            self._tq_stage1_logits is not None
+            and self._tq_stage1_logits.shape[0] >= max_bs
+        ):
+            return
+
         q_heads = self.num_q_heads
         lora_rank = self.kv_lora_rank
-        needed_logits_shape = (bs, q_heads, max_kv_splits, lora_rank)
-        needed_lse_shape = (bs, q_heads, max_kv_splits)
-        if (
-            self._stage1_logits is None
-            or tuple(self._stage1_logits.shape) != needed_logits_shape
-        ):
-            self._stage1_logits = torch.empty(
-                needed_logits_shape, dtype=dtype, device=device
+        max_splits = self._tq_max_kv_splits
+        # Max tokens across all batches = max_bs * max_context_len. This is
+        # the ceiling kv_indices can ever need (bs=max_bs all at max_seqlen).
+        max_total_tokens = max_bs * self.max_context_len
+
+        self._tq_kv_indices = torch.empty(
+            max_total_tokens, dtype=torch.int32, device=device
+        )
+        self._tq_kv_indptr = torch.zeros(
+            max_bs + 1, dtype=torch.int32, device=device
+        )
+        # Fixed split count — fill once; kernel reads kv_splits[b] per batch.
+        self._tq_num_kv_splits = torch.full(
+            (max_bs,), max_splits, dtype=torch.int32, device=device
+        )
+        self._tq_stage1_logits = torch.empty(
+            (max_bs, q_heads, max_splits, lora_rank),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._tq_stage1_lse = torch.empty(
+            (max_bs, q_heads, max_splits),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._tq_o_rotated = torch.empty(
+            (max_bs, q_heads, lora_rank),
+            dtype=self.q_data_type,
+            device=device,
+        )
+
+    def _tq_warmup_kernel(self, device):
+        """Pre-compile the Stage C Triton kernel so its first launch doesn't
+        happen inside CUDA graph capture (JIT during capture = broken graph).
+
+        Runs a bs=1, seq_len=64 decode with dummy inputs. Pool buffers are
+        read from the real pool (zero-init is fine at warmup time — nothing
+        is actually stored there yet).
+        """
+        from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
+            tq_mla_decode_attention_fwd,
+        )
+
+        q_heads = self.num_q_heads
+        lora_rank = self.kv_lora_rank
+        rope_dim = self.qk_rope_head_dim
+        max_splits = self._tq_max_kv_splits
+
+        q_nope_rot = torch.zeros(
+            (1, q_heads, lora_rank), dtype=self.q_data_type, device=device
+        )
+        q_rope = torch.zeros(
+            (1, q_heads, rope_dim), dtype=self.q_data_type, device=device
+        )
+        o = torch.empty(
+            (1, q_heads, lora_rank), dtype=self.q_data_type, device=device
+        )
+        kv_indptr = torch.tensor([0, 64], dtype=torch.int32, device=device)
+        kv_indices = torch.zeros(64, dtype=torch.int32, device=device)
+        num_kv_splits = torch.full(
+            (1,), max_splits, dtype=torch.int32, device=device
+        )
+        att_logits = torch.empty(
+            (1, q_heads, max_splits, lora_rank),
+            dtype=torch.float32,
+            device=device,
+        )
+        att_lse = torch.empty(
+            (1, q_heads, max_splits), dtype=torch.float32, device=device
+        )
+
+        # Read real pool buffers for layer 0 — compile picks up their dtype
+        # + strides, so first real forward doesn't recompile.
+        layer_id_rel = 0
+        k_nope_packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+        k_scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
+        k_rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
+        k_centroids = self._tq_config.k_centroids
+        uniform = getattr(self._tq_config, "uniform", False)
+
+        tq_mla_decode_attention_fwd(
+            q_nope_rotated=q_nope_rot,
+            q_rope=q_rope,
+            k_nope_packed=k_nope_packed,
+            k_scale=k_scale,
+            k_rope=k_rope,
+            k_centroids=k_centroids,
+            o=o,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            att_logits=att_logits,
+            att_lse=att_lse,
+            num_kv_splits=num_kv_splits,
+            max_kv_splits=max_splits,
+            sm_scale=self.scaling,
+            logit_cap=0.0,
+            uniform=uniform,
+        )
+        torch.cuda.synchronize()
+
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        block_kv_indices: Optional[torch.Tensor] = None,
+    ):
+        # Parent builds flashmla's own CG buffers (block_kv_indices, mla
+        # metadata, num_splits). We keep that working since forward_extend
+        # and the target-verify path still use them.
+        super().init_cuda_graph_state(max_bs, max_num_tokens, block_kv_indices)
+
+        # Add Stage C's own CG-safe buffers. These are read by forward_decode
+        # when SGLANG_TQ_MLA_FUSED_DECODE=1 is set.
+        device = self.req_to_token.device
+        self._tq_ensure_buffers(max_bs, device)
+
+        # Compile the Stage C Triton kernel before graph capture starts.
+        # A JIT compile inside capture produces a broken graph with a
+        # subtle "kernel missing" symptom at replay.
+        self._tq_warmup_kernel(device)
+
+    def _tq_build_kv_indices(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Fill self._tq_kv_indptr[:bs+1] and self._tq_kv_indices into
+        pre-allocated buffers. No new allocations — CG-safe.
+
+        kv_indptr is prefix-sum of seq_lens (exclusive). kv_indices is the
+        flat concatenation of per-batch req_to_token rows, written directly
+        into the pre-allocated max-sized buffer.
+        """
+        seq_lens_i32 = seq_lens[:bs].to(torch.int32)
+        # Write cumsum into pre-allocated kv_indptr. Implicit int64→int32
+        # cast on assignment matches triton_backend.py pattern.
+        self._tq_kv_indptr[0] = 0
+        self._tq_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
+
+        # Fill kv_indices in-place via the flashinfer triton kernel. It
+        # writes only sum(seq_lens) entries; the rest of the pre-allocated
+        # buffer stays garbage but is never read (bounded by kv_indptr).
+        create_flashinfer_kv_indices_triton[(bs,)](
+            self.req_to_token,
+            req_pool_indices[:bs],
+            seq_lens_i32,
+            self._tq_kv_indptr,
+            None,
+            self._tq_kv_indices,
+            self.req_to_token.stride(0),
+        )
+
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        # Run parent first to populate flashmla's block_kv_indices, mla
+        # metadata, and num_splits — still needed for extend/target_verify.
+        super().init_forward_metadata(forward_batch)
+
+        # Stage C additions: our token-indexed kv_indices + kv_indptr. Built
+        # once per forward at init time so forward_decode is alloc-free.
+        if forward_batch.forward_mode.is_decode_or_idle():
+            bs = forward_batch.batch_size
+            # Non-CG path lazy-allocates buffers sized at runtime bs. This
+            # is the path used when --disable-cuda-graph is set. Shape is
+            # picked from the real bs (not max_bs) since we're not capturing.
+            if self._tq_stage1_logits is None:
+                self._tq_ensure_buffers(bs, forward_batch.seq_lens.device)
+            self._tq_build_kv_indices(
+                bs, forward_batch.req_pool_indices, forward_batch.seq_lens
             )
-            self._stage1_lse = torch.empty(
-                needed_lse_shape, dtype=dtype, device=device
-            )
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional["SpecInput"],
+    ):
+        # Parent fills block_kv_indices + mla_metadata + num_splits for the
+        # forward_metadata object. We re-use it and additionally populate
+        # Stage C's own kv_indptr + kv_indices into the pre-allocated pool.
+        super().init_forward_metadata_capture_cuda_graph(
+            bs, num_tokens, req_pool_indices, seq_lens,
+            encoder_lens, forward_mode, spec_info,
+        )
+        if forward_mode.is_decode_or_idle():
+            self._tq_build_kv_indices(bs, req_pool_indices, seq_lens)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional["SpecInput"],
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        # Replay-time metadata build runs on the CPU before the captured
+        # graph launches, so host-sync operations ARE allowed here. Parent
+        # already does an .item() on seq_lens_cpu.max() — we inherit that
+        # and just add our own in-place buffer refresh.
+        super().init_forward_metadata_replay_cuda_graph(
+            bs, req_pool_indices, seq_lens, seq_lens_sum,
+            encoder_lens, forward_mode, spec_info, seq_lens_cpu,
+        )
+        if forward_mode.is_decode_or_idle():
+            self._tq_build_kv_indices(bs, req_pool_indices, seq_lens[:bs])
 
     def forward_decode(
         self,
@@ -735,13 +956,6 @@ class TurboQuantMLABackend(FlashMLABackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
-        if not self._first_decode_logged:
-            import logging
-            logging.getLogger(__name__).info(
-                "TurboQuantMLABackend.forward_decode hit (layer %d, bs=%d, q_heads=%d)",
-                layer.layer_id, forward_batch.batch_size, layer.tp_q_head_num,
-            )
-            self._first_decode_logged = True
         # Write K to the pool (set_mla_kv_buffer path) — unchanged from parent.
         cache_loc = forward_batch.out_cache_loc
         if k is not None:
@@ -760,6 +974,7 @@ class TurboQuantMLABackend(FlashMLABackend):
         lora_rank = self.kv_lora_rank
         rope_dim = self.qk_rope_head_dim
         full_dim = lora_rank + rope_dim  # = head_dim = 576 for Kimi K2.6
+        max_splits = self._tq_max_kv_splits
 
         # Q comes in shape (bs, q_heads * full_dim) or (bs, 1, q_heads, full_dim).
         # Reshape to (bs, q_heads, full_dim), then split nope | rope.
@@ -768,12 +983,9 @@ class TurboQuantMLABackend(FlashMLABackend):
         q_rope = reshape_q[:, :, lora_rank:].contiguous()
 
         # --- Fix 2 (Phase 1 findings): rotate Q_nope into WHT domain ---
-        # This is the move that activates the orthogonality trick, letting the
-        # kernel dot rotated Q against rotated K without needing per-row
-        # inverse Hadamard.
-        # rotate_query returns fp32 regardless of input dtype (CUDA kernel
-        # convention). Cast back to bf16 to match kernel's expected dtype
-        # and keep register pressure bounded.
+        # This activates the orthogonality trick: (H·Q)·(H·K) = Q·K lets the
+        # kernel dot rotated-Q against rotated-K without per-row inverse WHT.
+        # rotate_query returns fp32; cast back to input dtype for the kernel.
         q_nope_rot = self._tq_config.rotate_query(q_nope).to(q_nope.dtype)
 
         # Pool references (current layer). Kernel reads these directly.
@@ -784,62 +996,19 @@ class TurboQuantMLABackend(FlashMLABackend):
         k_centroids = self._tq_config.k_centroids
         uniform = getattr(self._tq_config, "uniform", False)
 
-        # Build TOKEN-indexed flat kv_indices for the fused kernel.
-        #
-        # IMPORTANT: cannot reuse self.forward_metadata.block_kv_indices here.
-        # That tensor is PAGE-indexed (page_id = pool_row // PAGE_SIZE=64),
-        # produced by create_flashmla_kv_indices_triton for flashmla's native
-        # page-based reader (`k_cache.view(-1, PAGE_SIZE, ...)` with block_table).
-        # Our kernel reads individual pool rows, so we need per-TOKEN pool
-        # indices. Same pattern as triton_backend.py init_forward_metadata.
-        seq_lens = forward_batch.seq_lens[:bs].to(torch.int32)
-        kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=seq_lens.device)
-        # Assignment does implicit int64→int32 cast (pattern from triton_backend.py).
-        kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
-        # Total tokens across batch. .item() is a host-sync — acceptable for v1
-        # since CUDA graphs are off on this backend anyway (Phase 3 cleans this).
-        total_kv_tokens = int(kv_indptr[bs].item())
-        kv_indices = torch.empty(
-            total_kv_tokens, dtype=torch.int32, device=seq_lens.device
-        )
-        create_flashinfer_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            forward_batch.req_pool_indices[:bs],
-            seq_lens,
-            kv_indptr,
-            None,
-            kv_indices,
-            self.req_to_token.stride(0),
-        )
+        # Read pre-populated CG-safe buffers. kv_indptr is populated for
+        # indices [0..bs]; kv_indices first `kv_indptr[bs]` entries are
+        # valid. Kernel reads only through kv_indptr so the tail garbage
+        # in kv_indices is never touched.
+        kv_indptr = self._tq_kv_indptr[: bs + 1]
+        kv_indices = self._tq_kv_indices  # full buffer; kernel bounds by kv_indptr
+        num_kv_splits = self._tq_num_kv_splits[:bs]
 
-        # num_kv_splits: per-batch split count for stage-1 parallelism.
-        #
-        # IMPORTANT: cannot reuse self.forward_metadata.num_splits here.
-        # That tensor is flashmla's own scheduler metadata with shape
-        # (bs+1,) and a PREFIX-SUM convention ("how many splits cumulatively
-        # across batches 0..b-1"). Our kernel expects (bs,) of per-batch
-        # split counts, i.e. "how many splits does batch b get". Passing
-        # flashmla's tensor into `kv_splits = tl.load(num_kv_splits + b)`
-        # miscomputes per-batch KV ranges and degrades output quality as
-        # context grows (live symptom: first few decode tokens coherent,
-        # then collapses to "!!!!" as prefix-sum diverges from per-batch).
-        #
-        # Use a fixed split count for v1 — same pattern as triton decode
-        # backend's static_kv_splits fallback (num_kv_splits.fill_(max)).
-        # max_kv_splits=8 gives ~8-way stage-1 parallelism across seq_len
-        # without over-splitting tiny sequences.
-        max_kv_splits = 8
-        num_kv_splits = torch.full(
-            (bs,), max_kv_splits, dtype=torch.int32, device=seq_lens.device
-        )
-
-        # Stage-1 output buffers
-        self._ensure_stage1_buffers(bs, max_kv_splits, q_nope.device)
-
-        # Output in rotated nope space (stage-2 writes here)
-        o_rotated = torch.empty(
-            (bs, q_heads, lora_rank), dtype=q_nope.dtype, device=q_nope.device
-        )
+        # Narrow persistent output buffers to current bs. Slicing returns
+        # views with stable base addresses — CG-safe.
+        att_logits = self._tq_stage1_logits[:bs, :q_heads, :, :]
+        att_lse = self._tq_stage1_lse[:bs, :q_heads, :]
+        o_rotated = self._tq_o_rotated[:bs, :q_heads, :]
 
         tq_mla_decode_attention_fwd(
             q_nope_rotated=q_nope_rot,
@@ -851,19 +1020,18 @@ class TurboQuantMLABackend(FlashMLABackend):
             o=o_rotated,
             kv_indptr=kv_indptr,
             kv_indices=kv_indices,
-            att_logits=self._stage1_logits,
-            att_lse=self._stage1_lse,
+            att_logits=att_logits,
+            att_lse=att_lse,
             num_kv_splits=num_kv_splits,
-            max_kv_splits=max_kv_splits,
+            max_kv_splits=max_splits,
             sm_scale=layer.scaling,
             logit_cap=getattr(layer, "logit_cap", 0.0) or 0.0,
             uniform=uniform,
         )
 
-        # --- Fix 1 (Phase 1 findings): un-rotate the output ---
-        # Kernel output is in rotated nope space. Apply inverse Hadamard once
-        # on the small (bs, q_heads, lora_rank) tensor via the CUDA helper.
+        # Kernel output is in rotated nope space. Inverse-rotate once on
+        # the small (bs, q_heads, lora_rank) tensor to get original domain.
         o = self._tq_config.inverse_rotate_output(o_rotated).to(q_nope.dtype)
 
-        # Flashmla backend returns (bs * q_heads, v_head_dim). Match that.
+        # Flashmla backend contract: (bs * q_heads, v_head_dim). Match that.
         return o.view(-1, q_heads * lora_rank)
