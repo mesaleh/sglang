@@ -246,11 +246,25 @@ def _fwd_tq_mla_decode_stage1(
                 )
             # k_lo, k_hi shape: (BLOCK_LORA_PACKED, BLOCK_N) fp32
 
-            # --- Q · K dot product (rotated domain) ---
-            qk = tl.dot(q_nope_even, k_lo.to(q_nope_even.dtype))
-            qk += tl.dot(q_nope_odd, k_hi.to(q_nope_odd.dtype))
+            # --- Q_nope · K_nope (rotated domain, needs per-token scale) ---
+            # k_lo / k_hi are codebook values in rotated space, BEFORE the
+            # per-token dequant scale has been applied. We scale the nope
+            # contribution here, then add the un-scaled rope contribution.
+            # (Bug fix 2026-04-27: previously applied k_scale to the combined
+            # nope+rope qk, which wrongly scaled the rope term.)
+            qk_nope = tl.dot(q_nope_even, k_lo.to(q_nope_even.dtype))
+            qk_nope += tl.dot(q_nope_odd, k_hi.to(q_nope_odd.dtype))
 
-            # --- Q_rope · K_rope (original domain) ---
+            k_scale = tl.load(
+                K_Scale + kv_loc * stride_ksc_bs + 0,
+                mask=mask_n,
+                other=1.0,
+            ).to(tl.float32)
+            qk_nope = qk_nope * k_scale[None, :]
+
+            # --- Q_rope · K_rope (original domain, NO scale) ---
+            # RoPE is stored uncompressed in bf16; TurboQuant does not touch
+            # it, so no per-token dequant scale applies here.
             offs_buf_krope = (
                 kv_loc[None, :] * stride_krope_bs
                 + 0 * stride_krope_h
@@ -261,17 +275,10 @@ def _fwd_tq_mla_decode_stage1(
                 mask=mask_n[None, :] & mask_rope[:, None],
                 other=0.0,
             )
-            # k_rope shape: (BLOCK_ROPE, BLOCK_N) bf16
-            qk += tl.dot(q_rope, k_rope.to(q_rope.dtype))
+            qk_rope = tl.dot(q_rope, k_rope.to(q_rope.dtype))
 
-            # --- Per-token dequant scale + softmax scale ---
-            k_scale = tl.load(
-                K_Scale + kv_loc * stride_ksc_bs + 0,
-                mask=mask_n,
-                other=1.0,
-            ).to(tl.float32)
-            qk *= k_scale[None, :]
-            qk *= sm_scale
+            # Combine scaled-nope + un-scaled-rope; apply softmax scale once.
+            qk = (qk_nope + qk_rope) * sm_scale
 
             if logit_cap > 0:
                 qk = logit_cap * (2.0 * tl.sigmoid(2.0 * qk / logit_cap) - 1.0)
