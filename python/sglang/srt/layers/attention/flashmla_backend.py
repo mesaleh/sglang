@@ -699,6 +699,14 @@ class TurboQuantMLABackend(FlashMLABackend):
         self._stage1_logits = None
         self._stage1_lse = None
 
+        # Boot-time visibility: confirms this class (not base FlashMLABackend)
+        # is actually instantiated in the live pod. One-line per rank at init.
+        import logging
+        logging.getLogger(__name__).info(
+            "TurboQuantMLABackend active (Stage C fused Triton MLA decode)."
+        )
+        self._first_decode_logged = False
+
     def _ensure_stage1_buffers(self, bs: int, max_kv_splits: int, device, dtype=torch.float32):
         """Lazy-alloc stage-1 partials buffer. Grows if larger bs arrives;
         steady-state address is stable so CUDA graph capture sees fixed size
@@ -727,6 +735,13 @@ class TurboQuantMLABackend(FlashMLABackend):
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
     ):
+        if not self._first_decode_logged:
+            import logging
+            logging.getLogger(__name__).info(
+                "TurboQuantMLABackend.forward_decode hit (layer %d, bs=%d, q_heads=%d)",
+                layer.layer_id, forward_batch.batch_size, layer.tp_q_head_num,
+            )
+            self._first_decode_logged = True
         # Write K to the pool (set_mla_kv_buffer path) — unchanged from parent.
         cache_loc = forward_batch.out_cache_loc
         if k is not None:
@@ -797,13 +812,26 @@ class TurboQuantMLABackend(FlashMLABackend):
             self.req_to_token.stride(0),
         )
 
-        # num_kv_splits: reuse flashmla metadata for the split count.
-        num_kv_splits = self.forward_metadata.num_splits[:bs].to(torch.int32)
-        # max_kv_splits: an upper bound to size the stage-1 output.
-        max_kv_splits = int(num_kv_splits.max().item()) if bs > 0 else 1
-        # ^ NOTE: .item() here is a host-sync and NOT CG-compatible. For v1 we
-        # accept it (CUDA graphs will be off on this backend until Phase 3).
-        # Remove before shipping with graphs on.
+        # num_kv_splits: per-batch split count for stage-1 parallelism.
+        #
+        # IMPORTANT: cannot reuse self.forward_metadata.num_splits here.
+        # That tensor is flashmla's own scheduler metadata with shape
+        # (bs+1,) and a PREFIX-SUM convention ("how many splits cumulatively
+        # across batches 0..b-1"). Our kernel expects (bs,) of per-batch
+        # split counts, i.e. "how many splits does batch b get". Passing
+        # flashmla's tensor into `kv_splits = tl.load(num_kv_splits + b)`
+        # miscomputes per-batch KV ranges and degrades output quality as
+        # context grows (live symptom: first few decode tokens coherent,
+        # then collapses to "!!!!" as prefix-sum diverges from per-batch).
+        #
+        # Use a fixed split count for v1 — same pattern as triton decode
+        # backend's static_kv_splits fallback (num_kv_splits.fill_(max)).
+        # max_kv_splits=8 gives ~8-way stage-1 parallelism across seq_len
+        # without over-splitting tiny sequences.
+        max_kv_splits = 8
+        num_kv_splits = torch.full(
+            (bs,), max_kv_splits, dtype=torch.int32, device=seq_lens.device
+        )
 
         # Stage-1 output buffers
         self._ensure_stage1_buffers(bs, max_kv_splits, q_nope.device)
