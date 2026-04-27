@@ -753,7 +753,10 @@ class TurboQuantMLABackend(FlashMLABackend):
         # This is the move that activates the orthogonality trick, letting the
         # kernel dot rotated Q against rotated K without needing per-row
         # inverse Hadamard.
-        q_nope_rot = self._tq_config.rotate_query(q_nope)
+        # rotate_query returns fp32 regardless of input dtype (CUDA kernel
+        # convention). Cast back to bf16 to match kernel's expected dtype
+        # and keep register pressure bounded.
+        q_nope_rot = self._tq_config.rotate_query(q_nope).to(q_nope.dtype)
 
         # Pool references (current layer). Kernel reads these directly.
         layer_id_rel = layer.layer_id - self._tq_pool.start_layer
