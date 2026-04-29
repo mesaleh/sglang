@@ -47,6 +47,44 @@ if _os.environ.get("SGLANG_TRITON_KERNELS_NO_PERSISTENT", "0") == "1":
     )
     update_opt_flags_constraints({"is_persistent": False})
 
+
+# Diagnostic: log the shape inputs to matmul_ogs so we can see which m,n,k
+# combination triggers the crash. Activated by OMNIVA_LOG_MATMUL_OGS=1.
+if _os.environ.get("OMNIVA_LOG_MATMUL_OGS", "0") == "1":
+    import sys as _sys
+    _original_matmul_ogs = matmul_ogs
+    _call_counter = [0]
+
+    def _matmul_ogs_logged(x, w, bias, *args, **kwargs):
+        _call_counter[0] += 1
+        cid = _call_counter[0]
+        try:
+            m_shape = tuple(x.shape)
+            w_shape = tuple(w.shape)
+        except Exception:
+            m_shape = "?"
+            w_shape = "?"
+        print(
+            f"[OMNIVA-MATMUL #{cid}] x.shape={m_shape} w.shape={w_shape} "
+            f"x.dtype={x.dtype} w.dtype={w.dtype}",
+            file=_sys.stderr, flush=True,
+        )
+        try:
+            return _original_matmul_ogs(x, w, bias, *args, **kwargs)
+        except Exception as e:
+            print(
+                f"[OMNIVA-MATMUL #{cid}] EXCEPTION {type(e).__name__}: {e}",
+                file=_sys.stderr, flush=True,
+            )
+            raise
+
+    matmul_ogs = _matmul_ogs_logged
+    print(
+        "[OMNIVA-PATCH] triton_kernels_moe.py: matmul_ogs wrapped for shape logging "
+        "(via OMNIVA_LOG_MATMUL_OGS). Disable in production — ~5 ms/call overhead.",
+        file=_sys.stderr, flush=True,
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
     from sglang.srt.layers.moe.topk import TopKOutput
