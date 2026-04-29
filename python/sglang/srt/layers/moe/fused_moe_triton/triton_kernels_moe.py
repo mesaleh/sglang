@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 from sgl_kernel import gelu_and_mul, silu_and_mul
+import os as _os
+
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
@@ -13,9 +15,30 @@ from triton_kernels.matmul_ogs import (
     PrecisionConfig,
     matmul_ogs,
 )
+from triton_kernels.matmul_ogs_details.opt_flags import (
+    update_opt_flags_constraints,
+)
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
+
+# gpt-oss-120b @ TP=1 single-H100 reproducibly hits a CUDA illegal memory
+# access inside triton_kernels' persistent matmul (_p_matmul_ogs) for MXFP4
+# MoE expert matmuls on any prefill above ~40 tokens. Traced with
+# CUDA_LAUNCH_BLOCKING=1 on 2026-04-29 (see vault arc doc
+# OmniSec/Inference/GPT-OSS/Experiment Log - Single GPU via TurboQuant
+# 4-bit KV.md iteration 6 for the full crash stack). The non-persistent
+# variant (_matmul_ogs) handles the same shapes correctly — same math,
+# different launch pattern.
+#
+# Environment-variable gated so it only fires for deployments that opt in.
+# TP>=2 gpt-oss sweeps from March 2026 ran the persistent kernel without
+# issue; the crash may be specific to the tile shape reached when all 128
+# experts live on one GPU. Set SGLANG_TRITON_KERNELS_NO_PERSISTENT=1 in
+# the pod env to activate the workaround. Default behavior (no env var)
+# is upstream-identical.
+if _os.environ.get("SGLANG_TRITON_KERNELS_NO_PERSISTENT", "0") == "1":
+    update_opt_flags_constraints({"is_persistent": False})
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
