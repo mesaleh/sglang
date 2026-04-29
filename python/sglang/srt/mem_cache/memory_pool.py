@@ -1439,6 +1439,24 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             "Dequant buffer path not supported."
         )
 
+    # Pool-agnostic accessors for the TurboQuant fast path in
+    # triton_backend.py. A flat pool just indexes its own per-layer lists;
+    # SWAKVPool implements the same interface and dispatches into the
+    # full/swa sub-pool via layers_mapping. Keeps the backend code pool-
+    # agnostic so adding new hybrid pool types does not require changes in
+    # the decode dispatch.
+    def get_tq_k_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_tq_v_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_tq_k_dequant_scale(self, layer_id: int):
+        return self.k_dequant_scale_buffer[layer_id - self.start_layer]
+
+    def get_tq_v_dequant_scale(self, layer_id: int):
+        return self.v_dequant_scale_buffer[layer_id - self.start_layer]
+
     def get_v_head_dim(self):
         return self.head_dim
 
