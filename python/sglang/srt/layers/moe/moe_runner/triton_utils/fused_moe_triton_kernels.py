@@ -1326,6 +1326,7 @@ def fused_moe_kernel_mxfp4(
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
     filter_expert: tl.constexpr,
+    enable_nan_prop: tl.constexpr,
 ):
     """Fused MoE grouped matmul with inline MXFP4 weight dequant.
 
@@ -1450,11 +1451,15 @@ def fused_moe_kernel_mxfp4(
         b_tile = tl.reshape(b_tile, [BLOCK_SIZE_K, BLOCK_SIZE_N])
 
         # NaN propagation: scale byte 0xFF -> entire 32-block is NaN.
-        nan_row = scale_u8 == 0xFF
-        nan_3d = tl.reshape(nan_row, [BLOCK_SIZE_K // 32, 1, BLOCK_SIZE_N])
-        nan_3d = tl.broadcast_to(nan_3d, [BLOCK_SIZE_K // 32, 32, BLOCK_SIZE_N])
-        nan_mask = tl.reshape(nan_3d, [BLOCK_SIZE_K, BLOCK_SIZE_N])
-        b_tile = tl.where(nan_mask, float("nan"), b_tile)
+        # Production gpt-oss weights never contain 0xFF so we gate this off
+        # for speed. The unit test (test_mxfp4_moe_kernel.py) exercises
+        # enable_nan_prop=True to validate the formula is correct.
+        if enable_nan_prop:
+            nan_row = scale_u8 == 0xFF
+            nan_3d = tl.reshape(nan_row, [BLOCK_SIZE_K // 32, 1, BLOCK_SIZE_N])
+            nan_3d = tl.broadcast_to(nan_3d, [BLOCK_SIZE_K // 32, 32, BLOCK_SIZE_N])
+            nan_mask = tl.reshape(nan_3d, [BLOCK_SIZE_K, BLOCK_SIZE_N])
+            b_tile = tl.where(nan_mask, float("nan"), b_tile)
 
         # Accumulate.
         accumulator = tl.dot(a, b_tile.to(compute_type), acc=accumulator)
@@ -1491,6 +1496,7 @@ def invoke_fused_moe_kernel_mxfp4(
     config: Dict[str, Any],
     compute_type: tl.dtype,
     filter_expert: bool = True,
+    enable_nan_prop: bool = False,
 ) -> None:
     """Launch ``fused_moe_kernel_mxfp4``.
 
@@ -1558,5 +1564,6 @@ def invoke_fused_moe_kernel_mxfp4(
         compute_type=compute_type,
         even_Ks=even_Ks,
         filter_expert=filter_expert,
+        enable_nan_prop=enable_nan_prop,
         **config,
     )

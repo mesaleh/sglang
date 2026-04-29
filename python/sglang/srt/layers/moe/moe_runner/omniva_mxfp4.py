@@ -42,17 +42,36 @@ if TYPE_CHECKING:
     )
 
 
-# Default tile config. BLOCK_SIZE_K must be multiple of 32 (MXFP block
-# size) AND divide K=2880 evenly to avoid the partial-tail path — 64
-# satisfies both (2880 / 64 = 45). BLOCK_SIZE_N=64 chosen to balance
-# register pressure against occupancy on SM90.
-_DEFAULT_CONFIG = {
+# Tile configs tuned for gpt-oss-120b at TP=1 c=1.
+#
+# Constraints:
+#   - BLOCK_SIZE_K must divide 32 (MXFP block size). Also should divide K
+#     exactly to stay on the fast no-mask path: 2880 % 64 = 0, so 64 is
+#     safe. 128 triggers the partial-K path (2880 % 128 = 64).
+#   - Total blocks per matmul = (N / BLOCK_N) * (active_experts) — we want
+#     this ≥ 132 (H100 SM count) for full occupancy at c=1 bs=1.
+#
+# At c=1 bs=1 with topk=4 / E=128:
+#   - Gate-up: N=5760, 4 active experts. BLOCK_N=128 → 45 * 4 = 180 blocks.
+#   - Down:    N=2880, 4 active experts. BLOCK_N=64  → 45 * 4 = 180 blocks.
+# Both hit the occupancy floor. Bigger BLOCK_N (256) underutilizes SMs;
+# smaller wastes launch overhead.
+_GATE_UP_CONFIG = {
+    "BLOCK_SIZE_M": 16,
+    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_K": 64,
+    "GROUP_SIZE_M": 1,
+    "num_warps": 8,
+    "num_stages": 3,
+}
+
+_DOWN_CONFIG = {
     "BLOCK_SIZE_M": 16,
     "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 64,
     "GROUP_SIZE_M": 1,
     "num_warps": 4,
-    "num_stages": 2,
+    "num_stages": 3,
 }
 
 
@@ -157,10 +176,16 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
         N = two_N // 2  # intermediate_size
         topk = topk_ids.shape[1]
 
-        config = _DEFAULT_CONFIG
+        # Both gate-up and down use the same BLOCK_SIZE_M (alignment
+        # invariant — sorted_token_ids padding is per BLOCK_M).
+        gate_up_config = _GATE_UP_CONFIG
+        down_config = _DOWN_CONFIG
+        assert (
+            gate_up_config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
+        ), "Gate-up and down configs must share BLOCK_SIZE_M for moe_align"
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], E
+            topk_ids, gate_up_config["BLOCK_SIZE_M"], E
         )
 
         # --- Gate-up matmul: A [M, K_hidden] @ W13 [E, 2N, K_hidden/2] ---
@@ -180,7 +205,7 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
             num_tokens_post_padded,
             mul_routed_weight=self.config.apply_router_weight_on_input,
             top_k=topk,
-            config=config,
+            config=gate_up_config,
             compute_type=tl.bfloat16,
             filter_expert=False,
         )
@@ -246,7 +271,7 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
             num_tokens_post_padded,
             mul_routed_weight=not self.config.apply_router_weight_on_input,
             top_k=1,
-            config=config,
+            config=down_config,
             compute_type=tl.bfloat16,
             filter_expert=False,
         )

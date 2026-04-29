@@ -201,6 +201,7 @@ class TestMxfp4Decode(unittest.TestCase):
             config=config,
             compute_type=tl.bfloat16,
             filter_expert=False,
+            enable_nan_prop=True,
         )
 
         # For one-hot activation at row k: C[k, n] = W[0, n, k].
@@ -275,6 +276,7 @@ class TestMxfp4MatmulGolden(unittest.TestCase):
             config=config,
             compute_type=tl.bfloat16,
             filter_expert=False,
+            enable_nan_prop=True,
         )
 
         # Reference: for each (token m, topk slot t), compute
