@@ -156,9 +156,16 @@ class AiterAttnBackend(AttentionBackend):
             # layer_id=0 may not be a full attention layer
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            pool = model_runner.token_to_kv_pool
+            # Prefer get_v_head_dim() when the pool exposes it. Some pool
+            # types (e.g. MHATokenToKVPoolTurboQuant) cannot serve a bf16
+            # value buffer for shape probes because they store packed uint8;
+            # on those, get_value_buffer(0).shape[-1] raises. Shape query
+            # should go through the dedicated accessor.
+            if hasattr(pool, "get_v_head_dim"):
+                self.v_head_dim = pool.get_v_head_dim()
+            else:
+                self.v_head_dim = pool.get_value_buffer(0).shape[-1]
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
