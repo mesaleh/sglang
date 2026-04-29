@@ -1005,20 +1005,34 @@ class TritonAttnBackend(AttentionBackend):
             and tq_config.k_bit_width in (2, 4)
             and tq_config.v_bit_width in (2, 4)
             and not self.enable_deterministic
-            and sliding_window_size == -1
             and kv_indptr is not None):
-            # Fused TQ extend: read packed uint8 KV directly, skip dequant buffer
-            # Supports symmetric and asymmetric K/V bit widths
-            idx = layer.layer_id - pool.start_layer
+            # Fused TQ extend: read packed uint8 KV directly, skip dequant buffer.
+            # Supports symmetric and asymmetric K/V bit widths, plus
+            # sliding-window attention (sliding_window_size > 0) via the
+            # windowed kernel path in turboquant_extend_attention.py. The
+            # pool-agnostic get_tq_* accessors route to the right sub-pool
+            # when `pool` is a SWAKVPool wrapping TQ sub-pools (gpt-oss
+            # hybrid-SWA case).
+            if hasattr(pool, "get_tq_k_buffer"):
+                k_buf = pool.get_tq_k_buffer(layer.layer_id)
+                v_buf = pool.get_tq_v_buffer(layer.layer_id)
+                k_scale_buf = pool.get_tq_k_dequant_scale(layer.layer_id)
+                v_scale_buf = pool.get_tq_v_dequant_scale(layer.layer_id)
+            else:
+                idx = layer.layer_id - pool.start_layer
+                k_buf = pool.k_buffer[idx]
+                v_buf = pool.v_buffer[idx]
+                k_scale_buf = pool.k_dequant_scale_buffer[idx]
+                v_scale_buf = pool.v_dequant_scale_buffer[idx]
             self.tq_extend_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k.contiguous(),
                 v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-                pool.k_buffer[idx],
-                pool.v_buffer[idx],
-                pool.k_dequant_scale_buffer[idx],
-                pool.v_dequant_scale_buffer[idx],
+                k_buf,
+                v_buf,
+                k_scale_buf,
+                v_scale_buf,
                 tq_config.k_centroids,
                 tq_config.v_centroids,
                 self.forward_metadata.qo_indptr,
@@ -1034,13 +1048,20 @@ class TritonAttnBackend(AttentionBackend):
                 logit_cap=logits_soft_cap,
                 sinks=sinks,
                 xai_temperature_len=layer.xai_temperature_len,
+                sliding_window_size=sliding_window_size,
+                window_kv_offsets=window_kv_offsets,
             )
         else:
             # Fallback: standard extend kernel (non-TQ path)
             if tq_config is not None:
+                # enable_deterministic=True is not yet routed through the
+                # fused TQ extend kernel (would need bitwise-stable split-dot
+                # order — possible but extra work). Sliding_window is now
+                # supported above; the only remaining unsupported TQ extend
+                # configuration is enable_deterministic.
                 raise RuntimeError(
-                    "TurboQuant extend fallback not supported. "
-                    "Ensure: enable_deterministic=False, no sliding_window."
+                    "TurboQuant extend fallback not supported: "
+                    "enable_deterministic must be False."
                 )
             key_buffer = pool.get_key_buffer(layer.layer_id)
             value_buffer = pool.get_value_buffer(layer.layer_id)
