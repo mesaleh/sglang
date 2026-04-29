@@ -1468,12 +1468,19 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
 
     def get_kv_size_bytes(self):
-        """Total GPU memory used by all TurboQuant buffers."""
-        total = 0
+        """GPU memory used by TurboQuant K/V buffers, returned as
+        (k_size, v_size) to match the parent MHATokenToKVPool contract.
+
+        Dequant-scale buffers are charged against the K and V sides
+        respectively so SWAKVPool.get_kv_size_bytes (which sums the two
+        ints from each sub-pool) reports a total that includes them.
+        """
+        k_size = 0
+        v_size = 0
         for i in range(self.layer_num):
-            total += self.k_buffer[i].nbytes + self.v_buffer[i].nbytes
-            total += self.k_dequant_scale_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
-        return total
+            k_size += self.k_buffer[i].nbytes + self.k_dequant_scale_buffer[i].nbytes
+            v_size += self.v_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
+        return k_size, v_size
 
 
 class HybridLinearKVPool(KVCache):
