@@ -1278,16 +1278,35 @@ class TritonAttnBackend(AttentionBackend):
             ).reshape(q.shape)
 
         if tq_config is not None and tq_config.k_bit_width in (2, 4) and tq_config.v_bit_width in (2, 4):
-            # Fused TQ decode: read packed uint8 KV directly, skip dequant buffer
-            # Supports symmetric (K=V) and asymmetric (K!=V) bit widths
+            # Fused TQ decode: read packed uint8 KV directly, skip dequant buffer.
+            # Supports symmetric (K=V) and asymmetric (K!=V) bit widths.
+            #
+            # Buffer access goes through get_tq_* accessors rather than direct
+            # .k_buffer[idx] indexing so the fast path works for both flat
+            # MHATokenToKVPoolTurboQuant pools (where the accessor is just
+            # self.k_buffer[layer_id - start_layer]) and hybrid SWAKVPool
+            # wrappers (which dispatch to full/swa sub-pool via layers_mapping).
+            # Models that go through SWA — e.g. GptOssForCausalLM — need this
+            # indirection; the plain list-index fails because SWAKVPool has
+            # no top-level k_buffer attribute, only sub-pools do.
             pool = forward_batch.token_to_kv_pool
-            idx = layer.layer_id - pool.start_layer
+            if hasattr(pool, "get_tq_k_buffer"):
+                k_buf = pool.get_tq_k_buffer(layer.layer_id)
+                v_buf = pool.get_tq_v_buffer(layer.layer_id)
+                k_scale_buf = pool.get_tq_k_dequant_scale(layer.layer_id)
+                v_scale_buf = pool.get_tq_v_dequant_scale(layer.layer_id)
+            else:
+                idx = layer.layer_id - pool.start_layer
+                k_buf = pool.k_buffer[idx]
+                v_buf = pool.v_buffer[idx]
+                k_scale_buf = pool.k_dequant_scale_buffer[idx]
+                v_scale_buf = pool.v_dequant_scale_buffer[idx]
             self.tq_decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                pool.k_buffer[idx],
-                pool.v_buffer[idx],
-                pool.k_dequant_scale_buffer[idx],
-                pool.v_dequant_scale_buffer[idx],
+                k_buf,
+                v_buf,
+                k_scale_buf,
+                v_scale_buf,
                 tq_config.k_centroids,
                 tq_config.v_centroids,
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
