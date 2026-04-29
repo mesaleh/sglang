@@ -42,23 +42,28 @@ if TYPE_CHECKING:
     )
 
 
-# Tile configs tuned for gpt-oss-120b at TP=1 c=1.
+# Tile configs tuned for gpt-oss-120b at TP=1 c=1. Empirical sweep on
+# H100 SM90 (lmsysorg/sglang:nightly-dev-20260424-d9c72bdd, triton 3.5.1)
+# with active_experts=4 / E=128. Best picks out of a 54-config grid
+# (BLOCK_M ∈ {16,32}, BLOCK_N ∈ {32,64,128}, num_warps ∈ {2,4,8},
+# num_stages ∈ {2,3,4}):
 #
-# Constraints:
-#   - BLOCK_SIZE_K must divide 32 (MXFP block size). Also should divide K
-#     exactly to stay on the fast no-mask path: 2880 % 64 = 0, so 64 is
-#     safe. 128 triggers the partial-K path (2880 % 128 = 64).
-#   - Total blocks per matmul = (N / BLOCK_N) * (active_experts) — we want
-#     this ≥ 132 (H100 SM count) for full occupancy at c=1 bs=1.
+#   gate-up (M=1,  N=5760, K=2880, topk=4): N64 w8 s3 -> 80 us/call
+#   down    (M=4,  N=2880, K=2880, topk=1): N32 w4 s3 -> 43 us/call
 #
-# At c=1 bs=1 with topk=4 / E=128:
-#   - Gate-up: N=5760, 4 active experts. BLOCK_N=128 → 45 * 4 = 180 blocks.
-#   - Down:    N=2880, 4 active experts. BLOCK_N=64  → 45 * 4 = 180 blocks.
-# Both hit the occupancy floor. Bigger BLOCK_N (256) underutilizes SMs;
-# smaller wastes launch overhead.
+# Hypothesis from the sweep: at c=1 the number of output rows is small
+# (M*topk=4 post-align 16), so bigger BLOCK_N gives each block more
+# work that never fills up — throughput is actually better with smaller
+# tiles + more warps per tile (better ILP per block). Bigger tiles had
+# worse HBM utilization because each block loaded more weight than it
+# could use efficiently at its tiny M.
+#
+# Constraint: BLOCK_SIZE_K must divide 32 (MXFP block); 64 divides K=2880
+# exactly so we stay on the fast no-mask load path (BLOCK_K=128 triggered
+# the partial-tail path and was consistently slower).
 _GATE_UP_CONFIG = {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 128,
+    "BLOCK_SIZE_N": 64,
     "BLOCK_SIZE_K": 64,
     "GROUP_SIZE_M": 1,
     "num_warps": 8,
@@ -67,7 +72,7 @@ _GATE_UP_CONFIG = {
 
 _DOWN_CONFIG = {
     "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 64,
+    "BLOCK_SIZE_N": 32,
     "BLOCK_SIZE_K": 64,
     "GROUP_SIZE_M": 1,
     "num_warps": 4,
