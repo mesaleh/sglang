@@ -143,6 +143,17 @@ class SWAKVPool(KVCache):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    # Forward v_head_dim probes from attention backends (triton_backend,
+    # aiter_backend, wave_backend all read pool.get_value_buffer(0).shape[-1]
+    # or pool.get_v_head_dim() during __init__ to discover v_head_dim at
+    # backend setup time). Without this, SWAKVPool falls through to the
+    # get_value_buffer fallback, which raises on TurboQuant sub-pools
+    # because packed uint8 buffers have no bf16 shape to probe. Both
+    # sub-pools are constructed with the same head_dim / v_head_dim so
+    # forwarding from full_kv_pool is correct regardless of sub-pool type.
+    def get_v_head_dim(self):
+        return self.full_kv_pool.get_v_head_dim()
+
     # --- TurboQuant passthrough ----------------------------------------------
     # When the sub-pools are TurboQuant pools (token_to_kv_pool_class=
     # MHATokenToKVPoolTurboQuant passed at construction), the attention
