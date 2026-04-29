@@ -247,19 +247,61 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
-        # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        # TurboQuant hybrid-SWA sizing: when --kv-cache-dtype is turboquant_*,
+        # the full and swa sub-pools inside SWAKVPool are packed
+        # MHATokenToKVPoolTurboQuant instances. kv_size (bf16) overstates the
+        # per-token footprint 3-4×, so we replace the bf16 formula with the
+        # TQ packed-layout formula (matches the DefaultPoolConfigurator
+        # non-MLA TQ branch below: packed_k + packed_v + k_scale_bf16 +
+        # v_scale_bf16 per token per layer). Without this branch the pool
+        # configurator sizes admission cap for bf16 and we lose the TQ
+        # memory advantage at 128K context on gpt-oss-120b.
+        if hasattr(mr, "turboquant_bits"):
+            k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+            v_bits = getattr(mr, "turboquant_v_bits", mr.turboquant_bits)
 
-        # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+            def _packed_bytes(bits: int, n: int, d: int) -> int:
+                if bits == 2:
+                    return n * (d // 4)  # 4 values per byte
+                return n * (d // 2)  # 4-bit: 2 values per byte
+
+            full_n = model_config.get_num_kv_heads(tp_size)
+            full_k_d = model_config.head_dim
+            full_v_d = model_config.v_head_dim
+            swa_n = model_config.get_swa_num_kv_heads(tp_size)
+            swa_k_d = model_config.swa_head_dim
+            swa_v_d = model_config.swa_v_head_dim
+
+            # Full attention layer: packed K + packed V + 2 × bf16 scale.
+            # K and V dims are threaded separately so the formula stays
+            # correct on models with asymmetric head dims (most GQA
+            # models, including gpt-oss, have head_dim == v_head_dim, so
+            # in practice these collapse).
+            self._full_per_token = (
+                _packed_bytes(k_bits, full_n, full_k_d)
+                + _packed_bytes(v_bits, full_n, full_v_d)
+                + 2 * full_n * 2  # k_dequant_scale + v_dequant_scale (bf16)
+            )
+            # SWA attention layer: same formula, SWA head counts / dims.
+            self._swa_per_token = (
+                _packed_bytes(k_bits, swa_n, swa_k_d)
+                + _packed_bytes(v_bits, swa_n, swa_v_d)
+                + 2 * swa_n * 2
+            )
+        else:
+            # Full layer per-token memory (bytes)
+            self._full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
+
+            # SWA layer per-token memory (bytes)
+            self._swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         # Bytes per token of max_total_num_tokens.
         #
