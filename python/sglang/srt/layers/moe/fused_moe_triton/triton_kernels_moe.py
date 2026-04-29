@@ -38,6 +38,13 @@ from triton_kernels.swiglu import swiglu_fn
 # the pod env to activate the workaround. Default behavior (no env var)
 # is upstream-identical.
 if _os.environ.get("SGLANG_TRITON_KERNELS_NO_PERSISTENT", "0") == "1":
+    import sys as _sys
+    print(
+        "[OMNIVA-PATCH] triton_kernels_moe.py: setting is_persistent=False "
+        "constraint on triton_kernels (via SGLANG_TRITON_KERNELS_NO_PERSISTENT)",
+        file=_sys.stderr,
+        flush=True,
+    )
     update_opt_flags_constraints({"is_persistent": False})
 
 if TYPE_CHECKING:
