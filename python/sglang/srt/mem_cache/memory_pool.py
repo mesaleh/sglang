@@ -1428,15 +1428,24 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         )
 
     def _get_key_buffer(self, layer_id: int):
-        raise NotImplementedError(
-            "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
-            "Dequant buffer path not supported."
+        # Returns a shape-correct zero-length tensor so that init-time
+        # shape probes (e.g. TritonAttnBackend.__init__ reading
+        # pool.get_key_buffer(0).shape[-1] to discover head_dim) work
+        # without allocating a real bf16 dequant buffer. The hot-path
+        # fused decode/extend kernels use get_tq_k_buffer (packed uint8)
+        # instead of this method; any caller that actually reads tensor
+        # data here would hit a size-0 tensor and crash loudly — which
+        # is the correct behavior since the dequant path is not
+        # supported.
+        return torch.empty(
+            0, self.head_num, self.head_dim,
+            dtype=self.dtype, device=self.device,
         )
 
     def _get_value_buffer(self, layer_id: int):
-        raise NotImplementedError(
-            "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
-            "Dequant buffer path not supported."
+        return torch.empty(
+            0, self.head_num, self.head_dim,
+            dtype=self.dtype, device=self.device,
         )
 
     # Pool-agnostic accessors for the TurboQuant fast path in
