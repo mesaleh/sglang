@@ -47,6 +47,24 @@ if _os.environ.get("SGLANG_TRITON_KERNELS_NO_PERSISTENT", "0") == "1":
     )
     update_opt_flags_constraints({"is_persistent": False})
 
+# Force specific block_m / block_k to diagnose whether tile-shape is the bug.
+# OMNIVA_TK_BLOCK_M / OMNIVA_TK_BLOCK_K can be set to override heuristics.
+_force_constraints = {}
+_block_m_env = _os.environ.get("OMNIVA_TK_BLOCK_M", "")
+if _block_m_env:
+    _force_constraints["block_m"] = int(_block_m_env)
+_block_k_env = _os.environ.get("OMNIVA_TK_BLOCK_K", "")
+if _block_k_env:
+    _force_constraints["block_k"] = int(_block_k_env)
+if _force_constraints:
+    import sys as _sys
+    print(
+        f"[OMNIVA-PATCH] triton_kernels_moe.py: forcing tile shape constraints "
+        f"{_force_constraints}",
+        file=_sys.stderr, flush=True,
+    )
+    update_opt_flags_constraints(_force_constraints)
+
 
 # Diagnostic: log the shape inputs to matmul_ogs so we can see which m,n,k
 # combination triggers the crash. Activated by OMNIVA_LOG_MATMUL_OGS=1.
