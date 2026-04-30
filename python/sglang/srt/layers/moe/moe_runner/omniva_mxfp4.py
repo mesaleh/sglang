@@ -42,42 +42,21 @@ if TYPE_CHECKING:
     )
 
 
-# Tile configs tuned for gpt-oss-120b at TP=1 c=1. Empirical sweep on
-# H100 SM90 (lmsysorg/sglang:nightly-dev-20260424-d9c72bdd, triton 3.5.1)
-# with active_experts=4 / E=128. Best picks out of a 54-config grid
-# (BLOCK_M ∈ {16,32}, BLOCK_N ∈ {32,64,128}, num_warps ∈ {2,4,8},
-# num_stages ∈ {2,3,4}):
+# Tile configs come from the autotune lookup in
+# ``try_get_optimal_moe_config`` (dtype="mxfp4_w4a16"), which reads tuned
+# JSONs out of ``triton_utils/configs/triton_<ver>/E=...,N=...,dtype=
+# mxfp4_w4a16[,down=true].json`` and falls back to the MXFP4 branch of
+# ``get_default_config`` when no JSON is present.
 #
-#   gate-up (M=1,  N=5760, K=2880, topk=4): N64 w8 s3 -> 80 us/call
-#   down    (M=4,  N=2880, K=2880, topk=1): N32 w4 s3 -> 43 us/call
-#
-# Hypothesis from the sweep: at c=1 the number of output rows is small
-# (M*topk=4 post-align 16), so bigger BLOCK_N gives each block more
-# work that never fills up — throughput is actually better with smaller
-# tiles + more warps per tile (better ILP per block). Bigger tiles had
-# worse HBM utilization because each block loaded more weight than it
-# could use efficiently at its tiny M.
-#
-# Constraint: BLOCK_SIZE_K must divide 32 (MXFP block); 64 divides K=2880
-# exactly so we stay on the fast no-mask load path (BLOCK_K=128 triggered
-# the partial-tail path and was consistently slower).
-_GATE_UP_CONFIG = {
-    "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 64,
-    "BLOCK_SIZE_K": 64,
-    "GROUP_SIZE_M": 1,
-    "num_warps": 8,
-    "num_stages": 3,
-}
+# To retune for a new shape, run ``benchmark/kernels/fused_moe_triton/
+# tuning_fused_moe_triton.py --dtype mxfp4_w4a16`` and commit the
+# generated JSONs. The default-config fallback is deliberately
+# conservative so untuned shapes still work correctly, just not at peak.
 
-_DOWN_CONFIG = {
-    "BLOCK_SIZE_M": 16,
-    "BLOCK_SIZE_N": 32,
-    "BLOCK_SIZE_K": 64,
-    "GROUP_SIZE_M": 1,
-    "num_warps": 4,
-    "num_stages": 3,
-}
+# BLOCK_SIZE_K must be a multiple of 32 (MXFP_BLOCK_SIZE). The autotune
+# grid enforces this at lookup time; this constant keeps the sanity-check
+# readable.
+_MXFP_BLOCK = 32
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +135,9 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
         running_state: dict,
         hooks: Optional[Any] = None,
     ) -> OmnivaMxfp4RunnerOutput:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            try_get_optimal_moe_config,
+        )
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             invoke_fused_moe_kernel_mxfp4,
         )
@@ -181,13 +163,35 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
         N = two_N // 2  # intermediate_size
         topk = topk_ids.shape[1]
 
-        # Both gate-up and down use the same BLOCK_SIZE_M (alignment
-        # invariant — sorted_token_ids padding is per BLOCK_M).
-        gate_up_config = _GATE_UP_CONFIG
-        down_config = _DOWN_CONFIG
-        assert (
-            gate_up_config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]
-        ), "Gate-up and down configs must share BLOCK_SIZE_M for moe_align"
+        # Autotune lookup. ``try_get_optimal_moe_config`` reads
+        # ``configs/triton_<ver>/E=E,N=N,device=...,dtype=mxfp4_w4a16[.down].json``
+        # if it exists, else falls back to ``get_default_config`` — which
+        # has an explicit MXFP4 branch (see fused_moe_triton_config.py).
+        # It returns (up_config, (down_config, max_block_m)). The contract
+        # is that ``up_config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]``
+        # (asserted inside the helper) so moe_align_block_size only needs
+        # one BLOCK_M value.
+        gate_up_config, (down_config, _max_block_m) = try_get_optimal_moe_config(
+            w1_shape=quant_info.w13_weight.shape,
+            w2_shape=quant_info.w2_weight.shape,
+            top_k=topk,
+            dtype="mxfp4_w4a16",
+            M=M,
+            return_down_config=True,
+        )
+        if down_config is None:
+            # No tuned down-config JSON; reuse the gate-up config.
+            # Safe because the two kernels share a signature/constraints.
+            down_config = dict(gate_up_config)
+
+        assert gate_up_config["BLOCK_SIZE_K"] % _MXFP_BLOCK == 0, (
+            f"BLOCK_SIZE_K={gate_up_config['BLOCK_SIZE_K']} must be multiple of "
+            f"{_MXFP_BLOCK} (MXFP block size); check tuned config for up matmul"
+        )
+        assert down_config["BLOCK_SIZE_K"] % _MXFP_BLOCK == 0, (
+            f"BLOCK_SIZE_K={down_config['BLOCK_SIZE_K']} must be multiple of "
+            f"{_MXFP_BLOCK} (MXFP block size); check tuned config for down matmul"
+        )
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
             topk_ids, gate_up_config["BLOCK_SIZE_M"], E

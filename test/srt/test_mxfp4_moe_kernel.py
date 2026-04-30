@@ -330,5 +330,83 @@ class TestMxfp4MatmulGolden(unittest.TestCase):
         self.assertLess(rel, 0.15, f"rel_err={rel}")
 
 
+class TestAutotuneWiring(unittest.TestCase):
+    """Sanity checks that the Omniva MXFP4 runner plugs into the autotune
+    infrastructure the same way other kernels do. Doesn't need CUDA."""
+
+    def setUp(self):
+        # ``get_default_config`` reads ``enable_deterministic_inference``
+        # from the global server args. Stub it so this test doesn't need a
+        # full ServerArgs bootstrap.
+        import sglang.srt.server_args as sa_mod
+
+        self._prev_global = getattr(sa_mod, "_global_server_args", None)
+
+        class _Stub:
+            enable_deterministic_inference = False
+
+        sa_mod._global_server_args = _Stub()
+
+    def tearDown(self):
+        import sglang.srt.server_args as sa_mod
+
+        sa_mod._global_server_args = self._prev_global
+
+    def test_dtype_string_registered(self):
+        import torch
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            get_config_dtype_str,
+        )
+
+        self.assertEqual(
+            get_config_dtype_str(torch.bfloat16, use_mxfp4_w4a16=True),
+            "mxfp4_w4a16",
+        )
+        # Other flags still take precedence / unaffected
+        self.assertEqual(
+            get_config_dtype_str(torch.bfloat16, use_fp8_w8a8=True), "fp8_w8a8"
+        )
+
+    def test_default_config_has_mxfp4_branch(self):
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            get_default_config,
+        )
+
+        # BLOCK_SIZE_K must be a multiple of the MXFP block size (32) so
+        # scale alignment holds in the kernel. Both small-M and large-M
+        # branches must satisfy this.
+        for M in [1, 4, 32, 128, 512, 4096]:
+            cfg = get_default_config(
+                M=M, E=128, N=2880, K=2880, topk=4,
+                dtype="mxfp4_w4a16", is_marlin=False,
+            )
+            self.assertEqual(cfg["BLOCK_SIZE_K"] % 32, 0, f"M={M}")
+            for key in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "GROUP_SIZE_M",
+                        "num_warps", "num_stages"):
+                self.assertIn(key, cfg, f"M={M} missing {key}")
+
+    def test_try_get_optimal_falls_back_cleanly(self):
+        # No tuned JSON shipped yet for these shapes; must fall back to
+        # the default config without errors.
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+            try_get_optimal_moe_config,
+        )
+
+        up, (dn, _mbm) = try_get_optimal_moe_config(
+            w1_shape=(128, 5760, 1440),
+            w2_shape=(128, 2880, 1440),
+            top_k=4,
+            dtype="mxfp4_w4a16",
+            M=1,
+            return_down_config=True,
+        )
+        self.assertEqual(up["BLOCK_SIZE_K"] % 32, 0)
+        # Down config is None when no _down JSON exists — runner handles
+        # this by reusing the gate-up config.
+        if dn is not None:
+            self.assertEqual(dn["BLOCK_SIZE_K"] % 32, 0)
+            self.assertEqual(dn["BLOCK_SIZE_M"], up["BLOCK_SIZE_M"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
