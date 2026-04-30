@@ -167,10 +167,12 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
         # ``configs/triton_<ver>/E=E,N=N,device=...,dtype=mxfp4_w4a16[.down].json``
         # if it exists, else falls back to ``get_default_config`` — which
         # has an explicit MXFP4 branch (see fused_moe_triton_config.py).
-        # It returns (up_config, (down_config, max_block_m)). The contract
-        # is that ``up_config["BLOCK_SIZE_M"] == down_config["BLOCK_SIZE_M"]``
-        # (asserted inside the helper) so moe_align_block_size only needs
-        # one BLOCK_M value.
+        # The helper returns (up_config, (down_config, max_block_m)) and
+        # internally asserts up["BLOCK_SIZE_M"] == down["BLOCK_SIZE_M"]
+        # because moe_align_block_size only takes one BLOCK_M. When
+        # shipping new tuned JSONs, harmonize the two BLOCK_M values per
+        # M (see the tuning script's post-processing step) so this
+        # assertion never trips.
         gate_up_config, (down_config, _max_block_m) = try_get_optimal_moe_config(
             w1_shape=quant_info.w13_weight.shape,
             w2_shape=quant_info.w2_weight.shape,
@@ -181,7 +183,7 @@ class OmnivaMxfp4RunnerCore(MoeRunnerCore):
         )
         if down_config is None:
             # No tuned down-config JSON; reuse the gate-up config.
-            # Safe because the two kernels share a signature/constraints.
+            # Safe because the two kernels share signature/constraints.
             down_config = dict(gate_up_config)
 
         assert gate_up_config["BLOCK_SIZE_K"] % _MXFP_BLOCK == 0, (
