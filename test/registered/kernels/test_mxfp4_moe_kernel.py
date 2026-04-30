@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Unit tests for the MXFP4 fused MoE kernel
 (``fused_moe_kernel_mxfp4`` / ``invoke_fused_moe_kernel_mxfp4``).
@@ -18,7 +19,11 @@ Test matrix (tuned for gpt-oss-120b target shapes; kernel is generic):
 - M tokens      ∈ {1, 4, 16, 32, 128, 144, 256}
 
 Usage:
-    python -m pytest test/srt/test_mxfp4_moe_kernel.py -v
+    # CI runner (what test/run_suite.py uses):
+    python3 test/run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+
+    # Single-file pytest:
+    python -m pytest test/registered/kernels/test_mxfp4_moe_kernel.py -v
 """
 
 from __future__ import annotations
@@ -33,6 +38,13 @@ try:
     HAS_CUDA = torch.cuda.is_available()
 except ImportError:
     HAS_CUDA = False
+
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
+
+# CI: H100-class runner (needs MXFP4 weight path + H100 triton).
+# est_time ~20s locally; 60s gives CI partitioning headroom.
+register_cuda_ci(est_time=60, suite="stage-b-kernel-unit-1-gpu-large")
 
 
 def _pack_mxfp4_reference(weight_fp32: torch.Tensor):
@@ -136,7 +148,7 @@ def _upcast_mxfp4_reference(
 
 
 @unittest.skipUnless(HAS_CUDA, "CUDA not available")
-class TestMxfp4Decode(unittest.TestCase):
+class TestMxfp4Decode(CustomTestCase):
     """Standalone decode test: the kernel's bit-arithmetic E2M1 decode
     must reconstruct the original values when we provide synthetic packed
     data with known contents."""
@@ -214,7 +226,7 @@ class TestMxfp4Decode(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_CUDA, "CUDA not available")
-class TestMxfp4MatmulGolden(unittest.TestCase):
+class TestMxfp4MatmulGolden(CustomTestCase):
     """Golden test: run our kernel and compare to the same MoE matmul
     computed via _upcast_mxfp4_reference + PyTorch reference matmul."""
 
@@ -330,7 +342,143 @@ class TestMxfp4MatmulGolden(unittest.TestCase):
         self.assertLess(rel, 0.15, f"rel_err={rel}")
 
 
-class TestAutotuneWiring(unittest.TestCase):
+@unittest.skipUnless(HAS_CUDA, "CUDA not available")
+class TestMxfp4NaNPropAndFilter(CustomTestCase):
+    """Covers two paths not exercised by the random-weight golden tests:
+    (a) the ``enable_nan_prop=True`` path when a scale byte is actually
+        0xFF (the MXFP NaN tag); the entire 32-value K-block for that
+        column must poison its accumulation with NaN.
+    (b) ``filter_expert=True`` with ``expert_ids`` containing ``-1`` —
+        those blocks must get zeroed output, not garbage.
+    """
+
+    def test_nan_scale_byte_produces_nan_output(self):
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            invoke_fused_moe_kernel_mxfp4,
+        )
+
+        device = "cuda"
+        torch.manual_seed(0)
+        M, N, K, E, topk = 16, 128, 128, 4, 2
+
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.3
+        W = torch.randn(E, N, K, dtype=torch.float32, device=device) * 0.3
+        packed, scales = _pack_mxfp4_reference(W)
+        # Tag the first 32-value K-block of expert 0 column 0 as NaN.
+        scales[0, 0, 0] = 0xFF
+
+        topk_ids = torch.zeros((M, topk), dtype=torch.int32, device=device)
+        topk_ids[:, 0] = 0  # route every token through expert 0
+        topk_weights = torch.ones(M, topk, dtype=torch.float32, device=device)
+
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        BLOCK_M = 16
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, BLOCK_M, E
+        )
+        C = torch.zeros((M * topk, N), dtype=torch.bfloat16, device=device)
+
+        config = {
+            "BLOCK_SIZE_M": BLOCK_M,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+        invoke_fused_moe_kernel_mxfp4(
+            A, packed, scales, C, topk_weights, topk_ids,
+            sorted_token_ids, expert_ids, num_tokens_post_padded,
+            mul_routed_weight=False, top_k=topk, config=config,
+            compute_type=tl.bfloat16, filter_expert=False,
+            enable_nan_prop=True,
+        )
+
+        # Any token routed to expert 0, column 0 should be NaN (its
+        # accumulator consumed a NaN b-tile).
+        expert0_rows_col0 = C[topk_ids.reshape(-1) == 0][:, 0]
+        self.assertTrue(
+            torch.isnan(expert0_rows_col0.float()).all(),
+            f"expected NaN in expert-0 col-0 rows, got {expert0_rows_col0}",
+        )
+
+    def test_filter_expert_zeroes_negative_expert_rows(self):
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            invoke_fused_moe_kernel_mxfp4,
+        )
+
+        device = "cuda"
+        torch.manual_seed(1)
+        M, N, K, E, topk = 16, 128, 128, 4, 2
+
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.3
+        W = torch.randn(E, N, K, dtype=torch.float32, device=device) * 0.3
+        packed, scales = _pack_mxfp4_reference(W)
+
+        topk_ids = torch.randint(0, E, (M, topk), dtype=torch.int32, device=device)
+        topk_weights = torch.ones(M, topk, dtype=torch.float32, device=device)
+
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        BLOCK_M = 16
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, BLOCK_M, E
+        )
+
+        # Simulate an EP deployment where expert 0 is not local: set its
+        # expert_ids entries to -1. The kernel must zero those rows under
+        # filter_expert=True rather than dispatching to a garbage expert.
+        expert_ids_filtered = expert_ids.clone()
+        expert_ids_filtered[expert_ids == 0] = -1
+
+        # Pre-fill C with a sentinel so we can tell "kernel did not write"
+        # apart from "kernel wrote the right value (happens to be 0)".
+        C = torch.full(
+            (M * topk, N), fill_value=1.0, dtype=torch.bfloat16, device=device
+        )
+        config = {
+            "BLOCK_SIZE_M": BLOCK_M,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+        invoke_fused_moe_kernel_mxfp4(
+            A, packed, scales, C, topk_weights, topk_ids,
+            sorted_token_ids, expert_ids_filtered, num_tokens_post_padded,
+            mul_routed_weight=False, top_k=topk, config=config,
+            compute_type=tl.bfloat16, filter_expert=True,
+            enable_nan_prop=False,
+        )
+
+        # Every token routed to expert 0 should have an all-zero output row.
+        # Every token routed to a non-filtered expert should be populated (not
+        # the 1.0 sentinel and not 0.0 unless by coincidence).
+        flat = topk_ids.reshape(-1)
+        zeroed_mask = flat == 0
+        populated_mask = ~zeroed_mask
+        zeroed_rows = C[zeroed_mask].to(torch.float32)
+        populated_rows = C[populated_mask].to(torch.float32)
+        self.assertTrue(
+            (zeroed_rows == 0).all(),
+            f"filter_expert=True should zero filtered rows; got nonzero "
+            f"entries in {zeroed_rows}",
+        )
+        # Populated rows must not be the sentinel (i.e. kernel did write them).
+        self.assertFalse(
+            (populated_rows == 1.0).all(),
+            "populated rows should have real accumulator output, not the "
+            "1.0 sentinel",
+        )
+
+
+class TestAutotuneWiring(CustomTestCase):
     """Sanity checks that the Omniva MXFP4 runner plugs into the autotune
     infrastructure the same way other kernels do. Doesn't need CUDA."""
 

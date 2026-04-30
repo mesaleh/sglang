@@ -13,6 +13,43 @@ weights directly: no swizzle, no upcast. See:
 
 and the design document at
 ``OmniSec/Inference/GPT-OSS/Design - MXFP4 MoE Runner Kernel.md``.
+
+When to pick this backend (``--moe-runner-backend omniva_mxfp4``)
+----------------------------------------------------------------
+
+Choose this over ``triton_kernel`` when any of the following is true:
+
+* The model is MXFP4-quantized **and** deployment fits only when weights
+  stay packed (bf16 upcast would OOM). Our kernel is the only MXFP4
+  runner that skips the bf16 upcast.
+* ``triton_kernel`` (upstream ``matmul_ogs``) is crashing on your shapes
+  with a state-dependent CUDA illegal memory access — we've seen this on
+  gpt-oss-120b at TP=1 and the crash is not reliably worked around via
+  ``SGLANG_TRITON_KERNELS_NO_PERSISTENT``.
+* ``flashinfer_mxfp4`` is out because its ``K % 4 == 0`` shuffle-layout
+  assertion rejects your model (e.g. gpt-oss intermediate_size=2880).
+* You want a pure-Triton, non-TMA MoE path for correctness
+  reproducibility (no ``triton_kernels`` package dependency, no
+  persistent-grid tricks).
+
+Prefer ``triton_kernel`` when it works on your shapes: it tends to be
+faster at higher batch sizes because it uses TMA + persistent grids and
+fuses activation into the kernel. Our runner is tuned for c=1 bs=1 and
+is approximately HBM-optimal there, but leaves perf on the table at
+larger batch (bias/swiglu between kernel launches is not fused; tile
+configs via autotune are still coarse).
+
+Assumptions / invariants
+------------------------
+
+* ``is_gated=True`` (required; we assume gate+up fused in ``w13``).
+* ``activation="silu"`` (swiglu, including gpt-oss ``alpha``/
+  ``clamp_limit``).
+* ``moe_ep_size == 1`` (asserted in ``Mxfp4MoEMethod.apply``). EP>1 is
+  untested here.
+* Weights must come in the canonical packed layout produced by
+  ``Mxfp4MoEMethod.create_weights`` (uint8 ``[E, 2N, K/2]`` +
+  ``[E, 2N, K/32]`` scales + ``[E, 2N]`` bf16 bias).
 """
 
 from __future__ import annotations
