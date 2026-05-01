@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 from sgl_kernel import gelu_and_mul, silu_and_mul
+import os as _os
+
 from triton_kernels.matmul_ogs import (
     FlexCtx,
     FnSpecs,
@@ -13,9 +15,93 @@ from triton_kernels.matmul_ogs import (
     PrecisionConfig,
     matmul_ogs,
 )
+from triton_kernels.matmul_ogs_details.opt_flags import (
+    update_opt_flags_constraints,
+)
 from triton_kernels.numerics import InFlexData
 from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
+
+# gpt-oss-120b @ TP=1 single-H100 reproducibly hits a CUDA illegal memory
+# access inside triton_kernels' persistent matmul (_p_matmul_ogs) for MXFP4
+# MoE expert matmuls on any prefill above ~40 tokens. Traced with
+# CUDA_LAUNCH_BLOCKING=1 on 2026-04-29 (see vault arc doc
+# OmniSec/Inference/GPT-OSS/Experiment Log - Single GPU via TurboQuant
+# 4-bit KV.md iteration 6 for the full crash stack). The non-persistent
+# variant (_matmul_ogs) handles the same shapes correctly — same math,
+# different launch pattern.
+#
+# Environment-variable gated so it only fires for deployments that opt in.
+# TP>=2 gpt-oss sweeps from March 2026 ran the persistent kernel without
+# issue; the crash may be specific to the tile shape reached when all 128
+# experts live on one GPU. Set SGLANG_TRITON_KERNELS_NO_PERSISTENT=1 in
+# the pod env to activate the workaround. Default behavior (no env var)
+# is upstream-identical.
+if _os.environ.get("SGLANG_TRITON_KERNELS_NO_PERSISTENT", "0") == "1":
+    import sys as _sys
+    print(
+        "[OMNIVA-PATCH] triton_kernels_moe.py: setting is_persistent=False "
+        "constraint on triton_kernels (via SGLANG_TRITON_KERNELS_NO_PERSISTENT)",
+        file=_sys.stderr,
+        flush=True,
+    )
+    update_opt_flags_constraints({"is_persistent": False})
+
+# Force specific block_m / block_k to diagnose whether tile-shape is the bug.
+# OMNIVA_TK_BLOCK_M / OMNIVA_TK_BLOCK_K can be set to override heuristics.
+_force_constraints = {}
+_block_m_env = _os.environ.get("OMNIVA_TK_BLOCK_M", "")
+if _block_m_env:
+    _force_constraints["block_m"] = int(_block_m_env)
+_block_k_env = _os.environ.get("OMNIVA_TK_BLOCK_K", "")
+if _block_k_env:
+    _force_constraints["block_k"] = int(_block_k_env)
+if _force_constraints:
+    import sys as _sys
+    print(
+        f"[OMNIVA-PATCH] triton_kernels_moe.py: forcing tile shape constraints "
+        f"{_force_constraints}",
+        file=_sys.stderr, flush=True,
+    )
+    update_opt_flags_constraints(_force_constraints)
+
+
+# Diagnostic: log the shape inputs to matmul_ogs so we can see which m,n,k
+# combination triggers the crash. Activated by OMNIVA_LOG_MATMUL_OGS=1.
+if _os.environ.get("OMNIVA_LOG_MATMUL_OGS", "0") == "1":
+    import sys as _sys
+    _original_matmul_ogs = matmul_ogs
+    _call_counter = [0]
+
+    def _matmul_ogs_logged(x, w, bias, *args, **kwargs):
+        _call_counter[0] += 1
+        cid = _call_counter[0]
+        try:
+            m_shape = tuple(x.shape)
+            w_shape = tuple(w.shape)
+        except Exception:
+            m_shape = "?"
+            w_shape = "?"
+        print(
+            f"[OMNIVA-MATMUL #{cid}] x.shape={m_shape} w.shape={w_shape} "
+            f"x.dtype={x.dtype} w.dtype={w.dtype}",
+            file=_sys.stderr, flush=True,
+        )
+        try:
+            return _original_matmul_ogs(x, w, bias, *args, **kwargs)
+        except Exception as e:
+            print(
+                f"[OMNIVA-MATMUL #{cid}] EXCEPTION {type(e).__name__}: {e}",
+                file=_sys.stderr, flush=True,
+            )
+            raise
+
+    matmul_ogs = _matmul_ogs_logged
+    print(
+        "[OMNIVA-PATCH] triton_kernels_moe.py: matmul_ogs wrapped for shape logging "
+        "(via OMNIVA_LOG_MATMUL_OGS). Disable in production — ~5 ms/call overhead.",
+        file=_sys.stderr, flush=True,
+    )
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig

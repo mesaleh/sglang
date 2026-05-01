@@ -143,6 +143,54 @@ class SWAKVPool(KVCache):
         else:
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
+    # Forward v_head_dim probes from attention backends (triton_backend,
+    # aiter_backend, wave_backend all read pool.get_value_buffer(0).shape[-1]
+    # or pool.get_v_head_dim() during __init__ to discover v_head_dim at
+    # backend setup time). Without this, SWAKVPool falls through to the
+    # get_value_buffer fallback, which raises on TurboQuant sub-pools
+    # because packed uint8 buffers have no bf16 shape to probe. Both
+    # sub-pools are constructed with the same head_dim / v_head_dim so
+    # forwarding from full_kv_pool is correct regardless of sub-pool type.
+    def get_v_head_dim(self):
+        return self.full_kv_pool.get_v_head_dim()
+
+    # --- TurboQuant passthrough ----------------------------------------------
+    # When the sub-pools are TurboQuant pools (token_to_kv_pool_class=
+    # MHATokenToKVPoolTurboQuant passed at construction), the attention
+    # backends need to reach the packed uint8 buffers and per-token dequant
+    # scales directly. The fast-path in triton_backend.py goes through these
+    # accessors instead of indexing .k_buffer/.v_buffer attributes, so SWA
+    # and flat pools share the same call shape.
+    #
+    # `tq_config` is a single config object per TQ pool; both sub-pools build
+    # theirs from identical args (turboquant_bits / k_bits / v_bits /
+    # uniform), so returning full_kv_pool.tq_config is correct — the config
+    # is keyed on bit width and head dim, not layer id.
+    @property
+    def tq_config(self):
+        return getattr(self.full_kv_pool, "tq_config", None)
+
+    def _tq_pool_for(self, layer_id: int):
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        sub = self.swa_kv_pool if is_swa_layer else self.full_kv_pool
+        return sub, layer_id_pool
+
+    def get_tq_k_buffer(self, layer_id: int):
+        sub, idx = self._tq_pool_for(layer_id)
+        return sub.k_buffer[idx]
+
+    def get_tq_v_buffer(self, layer_id: int):
+        sub, idx = self._tq_pool_for(layer_id)
+        return sub.v_buffer[idx]
+
+    def get_tq_k_dequant_scale(self, layer_id: int):
+        sub, idx = self._tq_pool_for(layer_id)
+        return sub.k_dequant_scale_buffer[idx]
+
+    def get_tq_v_dequant_scale(self, layer_id: int):
+        sub, idx = self._tq_pool_for(layer_id)
+        return sub.v_dequant_scale_buffer[idx]
+
     def set_swa_loc(self, loc: torch.Tensor):
         self.swa_loc = loc
 

@@ -47,6 +47,11 @@ def _fwd_tq_extend_kernel(
     mask_indptr,
     # Sink
     sink_ptr,
+    # Sliding-window per-seq kv base offset (int tensor [bs], or None when
+    # the caller uses a windowed pool that already trims kv_indices — in
+    # that case SLIDING_WINDOW_SIZE > 0 with USE_CUSTOM_MASK False and this
+    # pointer is never dereferenced).
+    window_kv_offset_ptr,
     # Scalars
     sm_scale,
     kv_group_num,
@@ -89,6 +94,13 @@ def _fwd_tq_extend_kernel(
     USE_CUSTOM_MASK: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    # Sliding-window size (-1 disables SWA and keeps backward-compat byte
+    # identity with pre-change kernel). When > 0, query at absolute position
+    # q_abs attends only to kv tokens with kv_abs >= q_abs - SLIDING_WINDOW_SIZE.
+    # The skip-tile optimization below turns this into a fast path when most
+    # kv tiles fall outside the window — essential for long-context SWA
+    # models (e.g. gpt-oss-120b, 18 SWA layers at window=128 over 128K ctx).
+    SLIDING_WINDOW_SIZE: tl.constexpr,
     UNIFORM: tl.constexpr = False,
 ):
     cur_seq = tl.program_id(0)
@@ -104,6 +116,15 @@ def _fwd_tq_extend_kernel(
 
     if USE_CUSTOM_MASK:
         cur_seq_mask_start_idx = tl.load(mask_indptr + cur_seq)
+
+    # For windowed custom masks the mask storage is only allocated for the
+    # last SLIDING_WINDOW_SIZE kv tokens of each seq; window_kv_offset_ptr
+    # shifts the mask index base accordingly. In the non-custom-mask SWA
+    # path (the standard generation case for gpt-oss) the pool is already
+    # windowed so this stays 0.
+    window_kv_offset = 0
+    if USE_CUSTOM_MASK and SLIDING_WINDOW_SIZE > 0:
+        window_kv_offset = tl.load(window_kv_offset_ptr + cur_seq)
 
     # Separate offset ranges for K and V packed dims
     offs_kp = tl.arange(0, K_BLOCK_PACKED_DIM)
@@ -214,7 +235,8 @@ def _fwd_tq_extend_kernel(
                 mask_ptr
                 + cur_seq_mask_start_idx
                 + (cur_block_m * BLOCK_M + offs_m[:, None])
-                * cur_seq_len
+                * (cur_seq_len + window_kv_offset)
+                + window_kv_offset
                 + start_n
                 + offs_n[None, :],
                 mask=final_mask,
@@ -222,116 +244,139 @@ def _fwd_tq_extend_kernel(
             )
             final_mask &= custom_mask
 
-        # Load kv_loc via indirection
-        offs_kv_loc = tl.load(
-            kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
-            mask=mask_n,
-            other=0,
-        )
+        # Sliding-window mask: query at absolute position
+        # q_abs = cur_seq_len_prefix + cur_block_m*BLOCK_M + offs_m attends to
+        # kv in prefix-space at kv_abs = start_n + offs_n iff
+        # q_abs <= kv_abs + SLIDING_WINDOW_SIZE, i.e. kv is within the last
+        # SLIDING_WINDOW_SIZE tokens before the query. Matches
+        # extend_attention.py _fwd_kernel's prefix-stage window formulation.
+        if SLIDING_WINDOW_SIZE > 0:
+            window_mask = (
+                cur_seq_len_prefix + cur_block_m * BLOCK_M + offs_m[:, None]
+            ) <= (start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE)
+            final_mask &= window_mask
 
-        # --- K: load packed uint8, K codebook lookup (K params) ---
-        offs_buf_kp = (
-            offs_kv_loc[None, :] * stride_kp_bs
-            + cur_kv_head * stride_kp_h
-            + offs_kp[:, None]
-        )
-        packed_k = tl.load(
-            K_Packed + offs_buf_kp,
-            mask=mask_n[None, :] & mask_kp[:, None],
-            other=0,
-        )
+        # Skip the entire tile body when every element of final_mask is
+        # False. Critical perf optimization for SWA with window << context
+        # (gpt-oss: window=128 vs 128K ctx → ~99.9% of prefix tiles fully
+        # outside the window and skippable). When skipped, e_max / deno /
+        # acc stay at their current state — correct because a -inf qk row
+        # contributes exp(-inf)=0 to deno and nothing to acc anyway.
+        SKIP_TILE = False
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
-        k_idx_0 = (packed_k & K_BIT_MASK).to(tl.int32)
-        k_idx_1 = ((packed_k >> K_BITS_PER_VAL) & K_BIT_MASK).to(tl.int32)
-        if K_VALS_PER_BYTE == 4:
-            k_0 = _lookup_2bit(k_idx_0, kc0, kc1, kc2, kc3)
-            k_1 = _lookup_2bit(k_idx_1, kc0, kc1, kc2, kc3)
-        else:
-            k_0 = _lookup_4bit(k_idx_0, kc0, kc1, kc2, kc3, kc4, kc5, kc6, kc7,
-                               kc8, kc9, kc10, kc11, kc12, kc13, kc14, kc15, UNIFORM=UNIFORM)
-            k_1 = _lookup_4bit(k_idx_1, kc0, kc1, kc2, kc3, kc4, kc5, kc6, kc7,
-                               kc8, kc9, kc10, kc11, kc12, kc13, kc14, kc15, UNIFORM=UNIFORM)
+        if not SKIP_TILE:
+            # Load kv_loc via indirection
+            offs_kv_loc = tl.load(
+                kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+                mask=mask_n,
+                other=0,
+            )
 
-        qk = tl.dot(q_0, k_0.to(q_0.dtype)) + tl.dot(q_1, k_1.to(q_1.dtype))
+            # --- K: load packed uint8, K codebook lookup (K params) ---
+            offs_buf_kp = (
+                offs_kv_loc[None, :] * stride_kp_bs
+                + cur_kv_head * stride_kp_h
+                + offs_kp[:, None]
+            )
+            packed_k = tl.load(
+                K_Packed + offs_buf_kp,
+                mask=mask_n[None, :] & mask_kp[:, None],
+                other=0,
+            )
 
-        if K_VALS_PER_BYTE == 4:
-            k_idx_2 = ((packed_k >> (2 * K_BITS_PER_VAL)) & K_BIT_MASK).to(tl.int32)
-            k_idx_3 = ((packed_k >> (3 * K_BITS_PER_VAL)) & K_BIT_MASK).to(tl.int32)
-            k_2 = _lookup_2bit(k_idx_2, kc0, kc1, kc2, kc3)
-            k_3 = _lookup_2bit(k_idx_3, kc0, kc1, kc2, kc3)
-            qk += tl.dot(q_2, k_2.to(q_2.dtype)) + tl.dot(q_3, k_3.to(q_3.dtype))
+            k_idx_0 = (packed_k & K_BIT_MASK).to(tl.int32)
+            k_idx_1 = ((packed_k >> K_BITS_PER_VAL) & K_BIT_MASK).to(tl.int32)
+            if K_VALS_PER_BYTE == 4:
+                k_0 = _lookup_2bit(k_idx_0, kc0, kc1, kc2, kc3)
+                k_1 = _lookup_2bit(k_idx_1, kc0, kc1, kc2, kc3)
+            else:
+                k_0 = _lookup_4bit(k_idx_0, kc0, kc1, kc2, kc3, kc4, kc5, kc6, kc7,
+                                   kc8, kc9, kc10, kc11, kc12, kc13, kc14, kc15, UNIFORM=UNIFORM)
+                k_1 = _lookup_4bit(k_idx_1, kc0, kc1, kc2, kc3, kc4, kc5, kc6, kc7,
+                                   kc8, kc9, kc10, kc11, kc12, kc13, kc14, kc15, UNIFORM=UNIFORM)
 
-        # K dequant scale
-        k_dscale = tl.load(
-            K_DScale + offs_kv_loc * stride_kds_bs + cur_kv_head,
-            mask=mask_n, other=1.0,
-        ).to(tl.float32)
-        qk *= k_dscale[None, :]
-        qk *= sm_scale
+            qk = tl.dot(q_0, k_0.to(q_0.dtype)) + tl.dot(q_1, k_1.to(q_1.dtype))
 
-        if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            if K_VALS_PER_BYTE == 4:
+                k_idx_2 = ((packed_k >> (2 * K_BITS_PER_VAL)) & K_BIT_MASK).to(tl.int32)
+                k_idx_3 = ((packed_k >> (3 * K_BITS_PER_VAL)) & K_BIT_MASK).to(tl.int32)
+                k_2 = _lookup_2bit(k_idx_2, kc0, kc1, kc2, kc3)
+                k_3 = _lookup_2bit(k_idx_3, kc0, kc1, kc2, kc3)
+                qk += tl.dot(q_2, k_2.to(q_2.dtype)) + tl.dot(q_3, k_3.to(q_3.dtype))
 
-        if xai_temperature_len > 0:
-            qk *= xai_temperature_reg[:, None]
+            # K dequant scale
+            k_dscale = tl.load(
+                K_DScale + offs_kv_loc * stride_kds_bs + cur_kv_head,
+                mask=mask_n, other=1.0,
+            ).to(tl.float32)
+            qk *= k_dscale[None, :]
+            qk *= sm_scale
 
-        qk = tl.where(final_mask, qk, float("-inf"))
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
 
-        # --- V: load packed uint8, V codebook lookup (V params) ---
-        offs_buf_vp = (
-            offs_kv_loc[:, None] * stride_vp_bs
-            + cur_kv_head * stride_vp_h
-            + offs_vp[None, :]
-        )
-        packed_v = tl.load(
-            V_Packed + offs_buf_vp,
-            mask=mask_n[:, None] & mask_vp[None, :],
-            other=0,
-        )
-        v_idx_0 = (packed_v & V_BIT_MASK).to(tl.int32)
-        v_idx_1 = ((packed_v >> V_BITS_PER_VAL) & V_BIT_MASK).to(tl.int32)
-        if V_VALS_PER_BYTE == 4:
-            v_0 = _lookup_2bit(v_idx_0, vc0, vc1, vc2, vc3)
-            v_1 = _lookup_2bit(v_idx_1, vc0, vc1, vc2, vc3)
-        else:
-            v_0 = _lookup_4bit(v_idx_0, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
-                               vc8, vc9, vc10, vc11, vc12, vc13, vc14, vc15, UNIFORM=UNIFORM)
-            v_1 = _lookup_4bit(v_idx_1, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
-                               vc8, vc9, vc10, vc11, vc12, vc13, vc14, vc15, UNIFORM=UNIFORM)
-        if V_VALS_PER_BYTE == 4:
-            v_idx_2 = ((packed_v >> (2 * V_BITS_PER_VAL)) & V_BIT_MASK).to(tl.int32)
-            v_idx_3 = ((packed_v >> (3 * V_BITS_PER_VAL)) & V_BIT_MASK).to(tl.int32)
-            v_2 = _lookup_2bit(v_idx_2, vc0, vc1, vc2, vc3)
-            v_3 = _lookup_2bit(v_idx_3, vc0, vc1, vc2, vc3)
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
 
-        # Online softmax
-        row_max = tl.max(qk, 1)
-        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-        n_e_max = tl.maximum(row_max_fixed, e_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
-        deno = deno * re_scale + tl.sum(p, 1)
+            qk = tl.where(final_mask, qk, float("-inf"))
 
-        acc_0 *= re_scale[:, None]
-        acc_1 *= re_scale[:, None]
-        if V_VALS_PER_BYTE == 4:
-            acc_2 *= re_scale[:, None]
-            acc_3 *= re_scale[:, None]
+            # --- V: load packed uint8, V codebook lookup (V params) ---
+            offs_buf_vp = (
+                offs_kv_loc[:, None] * stride_vp_bs
+                + cur_kv_head * stride_vp_h
+                + offs_vp[None, :]
+            )
+            packed_v = tl.load(
+                V_Packed + offs_buf_vp,
+                mask=mask_n[:, None] & mask_vp[None, :],
+                other=0,
+            )
+            v_idx_0 = (packed_v & V_BIT_MASK).to(tl.int32)
+            v_idx_1 = ((packed_v >> V_BITS_PER_VAL) & V_BIT_MASK).to(tl.int32)
+            if V_VALS_PER_BYTE == 4:
+                v_0 = _lookup_2bit(v_idx_0, vc0, vc1, vc2, vc3)
+                v_1 = _lookup_2bit(v_idx_1, vc0, vc1, vc2, vc3)
+            else:
+                v_0 = _lookup_4bit(v_idx_0, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+                                   vc8, vc9, vc10, vc11, vc12, vc13, vc14, vc15, UNIFORM=UNIFORM)
+                v_1 = _lookup_4bit(v_idx_1, vc0, vc1, vc2, vc3, vc4, vc5, vc6, vc7,
+                                   vc8, vc9, vc10, vc11, vc12, vc13, vc14, vc15, UNIFORM=UNIFORM)
+            if V_VALS_PER_BYTE == 4:
+                v_idx_2 = ((packed_v >> (2 * V_BITS_PER_VAL)) & V_BIT_MASK).to(tl.int32)
+                v_idx_3 = ((packed_v >> (3 * V_BITS_PER_VAL)) & V_BIT_MASK).to(tl.int32)
+                v_2 = _lookup_2bit(v_idx_2, vc0, vc1, vc2, vc3)
+                v_3 = _lookup_2bit(v_idx_3, vc0, vc1, vc2, vc3)
 
-        # V dequant scale + accumulate
-        v_dscale = tl.load(
-            V_DScale + offs_kv_loc * stride_vds_bs + cur_kv_head,
-            mask=mask_n, other=1.0,
-        ).to(tl.float32)
-        p_scaled = p * v_dscale[None, :]
+            # Online softmax
+            row_max = tl.max(qk, 1)
+            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+            n_e_max = tl.maximum(row_max_fixed, e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            deno = deno * re_scale + tl.sum(p, 1)
 
-        acc_0 += tl.dot(p_scaled.to(v_0.dtype), v_0)
-        acc_1 += tl.dot(p_scaled.to(v_1.dtype), v_1)
-        if V_VALS_PER_BYTE == 4:
-            acc_2 += tl.dot(p_scaled.to(v_2.dtype), v_2)
-            acc_3 += tl.dot(p_scaled.to(v_3.dtype), v_3)
+            acc_0 *= re_scale[:, None]
+            acc_1 *= re_scale[:, None]
+            if V_VALS_PER_BYTE == 4:
+                acc_2 *= re_scale[:, None]
+                acc_3 *= re_scale[:, None]
 
-        e_max = n_e_max
+            # V dequant scale + accumulate
+            v_dscale = tl.load(
+                V_DScale + offs_kv_loc * stride_vds_bs + cur_kv_head,
+                mask=mask_n, other=1.0,
+            ).to(tl.float32)
+            p_scaled = p * v_dscale[None, :]
+
+            acc_0 += tl.dot(p_scaled.to(v_0.dtype), v_0)
+            acc_1 += tl.dot(p_scaled.to(v_1.dtype), v_1)
+            if V_VALS_PER_BYTE == 4:
+                acc_2 += tl.dot(p_scaled.to(v_2.dtype), v_2)
+                acc_3 += tl.dot(p_scaled.to(v_3.dtype), v_3)
+
+            e_max = n_e_max
 
     # =========================================================
     # STAGE 2: Extend/triangle loop — bf16 with strided loads
@@ -353,7 +398,8 @@ def _fwd_tq_extend_kernel(
                 mask_ptr
                 + cur_seq_mask_start_idx
                 + (cur_block_m * BLOCK_M + offs_m[:, None])
-                * cur_seq_len
+                * (cur_seq_len + window_kv_offset)
+                + window_kv_offset
                 + cur_seq_len_prefix
                 + start_n
                 + offs_n[None, :],
@@ -371,76 +417,91 @@ def _fwd_tq_extend_kernel(
         else:
             final_mask &= mask_m[:, None] & mask_n[None, :]
 
-        # Load K_Extend with K stride pattern (transposed: [K_PACKED_DIM, BLOCK_N])
-        k_ext_base = (
-            (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
-            + cur_kv_head * stride_kh
-        )
-        offs_k_0 = k_ext_base + (K_VALS_PER_BYTE * offs_kp[:, None])
-        offs_k_1 = k_ext_base + (K_VALS_PER_BYTE * offs_kp[:, None] + 1)
-        mask_k = mask_n[None, :] & mask_kp[:, None]
+        # Sliding-window mask in extend-space: both query and kv are in the
+        # extend chunk so prefix offset cancels from both sides. Same
+        # formulation as extend_attention.py _fwd_kernel's extend-stage
+        # window mask.
+        if SLIDING_WINDOW_SIZE > 0:
+            window_mask = (cur_block_m * BLOCK_M + offs_m[:, None]) <= (
+                start_n + offs_n[None, :] + SLIDING_WINDOW_SIZE
+            )
+            final_mask &= window_mask
 
-        k_ext_0 = tl.load(K_Extend + offs_k_0, mask=mask_k, other=0.0)
-        k_ext_1 = tl.load(K_Extend + offs_k_1, mask=mask_k, other=0.0)
+        SKIP_TILE = False
+        if USE_CUSTOM_MASK or SLIDING_WINDOW_SIZE > 0:
+            SKIP_TILE = tl.max(tl.max(final_mask.to(tl.int32), axis=1), axis=0) == 0
 
-        qk = tl.dot(q_0, k_ext_0.to(q_0.dtype)) + tl.dot(q_1, k_ext_1.to(q_1.dtype))
+        if not SKIP_TILE:
+            # Load K_Extend with K stride pattern (transposed: [K_PACKED_DIM, BLOCK_N])
+            k_ext_base = (
+                (cur_seq_extend_start_idx + start_n + offs_n[None, :]) * stride_kbs
+                + cur_kv_head * stride_kh
+            )
+            offs_k_0 = k_ext_base + (K_VALS_PER_BYTE * offs_kp[:, None])
+            offs_k_1 = k_ext_base + (K_VALS_PER_BYTE * offs_kp[:, None] + 1)
+            mask_k = mask_n[None, :] & mask_kp[:, None]
 
-        if K_VALS_PER_BYTE == 4:
-            offs_k_2 = k_ext_base + (4 * offs_kp[:, None] + 2)
-            offs_k_3 = k_ext_base + (4 * offs_kp[:, None] + 3)
-            k_ext_2 = tl.load(K_Extend + offs_k_2, mask=mask_k, other=0.0)
-            k_ext_3 = tl.load(K_Extend + offs_k_3, mask=mask_k, other=0.0)
-            qk += tl.dot(q_2, k_ext_2.to(q_2.dtype)) + tl.dot(q_3, k_ext_3.to(q_3.dtype))
+            k_ext_0 = tl.load(K_Extend + offs_k_0, mask=mask_k, other=0.0)
+            k_ext_1 = tl.load(K_Extend + offs_k_1, mask=mask_k, other=0.0)
 
-        qk *= sm_scale
+            qk = tl.dot(q_0, k_ext_0.to(q_0.dtype)) + tl.dot(q_1, k_ext_1.to(q_1.dtype))
 
-        if logit_cap > 0:
-            qk = logit_cap * tanh(qk / logit_cap)
+            if K_VALS_PER_BYTE == 4:
+                offs_k_2 = k_ext_base + (4 * offs_kp[:, None] + 2)
+                offs_k_3 = k_ext_base + (4 * offs_kp[:, None] + 3)
+                k_ext_2 = tl.load(K_Extend + offs_k_2, mask=mask_k, other=0.0)
+                k_ext_3 = tl.load(K_Extend + offs_k_3, mask=mask_k, other=0.0)
+                qk += tl.dot(q_2, k_ext_2.to(q_2.dtype)) + tl.dot(q_3, k_ext_3.to(q_3.dtype))
 
-        if xai_temperature_len > 0:
-            qk *= xai_temperature_reg[:, None]
+            qk *= sm_scale
 
-        qk = tl.where(final_mask, qk, float("-inf"))
+            if logit_cap > 0:
+                qk = logit_cap * tanh(qk / logit_cap)
 
-        # Online softmax
-        row_max = tl.max(qk, 1)
-        row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
-        n_e_max = tl.maximum(row_max_fixed, e_max)
-        re_scale = tl.exp(e_max - n_e_max)
-        p = tl.exp(qk - n_e_max[:, None])
-        deno = deno * re_scale + tl.sum(p, 1)
+            if xai_temperature_len > 0:
+                qk *= xai_temperature_reg[:, None]
 
-        acc_0 *= re_scale[:, None]
-        acc_1 *= re_scale[:, None]
-        if V_VALS_PER_BYTE == 4:
-            acc_2 *= re_scale[:, None]
-            acc_3 *= re_scale[:, None]
+            qk = tl.where(final_mask, qk, float("-inf"))
 
-        # Load V_Extend with V stride pattern [BLOCK_N, V_PACKED_DIM]
-        v_ext_base = (
-            (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
-            + cur_kv_head * stride_vh
-        )
-        offs_v_0 = v_ext_base + (V_VALS_PER_BYTE * offs_vp[None, :])
-        offs_v_1 = v_ext_base + (V_VALS_PER_BYTE * offs_vp[None, :] + 1)
-        mask_v = mask_n[:, None] & mask_vp[None, :]
+            # Online softmax
+            row_max = tl.max(qk, 1)
+            row_max_fixed = tl.where(row_max == float("-inf"), -1e20, row_max)
+            n_e_max = tl.maximum(row_max_fixed, e_max)
+            re_scale = tl.exp(e_max - n_e_max)
+            p = tl.exp(qk - n_e_max[:, None])
+            deno = deno * re_scale + tl.sum(p, 1)
 
-        v_ext_0 = tl.load(V_Extend + offs_v_0, mask=mask_v, other=0.0)
-        v_ext_1 = tl.load(V_Extend + offs_v_1, mask=mask_v, other=0.0)
+            acc_0 *= re_scale[:, None]
+            acc_1 *= re_scale[:, None]
+            if V_VALS_PER_BYTE == 4:
+                acc_2 *= re_scale[:, None]
+                acc_3 *= re_scale[:, None]
 
-        p_cast = p.to(v_ext_0.dtype)
-        acc_0 += tl.dot(p_cast, v_ext_0)
-        acc_1 += tl.dot(p_cast, v_ext_1)
+            # Load V_Extend with V stride pattern [BLOCK_N, V_PACKED_DIM]
+            v_ext_base = (
+                (cur_seq_extend_start_idx + start_n + offs_n[:, None]) * stride_vbs
+                + cur_kv_head * stride_vh
+            )
+            offs_v_0 = v_ext_base + (V_VALS_PER_BYTE * offs_vp[None, :])
+            offs_v_1 = v_ext_base + (V_VALS_PER_BYTE * offs_vp[None, :] + 1)
+            mask_v = mask_n[:, None] & mask_vp[None, :]
 
-        if V_VALS_PER_BYTE == 4:
-            offs_v_2 = v_ext_base + (4 * offs_vp[None, :] + 2)
-            offs_v_3 = v_ext_base + (4 * offs_vp[None, :] + 3)
-            v_ext_2 = tl.load(V_Extend + offs_v_2, mask=mask_v, other=0.0)
-            v_ext_3 = tl.load(V_Extend + offs_v_3, mask=mask_v, other=0.0)
-            acc_2 += tl.dot(p_cast, v_ext_2)
-            acc_3 += tl.dot(p_cast, v_ext_3)
+            v_ext_0 = tl.load(V_Extend + offs_v_0, mask=mask_v, other=0.0)
+            v_ext_1 = tl.load(V_Extend + offs_v_1, mask=mask_v, other=0.0)
 
-        e_max = n_e_max
+            p_cast = p.to(v_ext_0.dtype)
+            acc_0 += tl.dot(p_cast, v_ext_0)
+            acc_1 += tl.dot(p_cast, v_ext_1)
+
+            if V_VALS_PER_BYTE == 4:
+                offs_v_2 = v_ext_base + (4 * offs_vp[None, :] + 2)
+                offs_v_3 = v_ext_base + (4 * offs_vp[None, :] + 3)
+                v_ext_2 = tl.load(V_Extend + offs_v_2, mask=mask_v, other=0.0)
+                v_ext_3 = tl.load(V_Extend + offs_v_3, mask=mask_v, other=0.0)
+                acc_2 += tl.dot(p_cast, v_ext_2)
+                acc_3 += tl.dot(p_cast, v_ext_3)
+
+            e_max = n_e_max
 
     # =========================================================
     # Sink handling
@@ -515,6 +576,8 @@ def tq_extend_attention_fwd(
     logit_cap=0.0,
     sinks=None,
     xai_temperature_len=-1,
+    sliding_window_size=-1,
+    window_kv_offsets=None,
     uniform=False,
 ):
     """Fused TurboQuant extend attention: reads packed uint8 KV directly.
@@ -522,6 +585,12 @@ def tq_extend_attention_fwd(
     Supports asymmetric K/V bit widths (e.g., K=4bit V=2bit).
     Both prefix (packed KV pool) and extend (fresh bf16) stages use
     N-way split dot products, with interleaved output store.
+
+    Sliding-window attention is supported via `sliding_window_size > 0`.
+    The kernel masks kv tokens outside the window per query and uses a
+    tile-skip optimization to avoid loading packed-KV tiles that fall
+    entirely outside the window. Essential for long-context SWA models
+    like gpt-oss-120b (18 of 36 layers at window=128).
     """
     assert k_bit_width in (2, 4), f"Unsupported K bit_width: {k_bit_width}"
     assert v_bit_width in (2, 4), f"Unsupported V bit_width: {v_bit_width}"
@@ -567,6 +636,7 @@ def tq_extend_attention_fwd(
         custom_mask,
         mask_indptr,
         sinks,
+        window_kv_offsets,
         sm_scale,
         kv_group_num,
         q_extend.stride(0), q_extend.stride(1),
@@ -595,6 +665,7 @@ def tq_extend_attention_fwd(
         USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         IS_CAUSAL=is_causal,
         HAS_SINK=HAS_SINK,
+        SLIDING_WINDOW_SIZE=sliding_window_size,
         UNIFORM=uniform,
         num_warps=4,
         num_stages=2,

@@ -1270,3 +1270,300 @@ def fused_append_shared_experts_with_weights(
         num_warps=1,
     )
     return out_ids, out_weights
+
+
+# -----------------------------------------------------------------------------
+# MXFP4 fused MoE kernel (Omniva)
+#
+# Designed to replace the OpenAI triton_kernels.matmul_ogs path for gpt-oss
+# on single-GPU (TP=1) where matmul_ogs hits a state-dependent CUDA illegal
+# memory access. Written as a sibling of fused_moe_kernel_gptq_awq — same
+# outer structure (pid swizzle, sorted_token_ids / expert_ids indirection,
+# f32 accumulator), with MXFP4-specific inline dequant:
+#   - Weight layout [E, N, K/2] uint8, packed along K (two E2M1 values per byte,
+#     low nibble = even K, high nibble = odd K).
+#   - Scale layout [E, N, K/32] uint8 E8M0 (one scale per 32 K values at
+#     each N column).
+# Decode formulas taken byte-for-byte from triton_kernels' _upcast_from_mxfp
+# so we can diff test outputs against that reference.
+#
+# See vault doc OmniSec/Inference/GPT-OSS/Design - MXFP4 MoE Runner Kernel.md.
+# -----------------------------------------------------------------------------
+@triton.jit
+def fused_moe_kernel_mxfp4(
+    # Pointers
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    b_scale_ptr,
+    topk_weights_ptr,
+    sorted_token_ids_ptr,
+    expert_ids_ptr,
+    num_tokens_post_padded_ptr,
+    # Dimensions
+    N: tl.constexpr,
+    K: tl.constexpr,
+    EM,
+    num_valid_tokens,
+    # Strides (elements, not bytes; stride_bk and stride_bsk are 1)
+    stride_am,
+    stride_ak,
+    stride_be,
+    stride_bn,
+    stride_bk,
+    stride_cm,
+    stride_cn,
+    stride_bse,
+    stride_bsn,
+    stride_bsk,
+    # Tile constants
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
+    MUL_ROUTED_WEIGHT: tl.constexpr,
+    top_k: tl.constexpr,
+    compute_type: tl.constexpr,
+    even_Ks: tl.constexpr,
+    filter_expert: tl.constexpr,
+    enable_nan_prop: tl.constexpr,
+):
+    """Fused MoE grouped matmul with inline MXFP4 weight dequant.
+
+    Mirrors the skeleton of ``fused_moe_kernel_gptq_awq``; the only replaced
+    region is the per-K-tile weight load + dequant. See module-level comment
+    for layout conventions.
+    """
+    # -- pid swizzle (identical to gptq skeleton) ---------------------------
+    pid = tl.program_id(axis=0)
+    num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
+    if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
+        return
+    offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
+    offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
+    token_mask = offs_token < num_valid_tokens
+
+    off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    if filter_expert and off_experts == -1:
+        write_zeros_to_output(
+            c_ptr,
+            stride_cm,
+            stride_cn,
+            pid_n,
+            N,
+            offs_token,
+            token_mask,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            compute_type,
+        )
+        return
+
+    # -- A and B pointer setup ---------------------------------------------
+    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    offs_k = tl.arange(0, BLOCK_SIZE_K)
+    a_ptrs = a_ptr + (
+        offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
+    )
+
+    # MXFP4: two E2M1 values per byte along K. We iterate K in pairs.
+    offs_k_pair = tl.arange(0, BLOCK_SIZE_K // 2)
+    offs_k_scale = tl.arange(0, BLOCK_SIZE_K // 32)
+    b_ptrs = (
+        b_ptr
+        + off_experts * stride_be
+        + offs_bn[None, :] * stride_bn
+        + offs_k_pair[:, None] * stride_bk
+    )
+    b_scale_ptrs = (
+        b_scale_ptr
+        + off_experts * stride_bse
+        + offs_bn[None, :] * stride_bsn
+        + offs_k_scale[:, None] * stride_bsk
+    )
+
+    # -- K loop -------------------------------------------------------------
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+        # Load A tile (bf16), mask across K boundary.
+        a = tl.load(
+            a_ptrs,
+            mask=token_mask[:, None] & (offs_k[None, :] < K - k * BLOCK_SIZE_K),
+            other=0.0,
+        )
+
+        # Load packed MXFP4 bytes. Shape (BLOCK_K/2, BLOCK_N) uint8.
+        # Mask the last K tile when K is not a multiple of BLOCK_SIZE_K.
+        if even_Ks:
+            packed = tl.load(b_ptrs)
+        else:
+            k_pair_mask = offs_k_pair[:, None] < (K - k * BLOCK_SIZE_K + 1) // 2
+            packed = tl.load(b_ptrs, mask=k_pair_mask, other=0)
+
+        # --- E2M1 -> bf16 bit-arithmetic decode (upstream canonical) --------
+        em0 = packed & 0x07
+        em1 = packed & 0x70
+        x0 = (em0.to(tl.uint16) << 6) | ((packed & 0x08).to(tl.uint16) << 12)
+        x1 = (em1.to(tl.uint16) << 2) | ((packed & 0x80).to(tl.uint16) << 8)
+        # Normal non-zero: add bias correction.
+        x0 = tl.where((em0 & 0x06) != 0, x0 + (126 << 7), x0)
+        x1 = tl.where((em1 & 0x60) != 0, x1 + (126 << 7), x1)
+        # Subnormal (0bs001) -> ±0.5.
+        x0 = tl.where(em0 == 0x01, 16128 | (x0 & 0x8000), x0)
+        x1 = tl.where(em1 == 0x10, 16128 | (x1 & 0x8000), x1)
+
+        # Interleave along K axis to reconstruct K-contiguous layout.
+        # tl.interleave works on the last axis only, so transpose first.
+        x0_t = tl.trans(x0)
+        x1_t = tl.trans(x1)
+        b_vals_u16 = tl.interleave(x0_t, x1_t)
+        b_vals_u16 = tl.trans(b_vals_u16)
+        b_vals = b_vals_u16.to(tl.bfloat16, bitcast=True)
+
+        # --- E8M0 scale decode + broadcast ---------------------------------
+        # Use other=0x7F so out-of-bounds scales decode to 2^0 = 1.0 (no-op);
+        # combined with the packed=0 load above (which decodes to +0.0), the
+        # tail K positions contribute 0 to the accumulator without NaN risk.
+        if even_Ks:
+            scale_u8 = tl.load(b_scale_ptrs)
+        else:
+            k_scale_mask = offs_k_scale[:, None] < tl.cdiv(
+                K - k * BLOCK_SIZE_K, 32
+            )
+            scale_u8 = tl.load(b_scale_ptrs, mask=k_scale_mask, other=0x7F)
+        scale_bf16 = (scale_u8.to(tl.uint16) << 7).to(tl.bfloat16, bitcast=True)
+
+        # Each scale row covers 32 K values at the same N column. Reshape
+        # b_vals to (BLOCK_K/32, 32, BLOCK_N), broadcast-multiply, reshape
+        # back. Matches upstream _upcast_from_mxfp.
+        b_vals_3d = tl.reshape(b_vals, [BLOCK_SIZE_K // 32, 32, BLOCK_SIZE_N])
+        scale_3d = tl.reshape(scale_bf16, [BLOCK_SIZE_K // 32, 1, BLOCK_SIZE_N])
+        b_tile = b_vals_3d * scale_3d
+        b_tile = tl.reshape(b_tile, [BLOCK_SIZE_K, BLOCK_SIZE_N])
+
+        # NaN propagation: scale byte 0xFF -> entire 32-block is NaN.
+        # Production gpt-oss weights never contain 0xFF so we gate this off
+        # for speed. The unit test (test_mxfp4_moe_kernel.py) exercises
+        # enable_nan_prop=True to validate the formula is correct.
+        if enable_nan_prop:
+            nan_row = scale_u8 == 0xFF
+            nan_3d = tl.reshape(nan_row, [BLOCK_SIZE_K // 32, 1, BLOCK_SIZE_N])
+            nan_3d = tl.broadcast_to(nan_3d, [BLOCK_SIZE_K // 32, 32, BLOCK_SIZE_N])
+            nan_mask = tl.reshape(nan_3d, [BLOCK_SIZE_K, BLOCK_SIZE_N])
+            b_tile = tl.where(nan_mask, float("nan"), b_tile)
+
+        # Accumulate.
+        accumulator = tl.dot(a, b_tile.to(compute_type), acc=accumulator)
+
+        # Advance pointers.
+        a_ptrs += BLOCK_SIZE_K * stride_ak
+        b_ptrs += (BLOCK_SIZE_K // 2) * stride_bk
+        b_scale_ptrs += (BLOCK_SIZE_K // 32) * stride_bsk
+
+    if MUL_ROUTED_WEIGHT:
+        moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
+        accumulator = accumulator * moe_weight[:, None]
+
+    accumulator = accumulator.to(compute_type)
+    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
+    c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    tl.store(c_ptrs, accumulator, mask=c_mask)
+
+
+def invoke_fused_moe_kernel_mxfp4(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    B_scale: torch.Tensor,
+    C: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    *,
+    mul_routed_weight: bool,
+    top_k: int,
+    config: Dict[str, Any],
+    compute_type: tl.dtype,
+    filter_expert: bool = True,
+    enable_nan_prop: bool = False,
+) -> None:
+    """Launch ``fused_moe_kernel_mxfp4``.
+
+    Args:
+        A: [M, K] bf16 activations.
+        B: [E, N, K/2] uint8 MXFP4 packed weights, K-contiguous.
+        B_scale: [E, N, K/32] uint8 E8M0 scales.
+        C: [M*top_k, N] bf16 output.
+        config: dict with BLOCK_SIZE_M / BLOCK_SIZE_N / BLOCK_SIZE_K /
+            GROUP_SIZE_M / num_warps / num_stages.
+    """
+    assert A.dtype == torch.bfloat16
+    assert B.dtype == torch.uint8
+    assert B_scale.dtype == torch.uint8
+    assert C.dtype == torch.bfloat16
+    assert topk_weights.stride(1) == 1
+    assert sorted_token_ids.stride(0) == 1
+
+    E, N, K_half = B.shape
+    K = K_half * 2
+    assert A.shape[1] == K, f"A[1]={A.shape[1]} must equal K={K}"
+    assert B_scale.shape == (E, N, K // 32), (
+        f"B_scale shape {tuple(B_scale.shape)} != expected ({E}, {N}, {K // 32})"
+    )
+    assert B.stride(2) == 1, f"B inner stride must be 1, got {B.stride(2)}"
+    assert B_scale.stride(2) == 1, (
+        f"B_scale inner stride must be 1, got {B_scale.stride(2)}"
+    )
+    assert config["BLOCK_SIZE_K"] % 32 == 0, (
+        f"BLOCK_SIZE_K={config['BLOCK_SIZE_K']} must be multiple of 32 (MXFP block)"
+    )
+
+    grid = lambda META: (
+        triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
+        * triton.cdiv(N, META["BLOCK_SIZE_N"]),
+    )
+
+    even_Ks = (K % config["BLOCK_SIZE_K"]) == 0
+
+    fused_moe_kernel_mxfp4[grid](
+        A,
+        B,
+        C,
+        B_scale,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        N,
+        K,
+        sorted_token_ids.shape[0],
+        topk_ids.numel(),
+        A.stride(0),
+        A.stride(1),
+        B.stride(0),
+        B.stride(1),
+        B.stride(2),
+        C.stride(-2),
+        C.stride(-1),
+        B_scale.stride(0),
+        B_scale.stride(1),
+        B_scale.stride(2),
+        MUL_ROUTED_WEIGHT=mul_routed_weight,
+        top_k=top_k,
+        compute_type=compute_type,
+        even_Ks=even_Ks,
+        filter_expert=filter_expert,
+        enable_nan_prop=enable_nan_prop,
+        **config,
+    )

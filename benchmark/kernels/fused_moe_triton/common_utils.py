@@ -247,6 +247,8 @@ def get_config_filename(
     use_int4_w4a16: bool,
     per_channel_quant: bool,
     block_shape: List[int],
+    use_mxfp4_w4a16: bool = False,
+    down_moe: bool = False,
 ) -> str:
     dtype_str = get_config_dtype_str(
         dtype,
@@ -254,12 +256,14 @@ def get_config_filename(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,
         use_int4_w4a16=use_int4_w4a16,
+        use_mxfp4_w4a16=use_mxfp4_w4a16,
     )
 
     # NOTE(woosuk): The current naming convention uses w2.shape[2], which
     # is the intermediate size after silu_and_mul.
     N = shard_intermediate_size // 2
-    if use_int4_w4a16:
+    if use_int4_w4a16 or use_mxfp4_w4a16:
+        # Both pack 2 values per byte on the inner axis → halve the key.
         N = N // 2
 
     filename = get_config_file_name(
@@ -268,6 +272,7 @@ def get_config_filename(
         dtype_str,
         block_shape,
         per_channel_quant,
+        down_moe=down_moe,
     )
 
     return filename

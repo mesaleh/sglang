@@ -1430,14 +1430,34 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
     def _get_key_buffer(self, layer_id: int):
         raise NotImplementedError(
             "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
-            "Dequant buffer path not supported."
+            "Dequant buffer path not supported. Attention backends should use "
+            "get_v_head_dim() for shape probes instead of get_key_buffer(0).shape[-1]."
         )
 
     def _get_value_buffer(self, layer_id: int):
         raise NotImplementedError(
             "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
-            "Dequant buffer path not supported."
+            "Dequant buffer path not supported. Attention backends should use "
+            "get_v_head_dim() for shape probes instead of get_value_buffer(0).shape[-1]."
         )
+
+    # Pool-agnostic accessors for the TurboQuant fast path in
+    # triton_backend.py. A flat pool just indexes its own per-layer lists;
+    # SWAKVPool implements the same interface and dispatches into the
+    # full/swa sub-pool via layers_mapping. Keeps the backend code pool-
+    # agnostic so adding new hybrid pool types does not require changes in
+    # the decode dispatch.
+    def get_tq_k_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_tq_v_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_tq_k_dequant_scale(self, layer_id: int):
+        return self.k_dequant_scale_buffer[layer_id - self.start_layer]
+
+    def get_tq_v_dequant_scale(self, layer_id: int):
+        return self.v_dequant_scale_buffer[layer_id - self.start_layer]
 
     def get_v_head_dim(self):
         return self.head_dim
@@ -1450,12 +1470,19 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
 
     def get_kv_size_bytes(self):
-        """Total GPU memory used by all TurboQuant buffers."""
-        total = 0
+        """GPU memory used by TurboQuant K/V buffers, returned as
+        (k_size, v_size) to match the parent MHATokenToKVPool contract.
+
+        Dequant-scale buffers are charged against the K and V sides
+        respectively so SWAKVPool.get_kv_size_bytes (which sums the two
+        ints from each sub-pool) reports a total that includes them.
+        """
+        k_size = 0
+        v_size = 0
         for i in range(self.layer_num):
-            total += self.k_buffer[i].nbytes + self.v_buffer[i].nbytes
-            total += self.k_dequant_scale_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
-        return total
+            k_size += self.k_buffer[i].nbytes + self.k_dequant_scale_buffer[i].nbytes
+            v_size += self.v_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
+        return k_size, v_size
 
 
 class HybridLinearKVPool(KVCache):

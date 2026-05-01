@@ -182,6 +182,32 @@ def get_default_config(
                 "num_warps": 4,
                 "num_stages": 2 if _is_hip else 3,
             }
+    elif dtype == "mxfp4_w4a16":
+        # MXFP4 weights (E2M1 + E8M0 scales per 32-value K block), bf16 acts.
+        # BLOCK_SIZE_K must be a multiple of 32 (MXFP block); picking 64 keeps
+        # the no-mask fast path when K is a multiple of 64 (as in gpt-oss K=2880).
+        # Small-M default tuned from an empirical 54-config sweep on H100 (SM90)
+        # at gpt-oss-120b shapes (E=128, N=5760/2880, topk=4, M=1..4 post-align):
+        # gate-up wants BLOCK_N=64 with 8 warps, down wants BLOCK_N=32 with 4.
+        # The larger-M branch falls back to a safer tile for unseen shapes.
+        if M <= E:
+            config = {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 1,
+                "num_warps": 8,
+                "num_stages": 3,
+            }
+        else:
+            config = {
+                "BLOCK_SIZE_M": 32,
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 8,
+                "num_warps": 8,
+                "num_stages": 3,
+            }
     else:
         config = {
             "BLOCK_SIZE_M": 64,
@@ -274,6 +300,7 @@ def get_config_dtype_str(
     use_int4_w4a16: Optional[bool] = False,
     use_fp8_w8a8: Optional[bool] = False,
     use_int8_w8a8: Optional[bool] = False,
+    use_mxfp4_w4a16: Optional[bool] = False,
 ):
     if use_fp8_w8a8:
         return "fp8_w8a8"
@@ -283,6 +310,10 @@ def get_config_dtype_str(
         return "int4_w4a16"
     elif use_int8_w8a16:
         return "int8_w8a16"
+    elif use_mxfp4_w4a16:
+        # MXFP4 weights (E2M1 + E8M0 block scales), bf16 activations.
+        # Consumed by fused_moe_kernel_mxfp4.
+        return "mxfp4_w4a16"
     elif dtype == torch.float:
         # avoiding cases where kernel fails when float32 MoE
         # use fp16/bfloat16 configs

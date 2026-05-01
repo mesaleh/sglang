@@ -499,6 +499,50 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
+                # TurboQuant + hybrid SWA: pass MHATokenToKVPoolTurboQuant as
+                # the sub-pool class so both the full and swa pools inside
+                # SWAKVPool are packed 4-bit. SWAKVPool exposes get_tq_*
+                # passthroughs so the attention fast paths in
+                # triton_backend.py reach the right sub-pool without
+                # knowing about the SWA layout. Without this branch,
+                # SWAKVPool would default to plain MHATokenToKVPool and
+                # --kv-cache-dtype turboquant_4bit would silently downgrade
+                # to bf16 (since the attention backends look up tq_config
+                # on the pool and get None).
+                pool_class_kwargs = {}
+                if hasattr(self, "turboquant_bits"):
+                    # is_hybrid_swa_compress models (e.g. Gemma4) add
+                    # swa_head_num / swa_head_dim / swa_v_head_dim kwargs
+                    # that MHATokenToKVPoolTurboQuant's __init__ doesn't
+                    # accept. Fail loudly rather than passing them through
+                    # and getting an unhelpful TypeError deep inside pool
+                    # init. Adding TQ support for compress-SWA models
+                    # would need MHATokenToKVPoolTurboQuant to accept
+                    # asymmetric SWA head dims — a separate piece of work.
+                    assert not self.is_hybrid_swa_compress, (
+                        "TurboQuant with is_hybrid_swa_compress (Gemma4, MiMoV2Flash, "
+                        "Step3p5) is not yet supported. The MHATokenToKVPoolTurboQuant "
+                        "__init__ does not accept swa_head_num / swa_head_dim / "
+                        "swa_v_head_dim. Remove --kv-cache-dtype turboquant_* or use "
+                        "a non-compress-SWA model (e.g. GptOssForCausalLM)."
+                    )
+                    from sglang.srt.mem_cache.memory_pool import (
+                        MHATokenToKVPoolTurboQuant,
+                    )
+
+                    pool_class_kwargs["token_to_kv_pool_class"] = (
+                        MHATokenToKVPoolTurboQuant
+                    )
+                    kwargs.update(
+                        {
+                            "turboquant_bits": self.turboquant_bits,
+                            "turboquant_k_bits": getattr(self, "turboquant_k_bits", 0),
+                            "turboquant_v_bits": getattr(self, "turboquant_v_bits", 0),
+                            "turboquant_uniform": getattr(
+                                self, "turboquant_uniform", False
+                            ),
+                        }
+                    )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -512,6 +556,7 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    **pool_class_kwargs,
                     **kwargs,
                 )
             elif config := self.mambaish_config:
