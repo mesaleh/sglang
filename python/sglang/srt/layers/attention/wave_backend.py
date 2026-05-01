@@ -150,6 +150,9 @@ class WaveAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
+        # max_kv_splits is assigned below, after max_context_len /
+        # device_core_count are known — the dynamic picker needs both.
+
         # Prefer get_v_head_dim() when the pool exposes it. Packed-KV pool
         # types (e.g. MHATokenToKVPoolTurboQuant) cannot serve a bf16 value
         # buffer for shape probes.
@@ -168,6 +171,8 @@ class WaveAttnBackend(AttentionBackend):
 
         # See pick_num_kv_splits_ceiling in triton_backend.py for the shared
         # derivation (both backends use the same flash-decoding scheduler).
+        # Honors an explicit --triton-attention-num-kv-splits if passed,
+        # otherwise derives a ceiling from device + head geometry + context.
         user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         if user_max_kv_splits is not None:
             self.max_kv_splits = user_max_kv_splits
