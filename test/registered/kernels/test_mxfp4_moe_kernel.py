@@ -16,7 +16,11 @@ Test matrix (tuned for gpt-oss-120b target shapes; kernel is generic):
 - Output N      ∈ {128, 2880, 5760} (128 for debug, 2880 = w2, 5760 = w13)
 - Experts E     ∈ {4, 128}          (4 for debug, 128 is real gpt-oss)
 - topk          ∈ {2, 4}
-- M tokens      ∈ {1, 4, 16, 32, 128, 144, 256}
+- M tokens      ∈ {1, 4, 16, 32, 48, 128, 144, 256}
+
+Concurrent-dispatch coverage (``TestMxfp4ConcurrentBatching``):
+- M=48, M=128 batched-vs-per-request equivalence (c=12 and c=32 decode)
+- Multi-stream isolation at M=48
 
 Usage:
     # CI runner (what test/run_suite.py uses):
@@ -476,6 +480,164 @@ class TestMxfp4NaNPropAndFilter(CustomTestCase):
             "populated rows should have real accumulator output, not the "
             "1.0 sentinel",
         )
+
+
+@unittest.skipUnless(HAS_CUDA, "CUDA not available")
+class TestMxfp4ConcurrentBatching(CustomTestCase):
+    """Concurrent-dispatch coverage for c>1 deployments.
+
+    At TP=1 with multiple concurrent requests, the scheduler packs each
+    decode step into one MoE call of shape M = c × topk (c=12 → M=48,
+    c=32 → M=128). Per-request correctness then depends on two
+    properties the kernel must preserve:
+
+    (a) **Row independence under batching.** Row ``i`` of the output must
+        depend only on row ``i`` of the activation + the expert weights
+        routed for that row. A batched call of N rows must produce the
+        same per-row output as N separate single-row calls. If batching
+        introduced any cross-row state (shared accumulator, mis-indexed
+        mask, BLOCK_M-boundary bug) the outputs would diverge.
+
+    (b) **Stream isolation.** The kernel must not rely on any mutable
+        global / module-level state that would race across CUDA streams.
+        Two simultaneous dispatches on different streams must each
+        produce the correct result.
+    """
+
+    def _run_batched(
+        self, A, packed, scales, topk_ids, topk_weights, topk, E, BLOCK_M
+    ):
+        """Run one kernel call for the whole batch; return C."""
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
+            invoke_fused_moe_kernel_mxfp4,
+        )
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size,
+        )
+
+        M = A.shape[0]
+        N = packed.shape[1]
+        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+            topk_ids, BLOCK_M, E
+        )
+        C = torch.zeros((M * topk, N), dtype=torch.bfloat16, device=A.device)
+        config = {
+            "BLOCK_SIZE_M": BLOCK_M,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+        invoke_fused_moe_kernel_mxfp4(
+            A, packed, scales, C, topk_weights, topk_ids,
+            sorted_token_ids, expert_ids, num_tokens_post_padded,
+            mul_routed_weight=False, top_k=topk, config=config,
+            compute_type=tl.bfloat16, filter_expert=False,
+            enable_nan_prop=True,
+        )
+        return C
+
+    def _batched_matches_per_request(self, M: int, topk: int, seed: int):
+        """Run M-row batch once, then run M single-row calls; compare."""
+        device = "cuda"
+        torch.manual_seed(seed)
+        N, K, E = 128, 128, 4
+        BLOCK_M = 16
+
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.3
+        W = torch.randn(E, N, K, dtype=torch.float32, device=device) * 0.3
+        packed, scales = _pack_mxfp4_reference(W)
+        topk_ids = torch.randint(0, E, (M, topk), dtype=torch.int32, device=device)
+        topk_weights = torch.rand(M, topk, dtype=torch.float32, device=device)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        C_batched = self._run_batched(
+            A, packed, scales, topk_ids, topk_weights, topk, E, BLOCK_M
+        )
+
+        # Per-request: slice one row at a time and dispatch with M=1.
+        C_sequential = torch.zeros_like(C_batched)
+        for m in range(M):
+            A_m = A[m : m + 1].contiguous()
+            tids_m = topk_ids[m : m + 1].contiguous()
+            tw_m = topk_weights[m : m + 1].contiguous()
+            c_m = self._run_batched(
+                A_m, packed, scales, tids_m, tw_m, topk, E, BLOCK_M
+            )
+            # c_m is [1*topk, N]; place it at rows [m*topk : (m+1)*topk].
+            C_sequential[m * topk : (m + 1) * topk] = c_m
+
+        # Per-row equivalence. Kernel-to-kernel comparison on identical
+        # inputs; 1e-2 covers the bf16-accumulator noise introduced when
+        # BLOCK_M tiles repack the same K-reductions in a different order.
+        diff = (C_batched.float() - C_sequential.float()).abs()
+        max_err = diff.max().item()
+        self.assertLess(
+            max_err, 1e-2,
+            f"batched vs per-request divergence at M={M} topk={topk}: "
+            f"max_err={max_err}",
+        )
+
+    def test_c12_decode_shape(self):
+        # c=12 decode: M = 12 * topk=4 = 48. Primary M2 target.
+        self._batched_matches_per_request(M=48, topk=4, seed=100)
+
+    def test_c32_decode_shape(self):
+        # c=32 decode: M = 32 * 4 = 128. Ladder edge — the shape that
+        # crashed triton_kernels.matmul_ogs; must stay clean here.
+        self._batched_matches_per_request(M=128, topk=4, seed=101)
+
+    def test_topk_2_concurrent(self):
+        # Same property at topk=2 (non-gpt-oss MoE models).
+        self._batched_matches_per_request(M=48, topk=2, seed=102)
+
+    def test_multi_stream_isolation(self):
+        """Two dispatches on two CUDA streams, overlapped. Each must
+        produce the same result as a single-stream run of the same
+        inputs — catches any module-level mutable state in the kernel
+        path (none expected, but cheap to verify)."""
+        device = "cuda"
+        torch.manual_seed(200)
+        M, N, K, E, topk = 48, 128, 128, 4, 4
+        BLOCK_M = 16
+
+        # Build two independent workloads A/W.
+        def make_workload(seed: int):
+            g = torch.Generator(device=device).manual_seed(seed)
+            A = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=g) * 0.3
+            W = torch.randn(E, N, K, dtype=torch.float32, device=device, generator=g) * 0.3
+            packed, scales = _pack_mxfp4_reference(W)
+            topk_ids = torch.randint(0, E, (M, topk), dtype=torch.int32,
+                                     device=device, generator=g)
+            tw = torch.rand(M, topk, dtype=torch.float32, device=device, generator=g)
+            tw = tw / tw.sum(dim=-1, keepdim=True)
+            return A, packed, scales, topk_ids, tw
+
+        w_a = make_workload(201)
+        w_b = make_workload(202)
+
+        # Golden: run each on default stream.
+        C_a_golden = self._run_batched(*w_a, topk, E, BLOCK_M)
+        C_b_golden = self._run_batched(*w_b, topk, E, BLOCK_M)
+
+        # Overlapped: run both on separate streams, then sync.
+        s_a = torch.cuda.Stream()
+        s_b = torch.cuda.Stream()
+        torch.cuda.synchronize()
+        with torch.cuda.stream(s_a):
+            C_a = self._run_batched(*w_a, topk, E, BLOCK_M)
+        with torch.cuda.stream(s_b):
+            C_b = self._run_batched(*w_b, topk, E, BLOCK_M)
+        torch.cuda.synchronize()
+
+        diff_a = (C_a.float() - C_a_golden.float()).abs().max().item()
+        diff_b = (C_b.float() - C_b_golden.float()).abs().max().item()
+        # Stream-scheduled launch of a deterministic kernel with the
+        # same inputs should produce bit-identical output. Any epsilon
+        # here would indicate nondeterminism inside the kernel.
+        self.assertEqual(diff_a, 0.0, f"stream A deviates: {diff_a}")
+        self.assertEqual(diff_b, 0.0, f"stream B deviates: {diff_b}")
 
 
 class TestAutotuneWiring(CustomTestCase):
