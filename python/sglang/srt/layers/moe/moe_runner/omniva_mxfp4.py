@@ -22,7 +22,8 @@ Choose this over ``triton_kernel`` when any of the following is true:
 * The model is MXFP4-quantized **and** deployment fits only when weights
   stay packed (bf16 upcast would OOM). Our kernel is the only MXFP4
   runner that skips the bf16 upcast.
-* ``triton_kernel`` (upstream ``matmul_ogs``) is crashing on your shapes
+* ``triton_kernel`` (which wraps OpenAI's ``triton_kernels.matmul_ogs``
+  pip package — not part of SGLang proper) is crashing on your shapes
   with a state-dependent CUDA illegal memory access — we've seen this on
   gpt-oss-120b at TP=1 and the crash is not reliably worked around via
   ``SGLANG_TRITON_KERNELS_NO_PERSISTENT``.
