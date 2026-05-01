@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -26,6 +28,140 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# Flash-decoding num_kv_splits ceiling picker
+#
+# Used by both TritonAttnBackend and WaveAttnBackend; the shared helper keeps
+# them from drifting. See the docstring on pick_num_kv_splits_ceiling().
+# ----------------------------------------------------------------------------
+
+# Fallback ceiling when device SM count is unavailable (e.g. older CUDA
+# runtime that doesn't expose it, or non-NVIDIA/AMD device without a
+# well-defined "core count"). Historically this was the hardcoded
+# --triton-attention-num-kv-splits default on SGLang and is a safe
+# no-regression baseline.
+_AUTO_KV_SPLITS_FALLBACK = 8
+
+# Target SM-occupancy safety margin. We want grid_blocks ≥ SMs so every
+# SM has work; 1.5× gives the Triton scheduler some flex (co-scheduling
+# with other kernels, register spill variants, etc.). Empirically this
+# lands in the monotonic-improvement region of the 2026-05-01 gpt-oss
+# sweep on H100 (splits 8→16→32→64 yielded 29→47→66→84 tok/s at 81K
+# c=1 decode; splits=128 plateaued at 82). Because the inner kernel
+# log-scales its SM demand with context length, the picker multiplies
+# the raw SM count by log2(max_context_len/64) before applying this
+# safety margin — so at long advertised contexts the ceiling saturates
+# at _AUTO_KV_SPLITS_MAX, which matches the plateau we observed.
+_AUTO_KV_SPLITS_SM_SAFETY = 1.5
+
+# Hard floor and ceiling. Floor: never pick below the prior default
+# (avoid regressing existing workloads that worked fine at low ceilings).
+# Ceiling: the Triton kernel allocates scratch buffers sized by
+# max_kv_splits per CUDA-graph bucket; past 128 the merge overhead
+# dominates and memory grows without speed benefit (observed in sweep).
+_AUTO_KV_SPLITS_MIN = 8
+_AUTO_KV_SPLITS_MAX = 128
+
+
+def pick_num_kv_splits_ceiling(
+    *,
+    device_core_count: Optional[int],
+    num_head: int,
+    num_kv_head: int,
+    max_context_len: Optional[int],
+    backend_name: str = "triton-attention",
+) -> int:
+    """Pick the KV-splits ceiling for a flash-decoding backend at init.
+
+    Intent: give the per-step ``get_num_kv_splits_triton`` kernel enough
+    headroom to fully saturate the device's SMs at c=1 bs=1 decode across
+    the full advertised context length. Two competing factors:
+
+    1. **Grid-block count**: the inner kernel's token_grid at decode is
+       ``num_seq * num_group * cdiv(num_head, BLOCK_H=16)`` (see the
+       hybrid-attention branch of ``get_num_kv_splits_triton``). At c=1
+       bs=1 this collapses to ``cdiv(num_head, 16)`` for GQA or
+       ``num_head`` for MHA.
+    2. **The inner kernel's log-scaling of the effective SM budget**:
+       at max_seq_len it computes
+       ``ext_device_core_count = device_core_count * max(log2(seq/64), 1.0)``
+       to size the KV chunks. That's what actually determines how many
+       splits it wants; we must at least match its demand or we clamp
+       it low. Mirroring the same formula at ``max_context_len`` gives
+       a ceiling that scales with the model's full context.
+
+    We pick a ceiling such that
+        splits * token_grid(c=1) >= ext_SM * safety
+    which rearranges to
+        splits >= ceil(ext_SM * safety / cdiv(num_head, 16))
+
+    Bounded below by ``_AUTO_KV_SPLITS_MIN`` (no-regression vs prior
+    default) and above by ``_AUTO_KV_SPLITS_MAX`` (past this point
+    scratch memory grows faster than speed improves — observed
+    empirically in the 2026-05-01 gpt-oss sweep).
+
+    Returns the picked ceiling and logs the derivation at INFO level.
+    ``backend_name`` shows up in the log line for attribution.
+    """
+    if device_core_count is None or device_core_count <= 0:
+        logger.info(
+            "%s num_kv_splits: SM count unavailable (device_core_count=%s), "
+            "using fallback ceiling of %d.",
+            backend_name,
+            device_core_count,
+            _AUTO_KV_SPLITS_FALLBACK,
+        )
+        return _AUTO_KV_SPLITS_FALLBACK
+
+    # Mirror the Triton kernel's token_grid math at c=1 bs=1.
+    BLOCK_H = 16
+    if num_kv_head == 0:
+        # Shouldn't happen on a real model, but defend against it —
+        # divide-by-zero in num_kv_group below would be ugly.
+        return _AUTO_KV_SPLITS_FALLBACK
+    num_kv_group = num_head // num_kv_head
+    if num_kv_group <= 1:
+        token_grid_c1 = max(1, num_head)
+    else:
+        token_grid_c1 = max(1, math.ceil(num_head / min(BLOCK_H, num_kv_group)))
+
+    # Mirror the inner kernel's ext_device_core_count = SMs * log2(seq/64)
+    # at the full advertised context length.
+    if max_context_len and max_context_len > 64:
+        ext_multiplier = max(1.0, math.log2(max_context_len / 64.0))
+    else:
+        ext_multiplier = 1.0
+    ext_sm = device_core_count * ext_multiplier
+
+    target_blocks = ext_sm * _AUTO_KV_SPLITS_SM_SAFETY
+    raw_splits = math.ceil(target_blocks / token_grid_c1)
+    picked = max(_AUTO_KV_SPLITS_MIN, min(raw_splits, _AUTO_KV_SPLITS_MAX))
+
+    logger.info(
+        "%s num_kv_splits auto-picked: %d "
+        "(device_core_count=%d, max_context_len=%d, ext_multiplier=%.2f, "
+        "num_head=%d, num_kv_head=%d, token_grid@c=1=%d, target_blocks=%.1f, "
+        "raw=%d, bounded to [%d, %d]). "
+        "Pass --triton-attention-num-kv-splits to override.",
+        backend_name,
+        picked,
+        device_core_count,
+        max_context_len or 0,
+        ext_multiplier,
+        num_head,
+        num_kv_head,
+        token_grid_c1,
+        target_blocks,
+        raw_splits,
+        _AUTO_KV_SPLITS_MIN,
+        _AUTO_KV_SPLITS_MAX,
+    )
+    return picked
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -137,7 +273,23 @@ class TritonAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        # Ceiling on KV splits used by the flash-decoding kernel at decode.
+        # When the user passes --triton-attention-num-kv-splits we honor the
+        # explicit value; otherwise pick a ceiling sized to the device's SM
+        # count and this model's attention-head geometry. The per-step
+        # `get_num_kv_splits_triton` kernel then picks a per-sequence split
+        # count bounded by this ceiling.
+        user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        if user_max_kv_splits is not None:
+            self.max_kv_splits = user_max_kv_splits
+        else:
+            self.max_kv_splits = pick_num_kv_splits_ceiling(
+                device_core_count=self.device_core_count,
+                num_head=self.num_head,
+                num_kv_head=self.num_kv_head,
+                max_context_len=self.max_context_len,
+                backend_name="triton-attention",
+            )
 
         self.allow_bidirectional_attention_in_extend = (
             model_runner.server_args.disable_cuda_graph

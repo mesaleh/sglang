@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.triton_backend import pick_num_kv_splits_ceiling
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -149,7 +150,6 @@ class WaveAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
         # Prefer get_v_head_dim() when the pool exposes it. Packed-KV pool
         # types (e.g. MHATokenToKVPoolTurboQuant) cannot serve a bf16 value
         # buffer for shape probes.
@@ -165,6 +165,20 @@ class WaveAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+
+        # See pick_num_kv_splits_ceiling in triton_backend.py for the shared
+        # derivation (both backends use the same flash-decoding scheduler).
+        user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        if user_max_kv_splits is not None:
+            self.max_kv_splits = user_max_kv_splits
+        else:
+            self.max_kv_splits = pick_num_kv_splits_ceiling(
+                device_core_count=self.device_core_count,
+                num_head=self.num_head,
+                num_kv_head=self.num_kv_head,
+                max_context_len=self.max_context_len,
+                backend_name="wave-attention",
+            )
 
     def get_num_kv_splits(
         self,
