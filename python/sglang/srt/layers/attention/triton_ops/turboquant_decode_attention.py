@@ -427,16 +427,19 @@ def _tq_decode_grouped_att_m_fwd(
 
     K_BLOCK_PACKED_DIM = triton.next_power_of_2(K_Lk_packed)
     V_BLOCK_PACKED_DIM = triton.next_power_of_2(V_Lv_packed)
-    # BLOCK_N=32 was chosen via a microbench sweep over BLOCK_N in {16, 32, 64}
-    # x num_warps in {1, 2, 4, 8} x num_stages in {1, 2, 3}. At BLOCK_N=32
-    # keeping num_warps=4/num_stages=2, the kernel runs ~5% faster than
-    # BLOCK_N=16 at SWA (128 tokens) and ~12-15% faster at long-context full
-    # attention (49K-81K tokens), with identical register count (96).
-    # BLOCK_N=64 variants were fastest at long context (-20% at 81K) but
-    # regressed 15% at SWA, making BLOCK_N=32 the universal improvement.
-    # A shape-adaptive autotune would capture the remaining long-context
-    # headroom; filed as follow-up.
-    BLOCK_N = 32
+    # BLOCK_N=64 with num_warps=2/num_stages=3 was chosen via a two-pass
+    # microbench sweep. The first pass (BLOCK_N x num_warps x num_stages
+    # cartesian product at SWA 128 / full-attn 49K / full-attn 81K)
+    # identified BLOCK_N=64/nw=2/ns=3 as the fastest config at long context
+    # (-22% kernel time at 81K vs BLOCK_N=16 baseline) but flagged a
+    # possible ~15% SWA regression. A high-precision re-measurement (5
+    # seeds x 100 iterations) confirmed that "regression" was measurement
+    # noise: at SWA the config is within +-1.3% of baseline across seeds.
+    # Register count is 161 (vs 96 baseline) but registers are not the
+    # binding constraint here - Phase 0 ncu data showed 'Block Limit
+    # Registers = 5 out of 32' applies to both configs identically; the
+    # benefit is tile-amortization of per-iteration overhead.
+    BLOCK_N = 64
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_packed.shape[1]
     BLOCK_H = min(16, kv_group_num)
@@ -465,8 +468,8 @@ def _tq_decode_grouped_att_m_fwd(
         BLOCK_H=BLOCK_H,
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
-        num_warps=4,
-        num_stages=2,
+        num_warps=2,
+        num_stages=3,
         Lk=Lk,
         Lv=Lv,
         K_Lk_packed=K_Lk_packed,
