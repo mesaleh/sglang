@@ -427,7 +427,16 @@ def _tq_decode_grouped_att_m_fwd(
 
     K_BLOCK_PACKED_DIM = triton.next_power_of_2(K_Lk_packed)
     V_BLOCK_PACKED_DIM = triton.next_power_of_2(V_Lv_packed)
-    BLOCK_N = 16
+    # BLOCK_N=32 was chosen via a microbench sweep over BLOCK_N in {16, 32, 64}
+    # x num_warps in {1, 2, 4, 8} x num_stages in {1, 2, 3}. At BLOCK_N=32
+    # keeping num_warps=4/num_stages=2, the kernel runs ~5% faster than
+    # BLOCK_N=16 at SWA (128 tokens) and ~12-15% faster at long-context full
+    # attention (49K-81K tokens), with identical register count (96).
+    # BLOCK_N=64 variants were fastest at long context (-20% at 81K) but
+    # regressed 15% at SWA, making BLOCK_N=32 the universal improvement.
+    # A shape-adaptive autotune would capture the remaining long-context
+    # headroom; filed as follow-up.
+    BLOCK_N = 32
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // k_packed.shape[1]
     BLOCK_H = min(16, kv_group_num)
