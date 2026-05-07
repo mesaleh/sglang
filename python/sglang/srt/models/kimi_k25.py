@@ -778,6 +778,45 @@ class KimiK25ForConditionalGeneration(nn.Module):
         # Load language model weights
         if not self.config.encoder_only and language_weights:
             self.language_model.load_weights(language_weights)
+            missing_mla_layers = self._missing_mla_absorb_weight_layers(
+                self.language_model
+            )
+            if missing_mla_layers:
+                logger.info(
+                    "Kimi MLA post-load found %d layers without absorbed "
+                    "kv_b_proj weights; forcing full post_load_weights().",
+                    len(missing_mla_layers),
+                )
+                self.language_model.post_load_weights(weight_names=None)
+                missing_mla_layers = self._missing_mla_absorb_weight_layers(
+                    self.language_model
+                )
+                if missing_mla_layers:
+                    raise RuntimeError(
+                        "Kimi MLA post-load failed to populate w_kc/w_vc for "
+                        f"layers: {missing_mla_layers[:8]}"
+                    )
+
+    @staticmethod
+    def _missing_mla_absorb_weight_layers(language_model) -> List[int]:
+        model = getattr(language_model, "model", None)
+        layers = getattr(model, "layers", None)
+        if layers is None:
+            return []
+
+        start_layer = int(getattr(model, "start_layer", 0))
+        end_layer = int(getattr(model, "end_layer", len(layers)))
+        missing_layers = []
+        for layer_id in range(start_layer, min(end_layer, len(layers))):
+            self_attn = getattr(layers[layer_id], "self_attn", None)
+            if self_attn is None or not hasattr(self_attn, "kv_b_proj"):
+                continue
+            if (
+                getattr(self_attn, "w_kc", None) is None
+                or getattr(self_attn, "w_vc", None) is None
+            ):
+                missing_layers.append(layer_id)
+        return missing_layers
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
