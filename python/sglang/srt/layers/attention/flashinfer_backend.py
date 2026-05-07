@@ -796,7 +796,11 @@ class FlashInferAttnBackend(AttentionBackend):
         q = q.contiguous()
 
         # TurboQuant: rotate Q into WHT domain (K/V rotated after set_kv_buffer below)
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -927,7 +931,11 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
         # Call the wrapped function
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
         q_input = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if tq_config is not None:
             q_input = tq_config.rotate_query(q_input)

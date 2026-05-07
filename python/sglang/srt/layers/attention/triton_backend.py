@@ -1089,7 +1089,11 @@ class TritonAttnBackend(AttentionBackend):
             causal = False
 
         # TurboQuant: rotate Q into WHT domain; rotate K/V only if fresh (not from pool)
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
         if tq_config is not None:
             if (
                 not _kv_from_pool
@@ -1449,7 +1453,11 @@ class TritonAttnBackend(AttentionBackend):
             attn_logits = self.forward_metadata.swa_attn_logits
 
         # TurboQuant: rotate Q into WHT domain
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)

@@ -2114,6 +2114,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
       add fused paths later.
     """
 
+    is_mla_turboquant_pool = True
+
     def __init__(
         self,
         size: int,
