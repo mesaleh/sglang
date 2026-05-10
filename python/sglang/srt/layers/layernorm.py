@@ -158,6 +158,9 @@ def _forward_with_allreduce_fusion(
                     residual=residual,
                     weight=weight,
                     eps=norm_module.variance_epsilon,
+                    max_token_num=(
+                        envs.SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE.get()
+                    ),
                     use_attn_tp_group=use_attn_tp_group,
                 )
                 if fused_result[0] is not None:

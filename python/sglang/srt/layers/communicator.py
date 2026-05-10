@@ -149,8 +149,13 @@ def _fused_rmsnorm_fp8_per_token_quant(
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+# The min-latency oneshot case can use 128; SGLang keeps 2048 as the
+# default capacity for broader shapes.
+# Override SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE to trade fusion
+# capacity for lower workspace memory.
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = (
+    envs.SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE.get()
+)
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
