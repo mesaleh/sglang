@@ -58,6 +58,8 @@ class SchedulerProfilerMixin:
         self.profiler_target_decode_ct: Optional[int] = None
 
         self.profile_by_stage: bool = False
+        self.profile_stages = {"prefill", "decode"}
+        self.profile_current_stage: Optional[ForwardMode] = None
         self.profile_in_progress: bool = False
         self.merge_profiles = False
 
@@ -101,6 +103,20 @@ class SchedulerProfilerMixin:
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
+        valid_profile_stages = {"prefill", "decode"}
+        if profile_stages is None:
+            self.profile_stages = valid_profile_stages
+        else:
+            self.profile_stages = {stage.lower() for stage in profile_stages}
+            invalid_stages = self.profile_stages - valid_profile_stages
+            if invalid_stages:
+                return ProfileReqOutput(
+                    success=False,
+                    message=(
+                        f"Invalid profile_stages={sorted(invalid_stages)}. "
+                        f"Valid stages are {sorted(valid_profile_stages)}."
+                    ),
+                )
 
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
@@ -134,6 +150,20 @@ class SchedulerProfilerMixin:
             self.profiler_target_forward_ct = None
 
         return ProfileReqOutput(success=True, message="Succeeded")
+
+    def _stop_profile_if_stage_changes(self: Scheduler, next_stage: str) -> None:
+        if not self.profile_in_progress or self.profile_current_stage is None:
+            return
+
+        if self.profile_current_stage.is_prefill():
+            current_stage = "prefill"
+        elif self.profile_current_stage.is_decode():
+            current_stage = "decode"
+        else:
+            return
+
+        if current_stage != next_stage:
+            self.stop_profile(stage=self.profile_current_stage)
 
     def start_profile(
         self: Scheduler, stage: Optional[ForwardMode] = None
@@ -214,6 +244,7 @@ class SchedulerProfilerMixin:
                 torch.cuda.cudart().cudaProfilerStart()
             self.profile_in_progress = True
 
+        self.profile_current_stage = stage
         return ProfileReqOutput(success=True, message="Succeeded")
 
     def _merge_profile_traces(self: Scheduler) -> str:
@@ -332,6 +363,7 @@ class SchedulerProfilerMixin:
         )
         self.torch_profiler = None
         self.profile_in_progress = False
+        self.profile_current_stage = None
         self.profiler_start_forward_ct = None
 
         return ProfileReqOutput(success=True, message=f"Succeeded.{merge_message}")
@@ -343,6 +375,10 @@ class SchedulerProfilerMixin:
 
         if self.profile_by_stage:
             if batch.forward_mode.is_prefill():
+                if "prefill" not in self.profile_stages:
+                    self._stop_profile_if_stage_changes("prefill")
+                    return
+                self._stop_profile_if_stage_changes("prefill")
                 if self.profiler_prefill_ct == 0:
                     self.start_profile(batch.forward_mode)
                 self.profiler_prefill_ct += 1
@@ -350,6 +386,10 @@ class SchedulerProfilerMixin:
                     if self.profile_in_progress:
                         self.stop_profile(stage=ForwardMode.EXTEND)
             elif batch.forward_mode.is_decode():
+                if "decode" not in self.profile_stages:
+                    self._stop_profile_if_stage_changes("decode")
+                    return
+                self._stop_profile_if_stage_changes("decode")
                 if self.profiler_decode_ct == 0:
                     if self.profile_in_progress:
                         # force trace flush
