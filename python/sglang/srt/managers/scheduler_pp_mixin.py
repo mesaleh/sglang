@@ -65,6 +65,14 @@ _OMNIVA_PP_GPU_TIMING_ENABLED = os.getenv(
     "yes",
     "on",
 )
+_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD_ENABLED = os.getenv(
+    "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 _OMNIVA_PP_META_PREFIX = "__omniva_pp_"
 _OMNIVA_PP_MSG_ID_KEY = "__omniva_pp_msg_id__"
 _OMNIVA_PP_SEND_EPOCH_NS_KEY = "__omniva_pp_send_epoch_ns__"
@@ -99,6 +107,13 @@ class SchedulerPPMixin:
 
     def _omniva_pp_gpu_timing_enabled(self: Scheduler) -> bool:
         return _OMNIVA_PP_GPU_TIMING_ENABLED and self._omniva_pp_timing_should_log()
+
+    def _omniva_pp_immediate_output_forward_enabled(self: Scheduler) -> bool:
+        return (
+            _OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD_ENABLED
+            and self.pp_size == 2
+            and not self.pp_group.is_last_rank
+        )
 
     def _omniva_pp_tensor_keys(
         self: Scheduler, tensor_dict: Dict[str, object]
@@ -1472,6 +1487,9 @@ class SchedulerPPMixin:
         # XPU: even ranks send first, odd ranks recv first.
         send_first = (not is_xpu()) or ((self.pp_rank % 2) == 0)
         pp_timing = self._omniva_pp_timing_should_log()
+        immediate_output_forward = (
+            self._omniva_pp_immediate_output_forward_enabled()
+        )
 
         def _do_send():
             tic = time.perf_counter() if pp_timing else 0.0
@@ -1556,12 +1574,39 @@ class SchedulerPPMixin:
                     batch=mbs[next_mb_id],
                 )
 
+        def _forward_received_output_immediately():
+            nonlocal next_pp_outputs
+            if not immediate_output_forward or next_pp_outputs is None:
+                return
+
+            tic = time.perf_counter() if pp_timing else 0.0
+            work = self._pp_send_output_to_next_stage(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                next_pp_outputs,
+            )
+            send_output_work.extend(work)
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "forward_output_to_next_stage_immediate",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                    work_items=len(work),
+                )
+            next_pp_outputs = None
+
         if send_first:
-            send_output_work = _do_send()
+            if not immediate_output_forward:
+                send_output_work = _do_send()
             _do_recv()
+            _forward_received_output_immediately()
         else:
             _do_recv()
-            send_output_work = _do_send()
+            _forward_received_output_immediately()
+            if not immediate_output_forward:
+                send_output_work = _do_send()
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
