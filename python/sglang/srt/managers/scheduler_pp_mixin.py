@@ -248,8 +248,17 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
+                    total_tic = time.perf_counter() if pp_timing else 0.0
                     tic = time.perf_counter() if pp_timing else 0.0
                     d2h_event.synchronize()
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "process_batch_result_d2h_wait",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=next_mb_id,
+                            batch=self.mbs[next_mb_id],
+                        )
+                    tic = time.perf_counter() if pp_timing else 0.0
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
@@ -257,8 +266,15 @@ class SchedulerPPMixin:
                         )
                     if pp_timing:
                         self._omniva_pp_timing_log(
-                            "process_batch_result",
+                            "process_batch_result_core",
                             elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=next_mb_id,
+                            batch=self.mbs[next_mb_id],
+                        )
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "process_batch_result",
+                            elapsed_ms=(time.perf_counter() - total_tic) * 1000,
                             mb_id=next_mb_id,
                             batch=self.mbs[next_mb_id],
                         )
@@ -1286,20 +1302,62 @@ class SchedulerPPMixin:
             nonlocal next_pp_outputs, batch_result, d2h_event
             if mbs[next_mb_id] is None or mbs[next_mb_id].forward_mode.is_prebuilt():
                 return
+            total_tic = time.perf_counter() if pp_timing else 0.0
             tic = time.perf_counter() if pp_timing else 0.0
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                tensor_dict = self._pp_recv_dict_from_prev_stage()
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "recv_output_from_prev_stage_recv_dict",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                    tensor_keys=sorted(str(key) for key in tensor_dict.keys()),
+                )
+            tic = time.perf_counter() if pp_timing else 0.0
+            next_pp_outputs = PPProxyTensors(tensor_dict)
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "recv_output_from_prev_stage_proxy_wrap",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                )
             with self.copy_stream_ctx:
+                tic = time.perf_counter() if pp_timing else 0.0
                 self.copy_stream.wait_stream(self.schedule_stream)
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_output_from_prev_stage_copy_wait",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=next_mb_id,
+                        batch=mbs[next_mb_id],
+                    )
+                tic = time.perf_counter() if pp_timing else 0.0
                 batch_result = self._pp_prep_batch_result(
                     mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
                 )
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_output_from_prev_stage_prep_batch_result",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=next_mb_id,
+                        batch=mbs[next_mb_id],
+                    )
+                tic = time.perf_counter() if pp_timing else 0.0
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_output_from_prev_stage_event_record",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=next_mb_id,
+                        batch=mbs[next_mb_id],
+                    )
             if pp_timing:
                 self._omniva_pp_timing_log(
                     "recv_output_from_prev_stage",
-                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    elapsed_ms=(time.perf_counter() - total_tic) * 1000,
                     mb_id=next_mb_id,
                     batch=mbs[next_mb_id],
                 )
