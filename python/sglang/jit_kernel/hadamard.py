@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+import traceback
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -8,6 +11,23 @@ from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
+
+
+logger = logging.getLogger(__name__)
+_HADAMARD_DEBUG = os.environ.get("SGLANG_TQ_HADAMARD_DEBUG", "0") == "1"
+
+
+def _rank_context() -> str:
+    keys = (
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "SGLANG_TP_RANK",
+        "SGLANG_TP_SIZE",
+        "CUDA_VISIBLE_DEVICES",
+        "SGLANG_TQ_MLA_FUSED_DECODE",
+    )
+    return ", ".join(f"{key}={os.environ.get(key, '<unset>')}" for key in keys)
 
 
 @cache_once
@@ -87,6 +107,39 @@ def hadamard_transform_with_signs(
 
     shapes_og = x.size()
     dim_og = x.size(-1)
+
+    signs1_shape = tuple(signs1.shape)
+    signs2_shape = tuple(signs2.shape)
+    if _HADAMARD_DEBUG:
+        logger.warning(
+            "hadamard_transform_with_signs call: x_shape=%s x_dtype=%s "
+            "x_device=%s signs1_shape=%s signs2_shape=%s scale=%s %s",
+            tuple(shapes_og),
+            x.dtype,
+            x.device,
+            signs1_shape,
+            signs2_shape,
+            scale,
+            _rank_context(),
+        )
+
+    signs_mismatch = (
+        signs1.dim() != 1
+        or signs2.dim() != 1
+        or signs1.numel() != dim_og
+        or signs2.numel() != dim_og
+    )
+    if signs_mismatch:
+        stack = "".join(traceback.format_stack(limit=12)[:-1])
+        msg = (
+            "hadamard_transform_with_signs sign/input dim mismatch: "
+            f"x_shape={tuple(shapes_og)} x_dtype={x.dtype} x_device={x.device} "
+            f"x_last_dim={dim_og} signs1_shape={signs1_shape} "
+            f"signs2_shape={signs2_shape} scale={scale} {_rank_context()}\n"
+            f"Python stack:\n{stack}"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
 
     x = x.reshape(-1, dim_og)
     if x.stride(-1) != 1:

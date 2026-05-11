@@ -669,7 +669,11 @@ class FlashAttentionBackend(AttentionBackend):
         # TurboQuant: rotate Q into WHT domain for extend
         # K/V are NOT rotated here — set_kv_buffer (above) quantizes original K/V
         # with internal WHT, and the page cache returns rotspace data via lazy dequant.
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1095,7 +1099,11 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
 
         # TurboQuant: rotate Q into WHT domain
-        tq_config = getattr(forward_batch.token_to_kv_pool, "tq_config", None)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim)

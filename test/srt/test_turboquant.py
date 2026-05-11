@@ -16,6 +16,7 @@ Usage:
 
 import math
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -69,6 +70,23 @@ class TestTurboQuantConfig(unittest.TestCase):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
         cfg = TurboQuantConfig(bit_width=4, head_dim=128, device="cpu")
         self.assertEqual(cfg.k_packed_dim, 64)
+
+    def test_mha_config_gate_skips_mla_pool(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        cfg = object()
+        mha_pool = SimpleNamespace(tq_config=cfg)
+        mla_pool = SimpleNamespace(tq_config=cfg, is_mla_turboquant_pool=True)
+        wrapped_mla_pool = SimpleNamespace(
+            tq_config=cfg,
+            full_kv_pool=SimpleNamespace(is_mla_turboquant_pool=True),
+        )
+
+        self.assertIs(get_mha_turboquant_config(mha_pool), cfg)
+        self.assertIsNone(get_mha_turboquant_config(mla_pool))
+        self.assertIsNone(get_mha_turboquant_config(wrapped_mla_pool))
 
 
 try:

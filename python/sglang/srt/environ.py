@@ -360,6 +360,8 @@ class Envs:
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Token capacity for FlashInfer allreduce-fusion workspace pre-initialization.
+    SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE = EnvInt(2048)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)

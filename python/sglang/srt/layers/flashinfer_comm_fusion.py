@@ -27,6 +27,8 @@ _flashinfer_comm = None
 _TorchDistBackend = None
 _flashinfer_allreduce_unavailable = False
 _posix_transport_override_logged = False
+_share_moe_attn_workspace: Optional[bool] = None
+_shared_moe_attn_workspace_logged = False
 
 
 def _should_force_posix_fd_transport() -> bool:
@@ -277,7 +279,65 @@ _attn_tp_workspace_manager = FlashInferWorkspaceManager()
 _moe_tp_workspace_manager = FlashInferWorkspaceManager()
 
 
+def _can_share_moe_attn_workspace() -> bool:
+    """Return True when MoE TP and attention TP map to the same communicator."""
+    global _share_moe_attn_workspace
+
+    if _share_moe_attn_workspace is not None:
+        return _share_moe_attn_workspace
+
+    try:
+        if get_moe_expert_parallel_world_size() > 1:
+            _share_moe_attn_workspace = False
+            return False
+
+        if (
+            get_attn_tensor_model_parallel_world_size()
+            != get_moe_tensor_parallel_world_size()
+        ):
+            _share_moe_attn_workspace = False
+            return False
+
+        if (
+            get_attn_tensor_model_parallel_rank()
+            != get_moe_tensor_parallel_rank()
+        ):
+            _share_moe_attn_workspace = False
+            return False
+
+        tp_coordinator = get_tp_group()
+        attn_coordinator = get_attn_tp_group()
+        moe_coordinator = get_moe_tp_group()
+
+        def normalize_group(coordinator):
+            if coordinator.device_group is tp_coordinator.device_group:
+                return None, None
+            return coordinator.device_group, coordinator.cpu_group
+
+        attn_device_group, attn_cpu_group = normalize_group(attn_coordinator)
+        moe_device_group, moe_cpu_group = normalize_group(moe_coordinator)
+        _share_moe_attn_workspace = (
+            attn_device_group is moe_device_group
+            and attn_cpu_group is moe_cpu_group
+        )
+        return _share_moe_attn_workspace
+    except Exception as e:
+        logger.debug("Failed to check FlashInfer workspace sharing: %s", e)
+        return False
+
+
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
+    global _shared_moe_attn_workspace_logged
+
+    if use_attn_tp_group and _can_share_moe_attn_workspace():
+        if not _shared_moe_attn_workspace_logged:
+            logger.info(
+                "Sharing FlashInfer MoE and attention workspaces because both "
+                "map to the same tensor-parallel communicator."
+            )
+            _shared_moe_attn_workspace_logged = True
+        return _moe_tp_workspace_manager
+
     return (
         _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
     )

@@ -401,3 +401,19 @@ class TurboQuantConfig:
         w_rot = hadamard_transform_with_signs(w_t, self.signs1, self.signs2, scale=wht_scale)
         w_rot = w_rot.reshape(num_heads, hidden, dim).permute(0, 2, 1).contiguous()
         return w_rot.reshape(num_heads * dim, hidden).to(dtype)
+
+
+def get_mha_turboquant_config(token_to_kv_pool):
+    """Return TurboQuant config only for MHA packed-KV attention paths.
+
+    MLA TurboQuant exposes ``tq_config`` for its pool-boundary quant/dequant and
+    Stage C decode path, but normal MHA prefill/chunked-prefix attention sees
+    already-expanded bf16 K/V tensors. Reusing the MLA config there would rotate
+    128-wide MHA values with 512-wide MLA latent signs.
+    """
+    if getattr(token_to_kv_pool, "is_mla_turboquant_pool", False):
+        return None
+    wrapped_pool = getattr(token_to_kv_pool, "full_kv_pool", None)
+    if getattr(wrapped_pool, "is_mla_turboquant_pool", False):
+        return None
+    return getattr(token_to_kv_pool, "tq_config", None)
