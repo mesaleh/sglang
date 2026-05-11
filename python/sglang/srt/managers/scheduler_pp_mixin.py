@@ -49,6 +49,26 @@ _OMNIVA_PP_TIMING_TP_RANKS = {
 }
 _OMNIVA_PP_TIMING_LOG_ALL_TP = "all" in _OMNIVA_PP_TIMING_TP_RANKS
 _OMNIVA_PP_TIMING_MAX_RIDS = int(os.getenv("SGLANG_OMNIVA_PP_TIMING_MAX_RIDS", "4"))
+_OMNIVA_PP_PAIR_TIMING_ENABLED = os.getenv(
+    "SGLANG_OMNIVA_PP_PAIR_TIMING", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_OMNIVA_PP_GPU_TIMING_ENABLED = os.getenv(
+    "SGLANG_OMNIVA_PP_GPU_TIMING", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_OMNIVA_PP_META_PREFIX = "__omniva_pp_"
+_OMNIVA_PP_MSG_ID_KEY = "__omniva_pp_msg_id__"
+_OMNIVA_PP_SEND_EPOCH_NS_KEY = "__omniva_pp_send_epoch_ns__"
+_OMNIVA_PP_SEND_PERF_NS_KEY = "__omniva_pp_send_perf_ns__"
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -57,6 +77,9 @@ if TYPE_CHECKING:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    forward_start_event: Optional[torch.Event] = None
+    forward_end_event: Optional[torch.Event] = None
+    forward_submit_epoch_ns: Optional[int] = None
 
 
 class SchedulerPPMixin:
@@ -69,6 +92,114 @@ class SchedulerPPMixin:
 
         return _OMNIVA_PP_TIMING_LOG_ALL_TP or str(self.tp_rank) in (
             _OMNIVA_PP_TIMING_TP_RANKS
+        )
+
+    def _omniva_pp_pair_timing_enabled(self: Scheduler) -> bool:
+        return _OMNIVA_PP_PAIR_TIMING_ENABLED and self._omniva_pp_timing_should_log()
+
+    def _omniva_pp_gpu_timing_enabled(self: Scheduler) -> bool:
+        return _OMNIVA_PP_GPU_TIMING_ENABLED and self._omniva_pp_timing_should_log()
+
+    def _omniva_pp_tensor_keys(
+        self: Scheduler, tensor_dict: Dict[str, object]
+    ) -> List[str]:
+        return sorted(
+            str(key)
+            for key in tensor_dict.keys()
+            if not str(key).startswith(_OMNIVA_PP_META_PREFIX)
+        )
+
+    def _omniva_pp_new_event(self: Scheduler, *, enable_timing: bool = False):
+        try:
+            return self.device_module.Event(enable_timing=enable_timing)
+        except TypeError:
+            return self.device_module.Event()
+
+    def _omniva_pp_next_message_id(self: Scheduler, msg_type: str) -> str:
+        seq = getattr(self, "_omniva_pp_message_seq", 0) + 1
+        self._omniva_pp_message_seq = seq
+        return (
+            f"pp{self.pp_rank}-tp{self.tp_rank}-{msg_type}-"
+            f"f{self.forward_ct}-m{seq}"
+        )
+
+    def _omniva_pp_add_message_metadata(
+        self: Scheduler,
+        tensor_dict: Dict[str, object],
+        msg_type: str,
+    ) -> Dict[str, object]:
+        if not self._omniva_pp_pair_timing_enabled():
+            return {}
+
+        metadata: Dict[str, object] = {
+            _OMNIVA_PP_MSG_ID_KEY: self._omniva_pp_next_message_id(msg_type),
+            _OMNIVA_PP_SEND_EPOCH_NS_KEY: time.time_ns(),
+            _OMNIVA_PP_SEND_PERF_NS_KEY: time.perf_counter_ns(),
+            "__omniva_pp_send_msg_type__": msg_type,
+            "__omniva_pp_send_forward_ct__": self.forward_ct,
+            "__omniva_pp_send_pp_rank__": self.pp_rank,
+            "__omniva_pp_send_tp_rank__": self.tp_rank,
+        }
+        tensor_dict.update(metadata)
+        return metadata
+
+    def _omniva_pp_message_metadata(
+        self: Scheduler, tensor_dict: Dict[str, object]
+    ) -> Dict[str, object]:
+        if not self._omniva_pp_pair_timing_enabled():
+            return {}
+
+        metadata: Dict[str, object] = {}
+        for key, value in tensor_dict.items():
+            key_str = str(key)
+            if key_str.startswith(_OMNIVA_PP_META_PREFIX):
+                metadata[key_str] = value
+
+        send_epoch_ns = metadata.get(_OMNIVA_PP_SEND_EPOCH_NS_KEY)
+        if isinstance(send_epoch_ns, int):
+            metadata["paired_send_to_recv_wall_ms"] = round(
+                (time.time_ns() - send_epoch_ns) / 1e6, 3
+            )
+        return metadata
+
+    def _omniva_pp_log_forward_gpu_elapsed(
+        self: Scheduler, mb_id: int, batch: Optional[ScheduleBatch]
+    ) -> None:
+        if not self._omniva_pp_gpu_timing_enabled():
+            return
+
+        metadata = self.mb_metadata[mb_id]
+        if (
+            metadata is None
+            or metadata.forward_start_event is None
+            or metadata.forward_end_event is None
+        ):
+            return
+
+        try:
+            elapsed_ms = metadata.forward_start_event.elapsed_time(
+                metadata.forward_end_event
+            )
+        except Exception as exc:
+            self._omniva_pp_timing_log(
+                "run_batch_gpu_elapsed_error",
+                mb_id=mb_id,
+                batch=batch,
+                error=repr(exc),
+            )
+            return
+
+        fields: Dict[str, object] = {}
+        if metadata.forward_submit_epoch_ns is not None:
+            fields["forward_submit_age_ms"] = round(
+                (time.time_ns() - metadata.forward_submit_epoch_ns) / 1e6, 3
+            )
+        self._omniva_pp_timing_log(
+            "run_batch_gpu_elapsed",
+            elapsed_ms=elapsed_ms,
+            mb_id=mb_id,
+            batch=batch,
+            **fields,
         )
 
     def _omniva_pp_batch_summary(
@@ -232,7 +363,21 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                pending_proxy_work_items = len(self.send_proxy_work)
+                tic = (
+                    time.perf_counter()
+                    if pp_timing and pending_proxy_work_items
+                    else 0.0
+                )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                if pp_timing and pending_proxy_work_items:
+                    self._omniva_pp_timing_log(
+                        "commit_send_proxy_work",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=mb_id,
+                        batch=self.cur_batch,
+                        work_items=pending_proxy_work_items,
+                    )
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -271,6 +416,9 @@ class SchedulerPPMixin:
                             mb_id=next_mb_id,
                             batch=self.mbs[next_mb_id],
                         )
+                    self._omniva_pp_log_forward_gpu_elapsed(
+                        next_mb_id, self.mbs[next_mb_id]
+                    )
                     if pp_timing:
                         self._omniva_pp_timing_log(
                             "process_batch_result",
@@ -697,6 +845,7 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
+        self._omniva_pp_message_seq = 0
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
@@ -1025,7 +1174,18 @@ class SchedulerPPMixin:
         Optional[GenerationBatchResult],
         Optional[torch.Event],
     ]:
+        pp_timing = self._omniva_pp_timing_should_log()
+        pending_work_items = len(self.send_output_work)
+        tic = time.perf_counter() if pp_timing and pending_work_items else 0.0
         self._pp_commit_comm_work(work=self.send_output_work)
+        if pp_timing and pending_work_items:
+            self._omniva_pp_timing_log(
+                "commit_send_output_work",
+                elapsed_ms=(time.perf_counter() - tic) * 1000,
+                mb_id=next_first_rank_mb_id,
+                batch=self.mbs[next_first_rank_mb_id],
+                work_items=pending_work_items,
+            )
         (
             next_pp_outputs,
             next_batch_result,
@@ -1114,6 +1274,9 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        pp_timing = self._omniva_pp_timing_should_log()
+        metadata = self._omniva_pp_add_message_metadata(tensor_dict, msg_type)
+        tic = time.perf_counter() if pp_timing else 0.0
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -1124,6 +1287,16 @@ class SchedulerPPMixin:
                 async_send=async_send,
             )
         )
+        if pp_timing:
+            self._omniva_pp_timing_log(
+                "send_tensor_dict_to_next_stage",
+                elapsed_ms=(time.perf_counter() - tic) * 1000,
+                msg_type=msg_type,
+                async_send=async_send,
+                work_items=len(p2p_work),
+                tensor_keys=self._omniva_pp_tensor_keys(tensor_dict),
+                **metadata,
+            )
         return p2p_work
 
     def _pp_recv_typed_dict(
@@ -1142,6 +1315,8 @@ class SchedulerPPMixin:
                 return inbox_queue.popleft()
 
         while True:
+            pp_timing = self._omniva_pp_timing_should_log()
+            tic = time.perf_counter() if pp_timing else 0.0
             tensor_dict = self.pp_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
@@ -1151,6 +1326,15 @@ class SchedulerPPMixin:
                     logger.warning_once(
                         f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
                         "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+                    )
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_tensor_dict_from_prev_stage",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        expected_kind=expected_kind,
+                        received_kind=received_kind,
+                        tensor_keys=self._omniva_pp_tensor_keys(tensor_dict),
+                        **self._omniva_pp_message_metadata(tensor_dict),
                     )
                 return tensor_dict
             else:
@@ -1229,7 +1413,16 @@ class SchedulerPPMixin:
             if mbs[next_first_rank_mb_id] is not None:
                 q_event, pp_outputs_to_send = last_rank_comm_queue.popleft()
                 if not mbs[next_first_rank_mb_id].forward_mode.is_prebuilt():
+                    pp_timing = self._omniva_pp_timing_should_log()
+                    tic = time.perf_counter() if pp_timing else 0.0
                     self.device_module.current_stream().wait_event(q_event)
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "send_output_ready_wait",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=next_first_rank_mb_id,
+                            batch=mbs[next_first_rank_mb_id],
+                        )
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
@@ -1312,7 +1505,8 @@ class SchedulerPPMixin:
                     elapsed_ms=(time.perf_counter() - tic) * 1000,
                     mb_id=next_mb_id,
                     batch=mbs[next_mb_id],
-                    tensor_keys=sorted(str(key) for key in tensor_dict.keys()),
+                    tensor_keys=self._omniva_pp_tensor_keys(tensor_dict),
+                    **self._omniva_pp_message_metadata(tensor_dict),
                 )
             tic = time.perf_counter() if pp_timing else 0.0
             next_pp_outputs = PPProxyTensors(tensor_dict)
@@ -1379,14 +1573,24 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque,
     ):
         pp_timing = self._omniva_pp_timing_should_log()
+        pp_gpu_timing = self._omniva_pp_gpu_timing_enabled()
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                forward_start_event = None
+                forward_end_event = None
+                forward_submit_epoch_ns = None
+                if pp_gpu_timing:
+                    forward_start_event = self._omniva_pp_new_event(
+                        enable_timing=True
+                    )
+                    forward_submit_epoch_ns = time.time_ns()
+                    forward_start_event.record(self.device_module.current_stream())
                 tic = time.perf_counter() if pp_timing else 0.0
                 result = self.run_batch(self.cur_batch, pp_proxy_tensors)
-                mb_metadata[mb_id] = PPBatchMetadata(
-                    can_run_cuda_graph=result.can_run_cuda_graph,
-                )
+                if pp_gpu_timing:
+                    forward_end_event = self._omniva_pp_new_event(enable_timing=True)
+                    forward_end_event.record(self.device_module.current_stream())
                 if pp_timing:
                     self._omniva_pp_timing_log(
                         "run_batch",
@@ -1395,6 +1599,12 @@ class SchedulerPPMixin:
                         batch=self.cur_batch,
                         can_run_cuda_graph=result.can_run_cuda_graph,
                     )
+                mb_metadata[mb_id] = PPBatchMetadata(
+                    can_run_cuda_graph=result.can_run_cuda_graph,
+                    forward_start_event=forward_start_event,
+                    forward_end_event=forward_end_event,
+                    forward_submit_epoch_ns=forward_submit_epoch_ns,
+                )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
