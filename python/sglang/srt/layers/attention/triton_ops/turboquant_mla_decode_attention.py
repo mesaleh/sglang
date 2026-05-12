@@ -32,11 +32,37 @@ Kernel reference ports:
     MLA stage-1/stage-2 split, grouped-MLA head tiling.
 """
 
+import os
+
 import triton
 import triton.language as tl
 
 
 _MIN_BLOCK_KV = 32
+
+
+def _get_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    value = int(raw_value)
+    if value < minimum:
+        raise ValueError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def _require_power_of_two(name: str, value: int) -> int:
+    if value & (value - 1):
+        raise ValueError(f"{name} must be a power of two, got {value}")
+    return value
+
+
+_TQ_MLA_DECODE_BLOCK_N = _require_power_of_two(
+    "SGLANG_TQ_MLA_DECODE_BLOCK_N",
+    _get_int_env("SGLANG_TQ_MLA_DECODE_BLOCK_N", 64, minimum=16),
+)
+_TQ_MLA_DECODE_NUM_WARPS = _get_int_env("SGLANG_TQ_MLA_DECODE_NUM_WARPS", 8)
+_TQ_MLA_DECODE_NUM_STAGES = _get_int_env("SGLANG_TQ_MLA_DECODE_NUM_STAGES", 2)
 
 
 @triton.jit
@@ -405,7 +431,7 @@ def tq_mla_decode_attention_fwd(
     BLOCK_LORA = triton.next_power_of_2(lora_rank)
     BLOCK_LORA_PACKED = triton.next_power_of_2(lora_packed)
     BLOCK_ROPE = triton.next_power_of_2(rope_dim)
-    BLOCK_N = 16
+    BLOCK_N = _TQ_MLA_DECODE_BLOCK_N
     BLOCK_H = min(16, q_heads)
 
     grid = (
@@ -445,8 +471,8 @@ def tq_mla_decode_attention_fwd(
         BLOCK_ROPE=BLOCK_ROPE,
         logit_cap=logit_cap,
         UNIFORM=uniform,
-        num_warps=4,
-        num_stages=2,
+        num_warps=_TQ_MLA_DECODE_NUM_WARPS,
+        num_stages=_TQ_MLA_DECODE_NUM_STAGES,
     )
 
     # Stage 2: softmax-reduce across splits. Reuses the MHA decode_attention
