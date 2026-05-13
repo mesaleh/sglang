@@ -22,11 +22,13 @@ If you only need to use the distributed environment without model/pipeline
  steps.
 """
 
+import atexit
 import contextlib
 import gc
 import logging
 import os
 import pickle
+import traceback
 import weakref
 from collections import namedtuple
 from contextlib import contextmanager, nullcontext
@@ -71,6 +73,179 @@ REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 # Reuse the user-provided distributed timeout for model-parallel subgroup
 # creation so runtime collectives do not silently fall back to backend defaults.
 _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _bool_env_var(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in _TRUE_ENV_VALUES
+
+
+_AR_CENSUS_ENABLED = _bool_env_var("SGLANG_OMNIVA_AR_CENSUS")
+_AR_CENSUS_CALLSITE = _bool_env_var("SGLANG_OMNIVA_AR_CENSUS_CALLSITE")
+_AR_CENSUS_CALLSITE_MAX_EVENTS = get_int_env_var(
+    "SGLANG_OMNIVA_AR_CENSUS_CALLSITE_MAX_EVENTS", 512
+)
+_AR_CENSUS_MAX_EVENTS = get_int_env_var("SGLANG_OMNIVA_AR_CENSUS_MAX_EVENTS", 256)
+_AR_CENSUS_SUMMARY_EVERY = get_int_env_var(
+    "SGLANG_OMNIVA_AR_CENSUS_SUMMARY_EVERY", 1000
+)
+_AR_CENSUS_SUMMARY_LIMIT = get_int_env_var(
+    "SGLANG_OMNIVA_AR_CENSUS_SUMMARY_LIMIT", 50
+)
+_AR_CENSUS_TOTAL = 0
+_AR_CENSUS_COUNTS: Dict[Tuple[Any, ...], int] = {}
+_AR_CENSUS_LOGGED_KEYS = set()
+
+
+def _all_reduce_census_callsite() -> str:
+    if not _AR_CENSUS_CALLSITE:
+        return ""
+    if _AR_CENSUS_CALLSITE_MAX_EVENTS >= 0 and (
+        _AR_CENSUS_TOTAL >= _AR_CENSUS_CALLSITE_MAX_EVENTS
+    ):
+        return ""
+
+    try:
+        frames = traceback.extract_stack(limit=32)
+    except Exception:
+        return "unknown"
+
+    for frame in reversed(frames[:-2]):
+        filename = frame.filename
+        if filename.endswith("parallel_state.py"):
+            continue
+        if "/torch/" in filename or "/torch/distributed/" in filename:
+            continue
+        return f"{os.path.basename(filename)}:{frame.lineno}:{frame.name}"
+    return "unknown"
+
+
+def _all_reduce_census_tuple_str(values: Tuple[int, ...]) -> str:
+    if not values:
+        return "scalar"
+    return "x".join(str(value) for value in values)
+
+
+def _all_reduce_census_log_summary(reason: str) -> None:
+    if not _AR_CENSUS_ENABLED or not _AR_CENSUS_COUNTS:
+        return
+
+    log = logging.getLogger(__name__)
+    log.info(
+        "[omniva_ar_census] event=summary reason=%s total=%d unique_shapes=%d",
+        reason,
+        _AR_CENSUS_TOTAL,
+        len(_AR_CENSUS_COUNTS),
+    )
+    for key, count in sorted(
+        _AR_CENSUS_COUNTS.items(), key=lambda item: item[1], reverse=True
+    )[:_AR_CENSUS_SUMMARY_LIMIT]:
+        (
+            backend,
+            group_name,
+            world_size,
+            dtype,
+            shape,
+            stride,
+            bytes_,
+            graph_mode,
+            callsite,
+        ) = key
+        log.info(
+            "[omniva_ar_census] event=summary_row count=%d backend=%s group=%s "
+            "world_size=%d dtype=%s shape=%s stride=%s bytes=%d graph=%s callsite=%s",
+            count,
+            backend,
+            group_name,
+            world_size,
+            dtype,
+            _all_reduce_census_tuple_str(shape),
+            _all_reduce_census_tuple_str(stride),
+            bytes_,
+            graph_mode,
+            callsite,
+        )
+
+
+def _all_reduce_census_record(
+    group: "GroupCoordinator",
+    input_: torch.Tensor,
+    backend: str,
+    ca_eligible: Optional[bool],
+) -> None:
+    if not _AR_CENSUS_ENABLED:
+        return
+
+    try:
+        global _AR_CENSUS_TOTAL
+        shape = tuple(int(dim) for dim in input_.shape)
+        stride = tuple(int(dim) for dim in input_.stride())
+        numel = input_.numel()
+        bytes_ = numel * input_.element_size()
+        graph_mode = is_in_piecewise_cuda_graph()
+        dtype = str(input_.dtype).replace("torch.", "")
+        callsite = _all_reduce_census_callsite()
+        key = (
+            backend,
+            group.unique_name,
+            group.world_size,
+            dtype,
+            shape,
+            stride,
+            bytes_,
+            graph_mode,
+            callsite,
+        )
+
+        _AR_CENSUS_TOTAL += 1
+        key_count = _AR_CENSUS_COUNTS.get(key, 0) + 1
+        _AR_CENSUS_COUNTS[key] = key_count
+
+        should_log = (
+            _AR_CENSUS_TOTAL <= _AR_CENSUS_MAX_EVENTS
+            or key not in _AR_CENSUS_LOGGED_KEYS
+        )
+        _AR_CENSUS_LOGGED_KEYS.add(key)
+
+        if should_log:
+            logging.getLogger(__name__).info(
+                "[omniva_ar_census] event=call total=%d key_count=%d "
+                "backend=%s group=%s rank=%d local_rank=%d rank_in_group=%d "
+                "world_size=%d dtype=%s shape=%s stride=%s numel=%d bytes=%d "
+                "graph=%s contiguous=%s ca_eligible=%s callsite=%s",
+                _AR_CENSUS_TOTAL,
+                key_count,
+                backend,
+                group.unique_name,
+                group.rank,
+                group.local_rank,
+                group.rank_in_group,
+                group.world_size,
+                dtype,
+                _all_reduce_census_tuple_str(shape),
+                _all_reduce_census_tuple_str(stride),
+                numel,
+                bytes_,
+                graph_mode,
+                input_.is_contiguous(),
+                ca_eligible,
+                callsite,
+            )
+
+        if (
+            _AR_CENSUS_SUMMARY_EVERY > 0
+            and _AR_CENSUS_TOTAL % _AR_CENSUS_SUMMARY_EVERY == 0
+        ):
+            _all_reduce_census_log_summary("interval")
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "[omniva_ar_census] event=record_failed error=%r", exc
+        )
+
+
+if _AR_CENSUS_ENABLED:
+    atexit.register(_all_reduce_census_log_summary, "process_exit")
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -579,55 +754,89 @@ class GroupCoordinator:
             return input_
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
+            if _AR_CENSUS_ENABLED:
+                _all_reduce_census_record(self, input_, "hpu", None)
             return self.hpu_communicator.all_reduce(input_)
 
         if self.xpu_communicator is not None and not self.xpu_communicator.disabled:
+            if _AR_CENSUS_ENABLED:
+                _all_reduce_census_record(self, input_, "xpu", None)
             return self.xpu_communicator.all_reduce(input_)
 
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
+            if _AR_CENSUS_ENABLED:
+                _all_reduce_census_record(self, input_, "npu", None)
             return self.npu_communicator.all_reduce(input_)
 
         if self.pynccl_comm is not None and self.is_symmetric_memory_enabled():
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with self.pynccl_comm.change_state(enable=True):
+                if _AR_CENSUS_ENABLED:
+                    _all_reduce_census_record(
+                        self, input_, "pynccl_symmetric", None
+                    )
                 self.pynccl_comm.all_reduce(input_)
                 return input_
 
         outplace_all_reduce_method = None
+        ca_eligible = None
+        if self.ca_comm is not None and not self.ca_comm.disabled:
+            ca_eligible = self.ca_comm.should_custom_ar(input_)
+            if ca_eligible:
+                outplace_all_reduce_method = "ca"
         if (
-            self.ca_comm is not None
-            and not self.ca_comm.disabled
-            and self.ca_comm.should_custom_ar(input_)
-        ):
-            outplace_all_reduce_method = "ca"
-        elif (
-            self.qr_comm is not None
+            outplace_all_reduce_method is None
+            and self.qr_comm is not None
             and not self.qr_comm.disabled
             and self.qr_comm.should_quick_allreduce(input_)
         ):
             outplace_all_reduce_method = "qr"
-        elif (
-            self.pymscclpp_comm is not None
+        if (
+            outplace_all_reduce_method is None
+            and self.pymscclpp_comm is not None
             and not self.pymscclpp_comm.disabled
             and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
         ):
             outplace_all_reduce_method = "pymscclpp"
-        elif (
-            self.torch_symm_mem_comm is not None
+        if (
+            outplace_all_reduce_method is None
+            and self.torch_symm_mem_comm is not None
             and not self.torch_symm_mem_comm.disabled
             and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
             outplace_all_reduce_method = "torch_symm_mem"
-        elif is_in_piecewise_cuda_graph() and self.pynccl_comm is not None:
+        if (
+            outplace_all_reduce_method is None
+            and is_in_piecewise_cuda_graph()
+            and self.pynccl_comm is not None
+        ):
             # For piecewise cuda graph, we use pynccl outplace allreduce
             outplace_all_reduce_method = "pynccl"
         if outplace_all_reduce_method is not None:
+            if _AR_CENSUS_ENABLED:
+                _all_reduce_census_record(
+                    self,
+                    input_,
+                    f"outplace_{outplace_all_reduce_method}",
+                    ca_eligible,
+                )
             return outplace_all_reduce(
                 input_,
                 group_name=self.unique_name,
                 outplace_all_reduce_method=outplace_all_reduce_method,
             )
         else:
+            if _AR_CENSUS_ENABLED:
+                if self.pynccl_comm is not None and not self.pynccl_comm.disabled:
+                    backend = "inplace_pynccl"
+                elif (
+                    self.torch_symm_mem_comm is not None
+                    and not self.torch_symm_mem_comm.disabled
+                ):
+                    backend = "inplace_torch_symm_mem"
+                else:
+                    backend = "inplace_torch_distributed"
+                _all_reduce_census_record(self, input_, backend, ca_eligible)
             inplace_all_reduce(input_, group_name=self.unique_name)
             return input_
 
