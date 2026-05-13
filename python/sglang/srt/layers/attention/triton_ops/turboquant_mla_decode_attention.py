@@ -65,6 +65,21 @@ _TQ_MLA_DECODE_NUM_WARPS = _get_int_env("SGLANG_TQ_MLA_DECODE_NUM_WARPS", 8)
 _TQ_MLA_DECODE_NUM_STAGES = _get_int_env("SGLANG_TQ_MLA_DECODE_NUM_STAGES", 2)
 
 
+def _normalize_lookup_impl(value: str) -> str:
+    value = value.strip().lower()
+    if value not in {"select", "gather"}:
+        raise ValueError(
+            "SGLANG_TQ_MLA_CODEBOOK_LOOKUP must be one of "
+            f"'select' or 'gather', got {value!r}"
+        )
+    return value
+
+
+_TQ_MLA_CODEBOOK_LOOKUP = _normalize_lookup_impl(
+    os.environ.get("SGLANG_TQ_MLA_CODEBOOK_LOOKUP", "select")
+)
+
+
 @triton.jit
 def _lookup_4bit_codebook(
     idx,
@@ -100,6 +115,12 @@ def _lookup_4bit_uniform(idx, c0, c15):
     Uniform layout encodes centroids as c0 + idx * (c15 - c0) / 15."""
     step = (c15 - c0) * 0.06666666666666667  # 1/15
     return idx.to(tl.float32) * step + c0
+
+
+@triton.jit
+def _lookup_4bit_gather(idx, centroids):
+    """4-bit codebook lookup via a tiny 16-entry table gather."""
+    return tl.load(centroids + idx)
 
 
 @triton.jit
@@ -142,6 +163,7 @@ def _fwd_tq_mla_decode_stage1(
     BLOCK_ROPE: tl.constexpr,           # next_power_of_2(ROPE_DIM) = 64
     logit_cap: tl.constexpr,
     UNIFORM: tl.constexpr,              # True = uniform codebook (cheap lookup)
+    LOOKUP_GATHER: tl.constexpr,        # True = tiny-table gather for non-uniform codebook
 ):
     # Grid: (bs, q_head_blocks, num_splits).
     cur_batch = tl.program_id(0)
@@ -261,6 +283,9 @@ def _fwd_tq_mla_decode_stage1(
             if UNIFORM:
                 k_lo = _lookup_4bit_uniform(k_idx_lo, c0, c15)
                 k_hi = _lookup_4bit_uniform(k_idx_hi, c0, c15)
+            elif LOOKUP_GATHER:
+                k_lo = _lookup_4bit_gather(k_idx_lo, K_Centroids)
+                k_hi = _lookup_4bit_gather(k_idx_hi, K_Centroids)
             else:
                 k_lo = _lookup_4bit_codebook(
                     k_idx_lo, c0, c1, c2, c3, c4, c5, c6, c7,
@@ -399,6 +424,7 @@ def tq_mla_decode_attention_fwd(
     sm_scale: float,
     logit_cap: float = 0.0,
     uniform: bool = False,
+    lookup_impl: str | None = None,
 ):
     """Run fused TurboQuant-MLA decode attention.
 
@@ -433,6 +459,7 @@ def tq_mla_decode_attention_fwd(
     BLOCK_ROPE = triton.next_power_of_2(rope_dim)
     BLOCK_N = _TQ_MLA_DECODE_BLOCK_N
     BLOCK_H = min(16, q_heads)
+    lookup_impl = _normalize_lookup_impl(lookup_impl or _TQ_MLA_CODEBOOK_LOOKUP)
 
     grid = (
         bs,
@@ -471,6 +498,7 @@ def tq_mla_decode_attention_fwd(
         BLOCK_ROPE=BLOCK_ROPE,
         logit_cap=logit_cap,
         UNIFORM=uniform,
+        LOOKUP_GATHER=lookup_impl == "gather",
         num_warps=_TQ_MLA_DECODE_NUM_WARPS,
         num_stages=_TQ_MLA_DECODE_NUM_STAGES,
     )
