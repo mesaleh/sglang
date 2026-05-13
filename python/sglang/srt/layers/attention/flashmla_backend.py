@@ -896,11 +896,9 @@ class TurboQuantMLABackend(FlashMLABackend):
         # once per forward at init time so forward_decode is alloc-free.
         if forward_batch.forward_mode.is_decode_or_idle():
             bs = forward_batch.batch_size
-            # Non-CG path lazy-allocates buffers sized at runtime bs. This
-            # is the path used when --disable-cuda-graph is set. Shape is
-            # picked from the real bs (not max_bs) since we're not capturing.
-            if self._tq_stage1_logits is None:
-                self._tq_ensure_buffers(bs, forward_batch.seq_lens.device)
+            # Non-CG path lazy-allocates and grows buffers at runtime bs. This
+            # is the path used when --disable-cuda-graph is set.
+            self._tq_ensure_buffers(bs, forward_batch.seq_lens.device)
             self._tq_build_kv_indices(
                 bs, forward_batch.req_pool_indices, forward_batch.seq_lens
             )
