@@ -68,6 +68,7 @@ class BenchResult:
     block_h: int
     num_warps: int
     num_stages: int
+    lookup_impl: str
     eager_p50_us: float | None
     eager_p20_us: float | None
     eager_p80_us: float | None
@@ -182,6 +183,7 @@ class Inputs:
             sm_scale=1.0 / math.sqrt(shape.lora_rank + shape.rope_dim),
             logit_cap=0.0,
             uniform=False,
+            lookup_impl=os.environ.get("SGLANG_TQ_MLA_CODEBOOK_LOOKUP", "select"),
         )
         torch.cuda.synchronize()
 
@@ -218,6 +220,7 @@ def launch_stage1(
     block_h: int,
     num_warps: int,
     num_stages: int,
+    lookup_impl: str,
 ) -> None:
     shape = x.shape
     block_h = min(block_h, shape.q_heads)
@@ -263,6 +266,7 @@ def launch_stage1(
         BLOCK_ROPE=triton.next_power_of_2(shape.rope_dim),
         logit_cap=0.0,
         UNIFORM=False,
+        LOOKUP_GATHER=lookup_impl == "gather",
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -283,7 +287,7 @@ def launch_stage2(x: Inputs) -> None:
     )
 
 
-def launch_full_attention(x: Inputs) -> None:
+def launch_full_attention(x: Inputs, lookup_impl: str) -> None:
     tq_mla_decode_attention_fwd(
         q_nope_rotated=x.q_nope_rotated,
         q_rope=x.q_rope,
@@ -301,18 +305,19 @@ def launch_full_attention(x: Inputs) -> None:
         sm_scale=1.0 / math.sqrt(x.shape.lora_rank + x.shape.rope_dim),
         logit_cap=0.0,
         uniform=False,
+        lookup_impl=lookup_impl,
     )
 
 
-def launch_local_decode(x: Inputs) -> None:
+def launch_local_decode(x: Inputs, lookup_impl: str) -> None:
     x.q_nope_rotated.copy_(x.tq_config.rotate_query(x.q_nope))
-    launch_full_attention(x)
+    launch_full_attention(x, lookup_impl)
     x.o.copy_(x.tq_config.inverse_rotate_output(x.o_rotated))
 
 
-def launch_local_decode_with_metadata(x: Inputs) -> None:
+def launch_local_decode_with_metadata(x: Inputs, lookup_impl: str) -> None:
     x.fill_metadata()
-    launch_local_decode(x)
+    launch_local_decode(x, lookup_impl)
 
 
 def measure(
@@ -357,18 +362,50 @@ def op_fns(
     block_h: int,
     num_warps: int,
     num_stages: int,
+    lookup_impl: str,
 ) -> dict[str, Callable[[], None]]:
     return {
         "metadata_full": x.fill_metadata,
         "metadata_indices_only": x.fill_indices_only,
         "rotate_query": lambda: x.q_nope_rotated.copy_(x.tq_config.rotate_query(x.q_nope)),
-        "stage1": lambda: launch_stage1(x, block_n, block_h, num_warps, num_stages),
+        "stage1": lambda: launch_stage1(
+            x, block_n, block_h, num_warps, num_stages, lookup_impl
+        ),
         "stage2": lambda: launch_stage2(x),
-        "full_attention": lambda: launch_full_attention(x),
+        "full_attention": lambda: launch_full_attention(x, lookup_impl),
         "inverse_rotate": lambda: x.o.copy_(x.tq_config.inverse_rotate_output(x.o_rotated)),
-        "local_decode": lambda: launch_local_decode(x),
-        "local_decode_with_metadata": lambda: launch_local_decode_with_metadata(x),
+        "local_decode": lambda: launch_local_decode(x, lookup_impl),
+        "local_decode_with_metadata": lambda: launch_local_decode_with_metadata(
+            x, lookup_impl
+        ),
     }
+
+
+def check_lookup_correctness(x: Inputs, out_dir: Path) -> None:
+    x.fill_metadata()
+    launch_full_attention(x, "select")
+    torch.cuda.synchronize()
+    ref_o = x.o_rotated.float().clone()
+    ref_lse = x.att_lse.float().clone()
+
+    launch_full_attention(x, "gather")
+    torch.cuda.synchronize()
+    max_o_diff = (ref_o - x.o_rotated.float()).abs().max().item()
+    max_lse_diff = (ref_lse - x.att_lse.float()).abs().max().item()
+    passed = max_o_diff <= 1e-3 and max_lse_diff <= 1e-4
+    row = {
+        "batch_size": x.shape.batch_size,
+        "seq_len": x.shape.seq_len,
+        "q_heads": x.shape.q_heads,
+        "max_o_diff": max_o_diff,
+        "max_lse_diff": max_lse_diff,
+        "status": "ok" if passed else "error",
+    }
+    with (out_dir / "lookup_correctness.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, sort_keys=True) + "\n")
+    print(json.dumps({"lookup_correctness": row}, sort_keys=True), flush=True)
+    if not passed:
+        raise RuntimeError(f"select/gather lookup correctness failed: {row}")
 
 
 def result_to_row(result: BenchResult) -> dict[str, object]:
@@ -381,6 +418,7 @@ def result_to_row(result: BenchResult) -> dict[str, object]:
         "block_h": result.block_h,
         "num_warps": result.num_warps,
         "num_stages": result.num_stages,
+        "lookup_impl": result.lookup_impl,
         "eager_p50_us": result.eager_p50_us,
         "eager_p20_us": result.eager_p20_us,
         "eager_p80_us": result.eager_p80_us,
@@ -403,7 +441,7 @@ def write_outputs(results: list[BenchResult], out_dir: Path) -> None:
         fieldnames = list(rows[0].keys())
     else:
         empty_result = BenchResult(
-            "", 0, 0, 0, 0, 0, 0, 0, None, None, None, None, None, None, "", ""
+            "", 0, 0, 0, 0, 0, 0, 0, "", None, None, None, None, None, None, "", ""
         )
         fieldnames = list(result_to_row(empty_result).keys())
     with (out_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
@@ -432,7 +470,9 @@ def main() -> None:
     parser.add_argument("--block-hs", nargs="+", default=["16"])
     parser.add_argument("--num-warps", nargs="+", default=["8"])
     parser.add_argument("--num-stages", nargs="+", default=["2"])
+    parser.add_argument("--lookup-impls", nargs="+", default=["select"])
     parser.add_argument("--ops", nargs="+", default=["all"])
+    parser.add_argument("--check-lookup-correctness", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
@@ -450,6 +490,10 @@ def main() -> None:
     block_hs = parse_ints(args.block_hs)
     num_warps_values = parse_ints(args.num_warps)
     num_stages_values = parse_ints(args.num_stages)
+    lookup_impls = [value.strip().lower() for value in args.lookup_impls]
+    invalid_lookup_impls = sorted(set(lookup_impls) - {"select", "gather"})
+    if invalid_lookup_impls:
+        raise ValueError(f"Invalid lookup implementations: {invalid_lookup_impls}")
     all_results: list[BenchResult] = []
 
     env = {
@@ -457,6 +501,9 @@ def main() -> None:
         "torch_version": torch.__version__,
         "triton_version": triton.__version__,
         "pid": os.getpid(),
+        "SGLANG_TQ_MLA_CODEBOOK_LOOKUP": os.environ.get(
+            "SGLANG_TQ_MLA_CODEBOOK_LOOKUP", "select"
+        ),
         "args": {
             key: str(value) if isinstance(value, Path) else value
             for key, value in vars(args).items()
@@ -476,50 +523,68 @@ def main() -> None:
                 max_kv_splits=args.max_kv_splits,
             )
             x = Inputs(shape, seed=args.seed)
+            if args.check_lookup_correctness:
+                check_lookup_correctness(x, args.out_dir)
             for block_n in block_ns:
                 for block_h in block_hs:
                     for num_warps in num_warps_values:
                         for num_stages in num_stages_values:
-                            fns = op_fns(x, block_n, block_h, num_warps, num_stages)
-                            for op_name, fn in fns.items():
-                                if "all" not in requested_ops and op_name not in requested_ops:
-                                    continue
-                                eager = safe_measure(fn, args.warmup, args.rep, use_graph=False)
-                                if op_name in GRAPH_UNSAFE_OPS:
-                                    graph = skipped_graph_measure(
-                                        "graph capture skipped: op includes CUDA-graph-unsafe "
-                                        "metadata assignment/cumsum"
-                                    )
-                                else:
-                                    graph = safe_measure(
-                                        fn, args.warmup, args.rep, use_graph=True
-                                    )
-                                status = (
-                                    "ok"
-                                    if eager[3] == "ok" and graph[3] in {"ok", "skipped"}
-                                    else "error"
+                            for lookup_impl in lookup_impls:
+                                fns = op_fns(
+                                    x,
+                                    block_n,
+                                    block_h,
+                                    num_warps,
+                                    num_stages,
+                                    lookup_impl,
                                 )
-                                error = "\n".join(err for err in (eager[4], graph[4]) if err)
-                                result = BenchResult(
-                                    op=op_name,
-                                    batch_size=batch_size,
-                                    seq_len=seq_len,
-                                    q_heads=args.q_heads,
-                                    block_n=block_n,
-                                    block_h=min(block_h, args.q_heads),
-                                    num_warps=num_warps,
-                                    num_stages=num_stages,
-                                    eager_p50_us=eager[0],
-                                    eager_p20_us=eager[1],
-                                    eager_p80_us=eager[2],
-                                    graph_p50_us=graph[0],
-                                    graph_p20_us=graph[1],
-                                    graph_p80_us=graph[2],
-                                    status=status,
-                                    error=error,
-                                )
-                                all_results.append(result)
-                                print(json.dumps(result_to_row(result), sort_keys=True), flush=True)
+                                for op_name, fn in fns.items():
+                                    if "all" not in requested_ops and op_name not in requested_ops:
+                                        continue
+                                    eager = safe_measure(
+                                        fn, args.warmup, args.rep, use_graph=False
+                                    )
+                                    if op_name in GRAPH_UNSAFE_OPS:
+                                        graph = skipped_graph_measure(
+                                            "graph capture skipped: op includes CUDA-graph-unsafe "
+                                            "metadata assignment/cumsum"
+                                        )
+                                    else:
+                                        graph = safe_measure(
+                                            fn, args.warmup, args.rep, use_graph=True
+                                        )
+                                    status = (
+                                        "ok"
+                                        if eager[3] == "ok" and graph[3] in {"ok", "skipped"}
+                                        else "error"
+                                    )
+                                    error = "\n".join(
+                                        err for err in (eager[4], graph[4]) if err
+                                    )
+                                    result = BenchResult(
+                                        op=op_name,
+                                        batch_size=batch_size,
+                                        seq_len=seq_len,
+                                        q_heads=args.q_heads,
+                                        block_n=block_n,
+                                        block_h=min(block_h, args.q_heads),
+                                        num_warps=num_warps,
+                                        num_stages=num_stages,
+                                        lookup_impl=lookup_impl,
+                                        eager_p50_us=eager[0],
+                                        eager_p20_us=eager[1],
+                                        eager_p80_us=eager[2],
+                                        graph_p50_us=graph[0],
+                                        graph_p20_us=graph[1],
+                                        graph_p80_us=graph[2],
+                                        status=status,
+                                        error=error,
+                                    )
+                                    all_results.append(result)
+                                    print(
+                                        json.dumps(result_to_row(result), sort_keys=True),
+                                        flush=True,
+                                    )
 
     write_outputs(all_results, args.out_dir)
     print(f"Wrote {len(all_results)} rows to {args.out_dir}", flush=True)
