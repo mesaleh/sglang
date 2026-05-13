@@ -24,6 +24,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import atexit
 import contextlib
+import contextvars
 import gc
 import logging
 import os
@@ -96,6 +97,29 @@ _AR_CENSUS_SUMMARY_LIMIT = get_int_env_var(
 _AR_CENSUS_TOTAL = 0
 _AR_CENSUS_COUNTS: Dict[Tuple[Any, ...], int] = {}
 _AR_CENSUS_LOGGED_KEYS = set()
+_AR_CENSUS_OP_LABEL: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "sglang_omniva_ar_census_op_label", default=""
+)
+
+
+def is_all_reduce_census_enabled() -> bool:
+    return _AR_CENSUS_ENABLED
+
+
+@contextmanager
+def all_reduce_census_scope(label: str):
+    if not _AR_CENSUS_ENABLED or not label:
+        yield
+        return
+
+    previous_label = _AR_CENSUS_OP_LABEL.get()
+    if previous_label:
+        label = f"{previous_label}>{label}"
+    token = _AR_CENSUS_OP_LABEL.set(label)
+    try:
+        yield
+    finally:
+        _AR_CENSUS_OP_LABEL.reset(token)
 
 
 def _all_reduce_census_callsite() -> str:
@@ -150,11 +174,12 @@ def _all_reduce_census_log_summary(reason: str) -> None:
             stride,
             bytes_,
             graph_mode,
+            op_label,
             callsite,
         ) = key
         log.info(
             "[omniva_ar_census] event=summary_row count=%d backend=%s group=%s "
-            "world_size=%d dtype=%s shape=%s stride=%s bytes=%d graph=%s callsite=%s",
+            "world_size=%d dtype=%s shape=%s stride=%s bytes=%d graph=%s op=%s callsite=%s",
             count,
             backend,
             group_name,
@@ -164,6 +189,7 @@ def _all_reduce_census_log_summary(reason: str) -> None:
             _all_reduce_census_tuple_str(stride),
             bytes_,
             graph_mode,
+            op_label,
             callsite,
         )
 
@@ -185,6 +211,7 @@ def _all_reduce_census_record(
         bytes_ = numel * input_.element_size()
         graph_mode = is_in_piecewise_cuda_graph()
         dtype = str(input_.dtype).replace("torch.", "")
+        op_label = _AR_CENSUS_OP_LABEL.get()
         callsite = _all_reduce_census_callsite()
         key = (
             backend,
@@ -195,6 +222,7 @@ def _all_reduce_census_record(
             stride,
             bytes_,
             graph_mode,
+            op_label,
             callsite,
         )
 
@@ -213,7 +241,7 @@ def _all_reduce_census_record(
                 "[omniva_ar_census] event=call total=%d key_count=%d "
                 "backend=%s group=%s rank=%d local_rank=%d rank_in_group=%d "
                 "world_size=%d dtype=%s shape=%s stride=%s numel=%d bytes=%d "
-                "graph=%s contiguous=%s ca_eligible=%s callsite=%s",
+                "graph=%s contiguous=%s ca_eligible=%s op=%s callsite=%s",
                 _AR_CENSUS_TOTAL,
                 key_count,
                 backend,
@@ -230,6 +258,7 @@ def _all_reduce_census_record(
                 graph_mode,
                 input_.is_contiguous(),
                 ca_eligible,
+                op_label,
                 callsite,
             )
 
