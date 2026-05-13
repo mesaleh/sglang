@@ -21,10 +21,12 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.distributed import (
+    all_reduce_census_scope,
     attention_tensor_model_parallel_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
+    is_all_reduce_census_enabled,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
@@ -436,6 +438,7 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        layer_id: Optional[int] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -444,11 +447,16 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
 
-        self._context = CommunicateContext.init_new()
+        self._context = CommunicateContext.init_new(layer_id=layer_id)
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
+
+    def _all_reduce_census_label(self, op: str) -> str:
+        if self._context.layer_id is None:
+            return op
+        return f"{op}.layer={self._context.layer_id}"
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -531,7 +539,19 @@ class LayerCommunicator:
                         )
                     )
                 else:
-                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
+                    if is_all_reduce_census_enabled():
+                        with all_reduce_census_scope(
+                            self._all_reduce_census_label(
+                                "communicator.pending_moe_allreduce_layernorm"
+                            )
+                        ):
+                            hidden_states = moe_tensor_model_parallel_all_reduce(
+                                hidden_states
+                            )
+                    else:
+                        hidden_states = moe_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -766,12 +786,13 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
+    layer_id: Optional[int] = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     @classmethod
-    def init_new(cls):
+    def init_new(cls, layer_id: Optional[int] = None):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
@@ -798,7 +819,14 @@ class CommunicateContext:
             attn_cp_size=attn_cp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
+            layer_id=layer_id,
         )
+
+
+def _all_reduce_census_label_for_context(context: CommunicateContext, op: str) -> str:
+    if context.layer_id is None:
+        return op
+    return f"{op}.layer={context.layer_id}"
 
 
 class CommunicateSimpleFn:
@@ -1005,9 +1033,19 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
-                hidden_states = attention_tensor_model_parallel_all_reduce(
-                    hidden_states
-                )
+                if is_all_reduce_census_enabled():
+                    with all_reduce_census_scope(
+                        _all_reduce_census_label_for_context(
+                            context, "communicator.attn_allreduce_layernorm"
+                        )
+                    ):
+                        hidden_states = attention_tensor_model_parallel_all_reduce(
+                            hidden_states
+                        )
+                else:
+                    hidden_states = attention_tensor_model_parallel_all_reduce(
+                        hidden_states
+                    )
                 if _is_npu and context.cache is not None:
                     _ = prepare_weight_cache(hidden_states, context.cache)
                 hidden_states, residual = layernorm(hidden_states, residual)
@@ -1046,7 +1084,15 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         scattered_states += residual
-        residual = tensor_model_parallel_all_reduce(hidden_states)
+        if is_all_reduce_census_enabled():
+            with all_reduce_census_scope(
+                _all_reduce_census_label_for_context(
+                    context, "communicator.tp_residual_allreduce"
+                )
+            ):
+                residual = tensor_model_parallel_all_reduce(hidden_states)
+        else:
+            residual = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = layernorm(residual)
         return hidden_states, residual
 
