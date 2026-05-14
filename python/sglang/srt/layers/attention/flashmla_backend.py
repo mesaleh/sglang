@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
 import torch
 import triton
+import triton.language as tl
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
 from sglang.srt.environ import envs
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
 
 PAGE_SIZE = 64
+_TQ_MLA_FAST_METADATA = envs.SGLANG_TQ_MLA_FAST_METADATA.get()
 _TQ_MLA_PROFILE_NVTX = envs.SGLANG_TQ_MLA_PROFILE_NVTX.get()
 
 
@@ -63,6 +65,24 @@ def _tq_mla_nvtx_range(name: str):
     if not _TQ_MLA_PROFILE_NVTX:
         return _NOOP_NVTX_RANGE
     return _TorchNVTXRange(name)
+
+
+@triton.jit
+def _tq_build_indptr_triton(
+    seq_lens,
+    seq_lens_i32,
+    kv_indptr,
+    BS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < BS
+    vals = tl.load(seq_lens + offs, mask=mask, other=0).to(tl.int32)
+    prefix = tl.cumsum(vals, axis=0)
+
+    tl.store(kv_indptr, 0)
+    tl.store(seq_lens_i32 + offs, vals, mask=mask)
+    tl.store(kv_indptr + offs + 1, prefix, mask=mask)
 
 
 @dataclass
@@ -739,6 +759,7 @@ class TurboQuantMLABackend(FlashMLABackend):
         # Non-CG path also uses them via _ensure_fallback_buffers.
         self._tq_kv_indices = None         # (max_bs * max_context_len,) int32
         self._tq_kv_indptr = None          # (max_bs + 1,) int32
+        self._tq_seq_lens_i32 = None       # (max_bs,) int32 scratch for metadata fast path
         self._tq_num_kv_splits = None      # (max_bs,) int32 — filled with _tq_max_kv_splits
         self._tq_stage1_logits = None      # (max_bs, q_heads, max_kv_splits, lora_rank) fp32
         self._tq_stage1_lse = None         # (max_bs, q_heads, max_kv_splits) fp32
@@ -768,6 +789,8 @@ class TurboQuantMLABackend(FlashMLABackend):
             and self._tq_kv_indices.numel() >= max_total_tokens
             and self._tq_kv_indptr is not None
             and self._tq_kv_indptr.numel() >= max_bs + 1
+            and self._tq_seq_lens_i32 is not None
+            and self._tq_seq_lens_i32.numel() >= max_bs
             and self._tq_num_kv_splits is not None
             and self._tq_num_kv_splits.numel() >= max_bs
             and self._tq_stage1_logits is not None
@@ -790,6 +813,9 @@ class TurboQuantMLABackend(FlashMLABackend):
         )
         self._tq_kv_indptr = torch.zeros(
             max_bs + 1, dtype=torch.int32, device=device
+        )
+        self._tq_seq_lens_i32 = torch.empty(
+            max_bs, dtype=torch.int32, device=device
         )
         # Fixed split count — fill once; kernel reads kv_splits[b] per batch.
         self._tq_num_kv_splits = torch.full(
@@ -917,13 +943,30 @@ class TurboQuantMLABackend(FlashMLABackend):
         flat concatenation of per-batch req_to_token rows, written directly
         into the pre-allocated max-sized buffer.
         """
-        with _tq_mla_nvtx_range("omniva.tq_mla.metadata.seq_lens_i32"):
-            seq_lens_i32 = seq_lens[:bs].to(torch.int32)
-        with _tq_mla_nvtx_range("omniva.tq_mla.metadata.build_indptr"):
-            # Write cumsum into pre-allocated kv_indptr. Implicit int64→int32
-            # cast on assignment matches triton_backend.py pattern.
-            self._tq_kv_indptr[0] = 0
-            self._tq_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
+        if (
+            _TQ_MLA_FAST_METADATA
+            and seq_lens.is_cuda
+            and self._tq_seq_lens_i32 is not None
+            and self._tq_seq_lens_i32.numel() >= bs
+        ):
+            with _tq_mla_nvtx_range("omniva.tq_mla.metadata.fast_indptr"):
+                block = max(1, triton.next_power_of_2(bs))
+                _tq_build_indptr_triton[(1,)](
+                    seq_lens,
+                    self._tq_seq_lens_i32,
+                    self._tq_kv_indptr,
+                    BS=bs,
+                    BLOCK=block,
+                )
+                seq_lens_i32 = self._tq_seq_lens_i32
+        else:
+            with _tq_mla_nvtx_range("omniva.tq_mla.metadata.seq_lens_i32"):
+                seq_lens_i32 = seq_lens[:bs].to(torch.int32)
+            with _tq_mla_nvtx_range("omniva.tq_mla.metadata.build_indptr"):
+                # Write cumsum into pre-allocated kv_indptr. Implicit int64→int32
+                # cast on assignment matches triton_backend.py pattern.
+                self._tq_kv_indptr[0] = 0
+                self._tq_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
 
         # Fill kv_indices in-place via the flashinfer triton kernel. It
         # writes only sum(seq_lens) entries; the rest of the pre-allocated
