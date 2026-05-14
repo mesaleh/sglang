@@ -11,6 +11,7 @@ import torch
 import triton
 from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import FlashInferMLAAttnBackend
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
@@ -27,6 +28,41 @@ if TYPE_CHECKING:
 
 
 PAGE_SIZE = 64
+_TQ_MLA_PROFILE_NVTX = envs.SGLANG_TQ_MLA_PROFILE_NVTX.get()
+
+
+class _NoOpNVTXRange:
+    __slots__ = ()
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
+class _TorchNVTXRange:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        torch.cuda.nvtx.range_push(self.name)
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        torch.cuda.nvtx.range_pop()
+        return False
+
+
+_NOOP_NVTX_RANGE = _NoOpNVTXRange()
+
+
+def _tq_mla_nvtx_range(name: str):
+    if not _TQ_MLA_PROFILE_NVTX:
+        return _NOOP_NVTX_RANGE
+    return _TorchNVTXRange(name)
 
 
 @dataclass
@@ -853,17 +889,20 @@ class TurboQuantMLABackend(FlashMLABackend):
         # Parent builds flashmla's own CG buffers (block_kv_indices, mla
         # metadata, num_splits). We keep that working since forward_extend
         # and the target-verify path still use them.
-        super().init_cuda_graph_state(max_bs, max_num_tokens, block_kv_indices)
+        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.parent_state"):
+            super().init_cuda_graph_state(max_bs, max_num_tokens, block_kv_indices)
 
         # Add Stage C's own CG-safe buffers. These are read by forward_decode
         # when SGLANG_TQ_MLA_FUSED_DECODE=1 is set.
         device = self.req_to_token.device
-        self._tq_ensure_buffers(max_bs, device)
+        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.ensure_buffers"):
+            self._tq_ensure_buffers(max_bs, device)
 
         # Compile the Stage C Triton kernel before graph capture starts.
         # A JIT compile inside capture produces a broken graph with a
         # subtle "kernel missing" symptom at replay.
-        self._tq_warmup_kernel(device)
+        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.warmup"):
+            self._tq_warmup_kernel(device)
 
     def _tq_build_kv_indices(
         self,
@@ -878,29 +917,33 @@ class TurboQuantMLABackend(FlashMLABackend):
         flat concatenation of per-batch req_to_token rows, written directly
         into the pre-allocated max-sized buffer.
         """
-        seq_lens_i32 = seq_lens[:bs].to(torch.int32)
-        # Write cumsum into pre-allocated kv_indptr. Implicit int64→int32
-        # cast on assignment matches triton_backend.py pattern.
-        self._tq_kv_indptr[0] = 0
-        self._tq_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
+        with _tq_mla_nvtx_range("omniva.tq_mla.metadata.seq_lens_i32"):
+            seq_lens_i32 = seq_lens[:bs].to(torch.int32)
+        with _tq_mla_nvtx_range("omniva.tq_mla.metadata.build_indptr"):
+            # Write cumsum into pre-allocated kv_indptr. Implicit int64→int32
+            # cast on assignment matches triton_backend.py pattern.
+            self._tq_kv_indptr[0] = 0
+            self._tq_kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens_i32, dim=0)
 
         # Fill kv_indices in-place via the flashinfer triton kernel. It
         # writes only sum(seq_lens) entries; the rest of the pre-allocated
         # buffer stays garbage but is never read (bounded by kv_indptr).
-        create_flashinfer_kv_indices_triton[(bs,)](
-            self.req_to_token,
-            req_pool_indices[:bs],
-            seq_lens_i32,
-            self._tq_kv_indptr,
-            None,
-            self._tq_kv_indices,
-            self.req_to_token.stride(0),
-        )
+        with _tq_mla_nvtx_range("omniva.tq_mla.metadata.build_kv_indices"):
+            create_flashinfer_kv_indices_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices[:bs],
+                seq_lens_i32,
+                self._tq_kv_indptr,
+                None,
+                self._tq_kv_indices,
+                self.req_to_token.stride(0),
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # Run parent first to populate flashmla's block_kv_indices, mla
         # metadata, and num_splits — still needed for extend/target_verify.
-        super().init_forward_metadata(forward_batch)
+        with _tq_mla_nvtx_range("omniva.tq_mla.metadata.parent_flashmla"):
+            super().init_forward_metadata(forward_batch)
 
         # Stage C additions: our token-indexed kv_indices + kv_indptr. Built
         # once per forward at init time so forward_decode is alloc-free.
@@ -908,10 +951,12 @@ class TurboQuantMLABackend(FlashMLABackend):
             bs = forward_batch.batch_size
             # Non-CG path lazy-allocates and grows buffers at runtime bs. This
             # is the path used when --disable-cuda-graph is set.
-            self._tq_ensure_buffers(bs, forward_batch.seq_lens.device)
-            self._tq_build_kv_indices(
-                bs, forward_batch.req_pool_indices, forward_batch.seq_lens
-            )
+            with _tq_mla_nvtx_range("omniva.tq_mla.metadata.ensure_buffers"):
+                self._tq_ensure_buffers(bs, forward_batch.seq_lens.device)
+            with _tq_mla_nvtx_range("omniva.tq_mla.metadata.build_tq_indices"):
+                self._tq_build_kv_indices(
+                    bs, forward_batch.req_pool_indices, forward_batch.seq_lens
+                )
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -926,12 +971,14 @@ class TurboQuantMLABackend(FlashMLABackend):
         # Parent fills block_kv_indices + mla_metadata + num_splits for the
         # forward_metadata object. We re-use it and additionally populate
         # Stage C's own kv_indptr + kv_indices into the pre-allocated pool.
-        super().init_forward_metadata_capture_cuda_graph(
-            bs, num_tokens, req_pool_indices, seq_lens,
-            encoder_lens, forward_mode, spec_info,
-        )
+        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.capture_parent_metadata"):
+            super().init_forward_metadata_capture_cuda_graph(
+                bs, num_tokens, req_pool_indices, seq_lens,
+                encoder_lens, forward_mode, spec_info,
+            )
         if forward_mode.is_decode_or_idle():
-            self._tq_build_kv_indices(bs, req_pool_indices, seq_lens)
+            with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.capture_tq_indices"):
+                self._tq_build_kv_indices(bs, req_pool_indices, seq_lens)
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -948,12 +995,14 @@ class TurboQuantMLABackend(FlashMLABackend):
         # graph launches, so host-sync operations ARE allowed here. Parent
         # already does an .item() on seq_lens_cpu.max() — we inherit that
         # and just add our own in-place buffer refresh.
-        super().init_forward_metadata_replay_cuda_graph(
-            bs, req_pool_indices, seq_lens, seq_lens_sum,
-            encoder_lens, forward_mode, spec_info, seq_lens_cpu,
-        )
+        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.replay_parent_metadata"):
+            super().init_forward_metadata_replay_cuda_graph(
+                bs, req_pool_indices, seq_lens, seq_lens_sum,
+                encoder_lens, forward_mode, spec_info, seq_lens_cpu,
+            )
         if forward_mode.is_decode_or_idle():
-            self._tq_build_kv_indices(bs, req_pool_indices, seq_lens[:bs])
+            with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.replay_tq_indices"):
+                self._tq_build_kv_indices(bs, req_pool_indices, seq_lens[:bs])
 
     def forward_decode(
         self,
@@ -969,9 +1018,10 @@ class TurboQuantMLABackend(FlashMLABackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v
-                )
+                with _tq_mla_nvtx_range("omniva.tq_mla.decode.save_kv_cache"):
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer, cache_loc, k, v
+                    )
 
         from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
             tq_mla_decode_attention_fwd,
@@ -986,60 +1036,68 @@ class TurboQuantMLABackend(FlashMLABackend):
 
         # Q comes in shape (bs, q_heads * full_dim) or (bs, 1, q_heads, full_dim).
         # Reshape to (bs, q_heads, full_dim), then split nope | rope.
-        reshape_q = q.view(bs, q_heads, full_dim)
-        q_nope = reshape_q[:, :, :lora_rank].contiguous()
-        q_rope = reshape_q[:, :, lora_rank:].contiguous()
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.q_split_contiguous"):
+            reshape_q = q.view(bs, q_heads, full_dim)
+            q_nope = reshape_q[:, :, :lora_rank].contiguous()
+            q_rope = reshape_q[:, :, lora_rank:].contiguous()
 
         # --- Fix 2 (Phase 1 findings): rotate Q_nope into WHT domain ---
         # This activates the orthogonality trick: (H·Q)·(H·K) = Q·K lets the
         # kernel dot rotated-Q against rotated-K without per-row inverse WHT.
         # rotate_query returns fp32; cast back to input dtype for the kernel.
-        q_nope_rot = self._tq_config.rotate_query(q_nope).to(q_nope.dtype)
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.rotate_query"):
+            q_nope_rot = self._tq_config.rotate_query(q_nope).to(q_nope.dtype)
 
         # Pool references (current layer). Kernel reads these directly.
-        layer_id_rel = layer.layer_id - self._tq_pool.start_layer
-        k_nope_packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
-        k_scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
-        k_rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
-        k_centroids = self._tq_config.k_centroids
-        uniform = getattr(self._tq_config, "uniform", False)
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.pool_refs"):
+            layer_id_rel = layer.layer_id - self._tq_pool.start_layer
+            k_nope_packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+            k_scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
+            k_rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
+            k_centroids = self._tq_config.k_centroids
+            uniform = getattr(self._tq_config, "uniform", False)
 
         # Read pre-populated CG-safe buffers. kv_indptr is populated for
         # indices [0..bs]; kv_indices first `kv_indptr[bs]` entries are
         # valid. Kernel reads only through kv_indptr so the tail garbage
         # in kv_indices is never touched.
-        kv_indptr = self._tq_kv_indptr[: bs + 1]
-        kv_indices = self._tq_kv_indices  # full buffer; kernel bounds by kv_indptr
-        num_kv_splits = self._tq_num_kv_splits[:bs]
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.index_views"):
+            kv_indptr = self._tq_kv_indptr[: bs + 1]
+            kv_indices = self._tq_kv_indices  # full buffer; kernel bounds by kv_indptr
+            num_kv_splits = self._tq_num_kv_splits[:bs]
 
         # Narrow persistent output buffers to current bs. Slicing returns
         # views with stable base addresses — CG-safe.
-        att_logits = self._tq_stage1_logits[:bs, :q_heads, :, :]
-        att_lse = self._tq_stage1_lse[:bs, :q_heads, :]
-        o_rotated = self._tq_o_rotated[:bs, :q_heads, :]
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.output_views"):
+            att_logits = self._tq_stage1_logits[:bs, :q_heads, :, :]
+            att_lse = self._tq_stage1_lse[:bs, :q_heads, :]
+            o_rotated = self._tq_o_rotated[:bs, :q_heads, :]
 
-        tq_mla_decode_attention_fwd(
-            q_nope_rotated=q_nope_rot,
-            q_rope=q_rope,
-            k_nope_packed=k_nope_packed,
-            k_scale=k_scale,
-            k_rope=k_rope,
-            k_centroids=k_centroids,
-            o=o_rotated,
-            kv_indptr=kv_indptr,
-            kv_indices=kv_indices,
-            att_logits=att_logits,
-            att_lse=att_lse,
-            num_kv_splits=num_kv_splits,
-            max_kv_splits=max_splits,
-            sm_scale=layer.scaling,
-            logit_cap=getattr(layer, "logit_cap", 0.0) or 0.0,
-            uniform=uniform,
-        )
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.tq_attention"):
+            tq_mla_decode_attention_fwd(
+                q_nope_rotated=q_nope_rot,
+                q_rope=q_rope,
+                k_nope_packed=k_nope_packed,
+                k_scale=k_scale,
+                k_rope=k_rope,
+                k_centroids=k_centroids,
+                o=o_rotated,
+                kv_indptr=kv_indptr,
+                kv_indices=kv_indices,
+                att_logits=att_logits,
+                att_lse=att_lse,
+                num_kv_splits=num_kv_splits,
+                max_kv_splits=max_splits,
+                sm_scale=layer.scaling,
+                logit_cap=getattr(layer, "logit_cap", 0.0) or 0.0,
+                uniform=uniform,
+            )
 
         # Kernel output is in rotated nope space. Inverse-rotate once on
         # the small (bs, q_heads, lora_rank) tensor to get original domain.
-        o = self._tq_config.inverse_rotate_output(o_rotated).to(q_nope.dtype)
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.inverse_rotate"):
+            o = self._tq_config.inverse_rotate_output(o_rotated).to(q_nope.dtype)
 
         # Flashmla backend contract: (bs * q_heads, v_head_dim). Match that.
-        return o.view(-1, q_heads * lora_rank)
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.output_view"):
+            return o.view(-1, q_heads * lora_rank)
