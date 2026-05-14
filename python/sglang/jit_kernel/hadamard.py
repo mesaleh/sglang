@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import traceback
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -87,6 +87,7 @@ def hadamard_transform_with_signs(
     signs1: torch.Tensor,
     signs2: torch.Tensor,
     scale: float = 1.0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused WHT rotation: out = signs2 * H(signs1 * x) * scale.
 
@@ -99,8 +100,12 @@ def hadamard_transform_with_signs(
         signs2: (dim,) float32 sign vector applied after Hadamard.
         scale: scalar multiplier (typically 1/sqrt(dim)).
 
+        out: optional output tensor with the same shape, dtype, and device as x.
+            Passing this avoids an internal allocation, which is required for
+            CUDA graph capture paths.
+
     Returns:
-        out: same shape as x, float32.
+        out: same shape as x.
     """
     if not x.is_cuda:
         raise RuntimeError("hadamard_transform_with_signs only supports CUDA tensors")
@@ -145,14 +150,41 @@ def hadamard_transform_with_signs(
     if x.stride(-1) != 1:
         x = x.contiguous()
 
-    # Use x's native dtype — the CUDA kernel handles bf16/fp16 I/O
-    # with float32 computation internally (load converts to float,
-    # store converts back to input_t)
-    out = torch.empty_like(x)
-    module = _jit_hadamard_module(x.dtype)
-    module.hadamard_transform_with_signs(x, out, signs1, signs2, scale)
+    if out is None:
+        # Use x's native dtype — the CUDA kernel handles bf16/fp16 I/O
+        # with float32 computation internally (load converts to float,
+        # store converts back to input_t)
+        out_flat = torch.empty_like(x)
+    else:
+        if out.size() != shapes_og:
+            raise RuntimeError(
+                "hadamard_transform_with_signs out shape mismatch: "
+                f"out_shape={tuple(out.size())} x_shape={tuple(shapes_og)}"
+            )
+        if out.dtype != x.dtype or out.device != x.device:
+            raise RuntimeError(
+                "hadamard_transform_with_signs out dtype/device mismatch: "
+                f"out_dtype={out.dtype} x_dtype={x.dtype} "
+                f"out_device={out.device} x_device={x.device}"
+            )
+        try:
+            out_flat = out.view(-1, dim_og)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "hadamard_transform_with_signs out must be viewable as "
+                f"(-1, {dim_og}); got shape={tuple(out.size())} "
+                f"stride={out.stride()}"
+            ) from exc
+        if out_flat.stride(-1) != 1:
+            raise RuntimeError(
+                "hadamard_transform_with_signs out must be contiguous in the "
+                f"last dimension; got stride={out_flat.stride()}"
+            )
 
-    return out.reshape(shapes_og)
+    module = _jit_hadamard_module(x.dtype)
+    module.hadamard_transform_with_signs(x, out_flat, signs1, signs2, scale)
+
+    return out_flat.view(shapes_og)
 
 
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:

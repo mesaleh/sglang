@@ -2248,6 +2248,17 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+        workspace_tokens = max(1, envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.get())
+        self._tq_mla_kv_write_unit = torch.empty(
+            (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
+        )
+        self._tq_mla_kv_write_norms = torch.empty(
+            (workspace_tokens, 1), dtype=torch.float32, device=self.device
+        )
+        self._tq_mla_kv_write_y = torch.empty(
+            (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
+        )
+
         # The parent MLATokenToKVPool.__init__ reads `self.kv_buffer` to build
         # data_ptrs after _create_buffers returns. We don't have a single
         # per-layer fused KV buffer, so alias kv_buffer to the packed nope
@@ -2257,6 +2268,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         # which dequantize on demand.
         self.kv_buffer = self.kv_nope_packed_buffer
 
+        if envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get():
+            self._warmup_mla_fused_kv_write()
+
     def _clear_buffers(self):
         # Clear the alias first (breaks the reference cycle before we drop
         # the real buffers), then drop each underlying buffer.
@@ -2265,6 +2279,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         del self.kv_nope_packed_buffer
         del self.kv_nope_scale_buffer
         del self.kv_rope_buffer
+        del self._tq_mla_kv_write_unit
+        del self._tq_mla_kv_write_norms
+        del self._tq_mla_kv_write_y
 
     def get_kv_size_bytes(self):
         total = 0
@@ -2394,6 +2411,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> bool:
+        tokens = cache_k_nope.shape[0] if cache_k_nope.dim() > 0 else 0
         return (
             envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get()
             and self.turboquant_bits == 4
@@ -2412,7 +2430,15 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             and cache_k_nope.stride(-1) == 1
             and cache_k_rope.stride(-1) == 1
             and loc.dim() == 1
-            and loc.numel() == cache_k_nope.shape[0]
+            and loc.numel() == tokens
+            and self._tq_mla_kv_write_unit.shape[0] >= tokens
+            and self._tq_mla_kv_write_unit.shape[1] >= cache_k_nope.shape[1]
+            and self._tq_mla_kv_write_unit.shape[2] >= cache_k_nope.shape[-1]
+            and self._tq_mla_kv_write_norms.shape[0] >= tokens
+            and self._tq_mla_kv_write_norms.shape[1] >= cache_k_nope.shape[1]
+            and self._tq_mla_kv_write_y.shape[0] >= tokens
+            and self._tq_mla_kv_write_y.shape[1] >= cache_k_nope.shape[1]
+            and self._tq_mla_kv_write_y.shape[2] >= cache_k_nope.shape[-1]
         )
 
     def _set_mla_kv_buffer_fused(
@@ -2437,8 +2463,25 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             self.kv_nope_packed_buffer[layer_id_rel],
             self.kv_nope_scale_buffer[layer_id_rel],
             loc,
+            pre_unit=self._tq_mla_kv_write_unit,
+            pre_norms=self._tq_mla_kv_write_norms,
+            pre_y=self._tq_mla_kv_write_y,
         )
         self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+
+    def _warmup_mla_fused_kv_write(self):
+        if self.layer_num <= 0:
+            return
+
+        cache_k_nope = torch.zeros(
+            (1, 1, self.kv_lora_rank), dtype=torch.bfloat16, device=self.device
+        )
+        cache_k_rope = torch.zeros(
+            (1, 1, self.qk_rope_head_dim), dtype=torch.bfloat16, device=self.device
+        )
+        loc = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._set_mla_kv_buffer_fused(0, loc, cache_k_nope, cache_k_rope)
+        torch.cuda.synchronize()
 
     def set_mla_kv_buffer(
         self,

@@ -494,6 +494,9 @@ def _fused_pack_store_2bit_kv_kernel(
 def fused_turboquant_quantize_and_store(
     x, signs1, signs2, centroids, boundaries, bit_width,
     kv_buffer, dscale_buffer, loc,
+    pre_unit=None,
+    pre_norms=None,
+    pre_y=None,
 ):
     """Fused quantize + scatter store: norm → normalize → WHT → pack+dscale → scatter to KV pool.
 
@@ -503,11 +506,40 @@ def fused_turboquant_quantize_and_store(
     from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
 
     tokens, heads, dim = x.shape
+    use_workspace = (
+        pre_unit is not None
+        and pre_norms is not None
+        and pre_y is not None
+        and pre_unit.dim() == 3
+        and pre_norms.dim() == 2
+        and pre_y.dim() == 3
+        and pre_unit.shape[0] >= tokens
+        and pre_unit.shape[1] >= heads
+        and pre_unit.shape[2] >= dim
+        and pre_norms.shape[0] >= tokens
+        and pre_norms.shape[1] >= heads
+        and pre_y.shape[0] >= tokens
+        and pre_y.shape[1] >= heads
+        and pre_y.shape[2] >= dim
+        and pre_unit.dtype == torch.float32
+        and pre_norms.dtype == torch.float32
+        and pre_y.dtype == torch.float32
+        and pre_unit.device == x.device
+        and pre_norms.device == x.device
+        and pre_y.device == x.device
+    )
 
     # Step 1: Fused norm + normalize (1 Triton kernel)
     BLOCK_DIM = triton.next_power_of_2(dim)
-    x_unit = torch.empty(tokens, heads, dim, dtype=torch.float32, device=x.device)
-    norms = torch.empty(tokens, heads, dtype=torch.float32, device=x.device)
+    if use_workspace:
+        x_unit = pre_unit[:tokens, :heads, :dim]
+        norms = pre_norms[:tokens, :heads]
+        y_out = pre_y[:tokens, :heads, :dim]
+    else:
+        x_unit = torch.empty(tokens, heads, dim, dtype=torch.float32, device=x.device)
+        norms = torch.empty(tokens, heads, dtype=torch.float32, device=x.device)
+        y_out = None
+
     grid_nn = (tokens, heads)
     _fused_norm_normalize_kernel[grid_nn](
         x, x_unit, norms,
@@ -519,7 +551,9 @@ def fused_turboquant_quantize_and_store(
 
     # Step 2: Fused WHT rotation (1 CUDA kernel)
     wht_scale = 1.0 / (dim ** 0.5)
-    y = hadamard_transform_with_signs(x_unit, signs1, signs2, scale=wht_scale)
+    y = hadamard_transform_with_signs(
+        x_unit, signs1, signs2, scale=wht_scale, out=y_out
+    )
 
     # Step 3: Fused pack + dscale + scatter store (1 Triton kernel)
     if bit_width == 4:

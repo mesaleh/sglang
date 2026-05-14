@@ -562,6 +562,13 @@ class TestTurboQuantGPU(unittest.TestCase):
         fused_packed = torch.zeros_like(legacy_packed)
         fused_scale = torch.zeros_like(legacy_scale)
         fused_rope = torch.zeros_like(legacy_rope)
+        pre_unit = torch.empty(
+            tokens, 1, lora_rank, dtype=torch.float32, device=self.device
+        )
+        pre_norms = torch.empty(tokens, 1, dtype=torch.float32, device=self.device)
+        pre_y = torch.empty(
+            tokens, 1, lora_rank, dtype=torch.float32, device=self.device
+        )
         fused_turboquant_quantize_and_store(
             cache_k_nope,
             cfg.signs1,
@@ -572,6 +579,9 @@ class TestTurboQuantGPU(unittest.TestCase):
             fused_packed,
             fused_scale,
             loc,
+            pre_unit=pre_unit,
+            pre_norms=pre_norms,
+            pre_y=pre_y,
         )
         fused_rope[loc] = cache_k_rope
 
