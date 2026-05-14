@@ -582,8 +582,9 @@ class TestTurboQuantGPU(unittest.TestCase):
             pre_unit=pre_unit,
             pre_norms=pre_norms,
             pre_y=pre_y,
+            rope_src=cache_k_rope.contiguous(),
+            rope_buffer=fused_rope,
         )
-        fused_rope[loc] = cache_k_rope
 
         torch.testing.assert_close(fused_packed[loc], legacy_packed[loc])
         torch.testing.assert_close(fused_rope[loc], legacy_rope[loc])
@@ -634,15 +635,23 @@ class TestTurboQuantGPU(unittest.TestCase):
 
         legacy_pool = make_pool()
         fused_pool = make_pool()
+        fused_rope_pool = make_pool()
         layer = SimpleNamespace(layer_id=0)
 
         with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
             legacy_pool.set_kv_buffer(layer, loc, cache_k, cache_k)
         with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
             fused_pool.set_kv_buffer(layer, loc, cache_k, cache_k)
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
+            with envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.override(True):
+                fused_rope_pool.set_kv_buffer(layer, loc, cache_k, cache_k)
 
         torch.testing.assert_close(
             fused_pool.kv_nope_packed_buffer[0][loc],
+            legacy_pool.kv_nope_packed_buffer[0][loc],
+        )
+        torch.testing.assert_close(
+            fused_rope_pool.kv_nope_packed_buffer[0][loc],
             legacy_pool.kv_nope_packed_buffer[0][loc],
         )
         torch.testing.assert_close(
@@ -650,7 +659,17 @@ class TestTurboQuantGPU(unittest.TestCase):
             legacy_pool.kv_rope_buffer[0][loc],
         )
         torch.testing.assert_close(
+            fused_rope_pool.kv_rope_buffer[0][loc],
+            legacy_pool.kv_rope_buffer[0][loc],
+        )
+        torch.testing.assert_close(
             fused_pool.kv_nope_scale_buffer[0][loc].float(),
+            legacy_pool.kv_nope_scale_buffer[0][loc].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            fused_rope_pool.kv_nope_scale_buffer[0][loc].float(),
             legacy_pool.kv_nope_scale_buffer[0][loc].float(),
             atol=1e-2,
             rtol=1e-2,

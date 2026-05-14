@@ -2453,6 +2453,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         )
 
         cfg = self.tq_config
+        fuse_rope_write = self._can_fuse_rope_write(
+            layer_id_rel, cache_k_nope, cache_k_rope
+        )
         fused_turboquant_quantize_and_store(
             cache_k_nope,
             cfg.signs1,
@@ -2466,8 +2469,25 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             pre_unit=self._tq_mla_kv_write_unit,
             pre_norms=self._tq_mla_kv_write_norms,
             pre_y=self._tq_mla_kv_write_y,
+            rope_src=cache_k_rope if fuse_rope_write else None,
+            rope_buffer=self.kv_rope_buffer[layer_id_rel] if fuse_rope_write else None,
         )
-        self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+        if not fuse_rope_write:
+            self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+
+    def _can_fuse_rope_write(
+        self,
+        layer_id_rel: int,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> bool:
+        return (
+            envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.get()
+            and cache_k_nope.shape[-1] // 2 >= cache_k_rope.shape[-1]
+            and self.kv_rope_buffer[layer_id_rel].is_cuda
+            and self.kv_rope_buffer[layer_id_rel].device == cache_k_rope.device
+            and self.kv_rope_buffer[layer_id_rel].stride(-1) == 1
+        )
 
     def _warmup_mla_fused_kv_write(self):
         if self.layer_num <= 0:
