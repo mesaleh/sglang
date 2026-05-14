@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 PAGE_SIZE = 64
 _TQ_MLA_FAST_METADATA = envs.SGLANG_TQ_MLA_FAST_METADATA.get()
+_TQ_MLA_FUSED_METADATA_INDICES = envs.SGLANG_TQ_MLA_FUSED_METADATA_INDICES.get()
 _TQ_MLA_PROFILE_NVTX = envs.SGLANG_TQ_MLA_PROFILE_NVTX.get()
 
 
@@ -83,6 +84,45 @@ def _tq_build_indptr_triton(
     tl.store(kv_indptr, 0)
     tl.store(seq_lens_i32 + offs, vals, mask=mask)
     tl.store(kv_indptr + offs + 1, prefix, mask=mask)
+
+
+@triton.jit
+def _tq_build_indptr_and_kv_indices_triton(
+    req_to_token_ptr,  # [max_batch, max_context_len]
+    req_pool_indices_ptr,
+    seq_lens_ptr,
+    kv_indptr,
+    kv_indices_ptr,
+    req_to_token_ptr_stride: tl.constexpr,
+    BS: tl.constexpr,
+    BLOCK_BS: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
+
+    bs_offsets = tl.arange(0, BLOCK_BS)
+    bs_mask = bs_offsets < BS
+    seq_lens = tl.load(seq_lens_ptr + bs_offsets, mask=bs_mask, other=0).to(
+        tl.int32
+    )
+    kv_start_offset = tl.sum(tl.where(bs_offsets < pid, seq_lens, 0), axis=0)
+    kv_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
+
+    tl.store(kv_indptr + pid, kv_start_offset)
+    tl.store(kv_indptr + BS, kv_start_offset + kv_len, mask=pid == BS - 1)
+
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    num_loop = tl.cdiv(kv_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE).to(tl.int64) + i * BLOCK_SIZE
+        mask = offset < kv_len
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + offset,
+            mask=mask,
+        )
+        tl.store(kv_indices_ptr + kv_start_offset + offset, data, mask=mask)
 
 
 @dataclass
@@ -943,6 +983,23 @@ class TurboQuantMLABackend(FlashMLABackend):
         flat concatenation of per-batch req_to_token rows, written directly
         into the pre-allocated max-sized buffer.
         """
+        if _TQ_MLA_FUSED_METADATA_INDICES and seq_lens.is_cuda:
+            with _tq_mla_nvtx_range(
+                "omniva.tq_mla.metadata.fused_indptr_kv_indices"
+            ):
+                block_bs = max(1, triton.next_power_of_2(bs))
+                _tq_build_indptr_and_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    self._tq_kv_indptr,
+                    self._tq_kv_indices,
+                    self.req_to_token.stride(0),
+                    BS=bs,
+                    BLOCK_BS=block_bs,
+                )
+            return
+
         if (
             _TQ_MLA_FAST_METADATA
             and seq_lens.is_cuda
