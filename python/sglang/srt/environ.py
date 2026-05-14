@@ -205,6 +205,7 @@ class Envs:
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
+    SGLANG_TQ_MLA_FUSED_KV_WRITE = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")

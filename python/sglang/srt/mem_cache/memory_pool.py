@@ -2384,9 +2384,61 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             f"set_kv_buffer expected dim {self.kv_lora_rank + self.qk_rope_head_dim}; "
             f"got {cache_k.shape[-1]}"
         )
-        cache_k_nope = cache_k[..., : self.kv_lora_rank].contiguous()
-        cache_k_rope = cache_k[..., self.kv_lora_rank:].contiguous()
+        cache_k_nope = cache_k[..., : self.kv_lora_rank]
+        cache_k_rope = cache_k[..., self.kv_lora_rank:]
         self.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
+    def _can_use_fused_kv_write(
+        self,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> bool:
+        return (
+            envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get()
+            and self.turboquant_bits == 4
+            and cache_k_nope.is_cuda
+            and cache_k_rope.is_cuda
+            and loc.is_cuda
+            and cache_k_nope.device == cache_k_rope.device
+            and cache_k_nope.device == loc.device
+            and cache_k_nope.dim() == 3
+            and cache_k_rope.dim() == 3
+            and cache_k_rope.shape[0] == cache_k_nope.shape[0]
+            and cache_k_nope.shape[1] == 1
+            and cache_k_rope.shape[1] == 1
+            and cache_k_nope.shape[-1] == self.kv_lora_rank
+            and cache_k_rope.shape[-1] == self.qk_rope_head_dim
+            and cache_k_nope.stride(-1) == 1
+            and cache_k_rope.stride(-1) == 1
+            and loc.dim() == 1
+            and loc.numel() == cache_k_nope.shape[0]
+        )
+
+    def _set_mla_kv_buffer_fused(
+        self,
+        layer_id_rel: int,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+            fused_turboquant_quantize_and_store,
+        )
+
+        cfg = self.tq_config
+        fused_turboquant_quantize_and_store(
+            cache_k_nope,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            self.turboquant_bits,
+            self.kv_nope_packed_buffer[layer_id_rel],
+            self.kv_nope_scale_buffer[layer_id_rel],
+            loc,
+        )
+        self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
 
     def set_mla_kv_buffer(
         self,
@@ -2428,6 +2480,17 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             cache_k_nope = cache_k_nope.to(torch.bfloat16)
         if cache_k_rope.dtype != torch.bfloat16:
             cache_k_rope = cache_k_rope.to(torch.bfloat16)
+
+        if self._can_use_fused_kv_write(loc, cache_k_nope, cache_k_rope):
+            self._set_mla_kv_buffer_fused(
+                layer_id_rel, loc, cache_k_nope, cache_k_rope
+            )
+            return
+
+        if not cache_k_nope.is_contiguous():
+            cache_k_nope = cache_k_nope.contiguous()
+        if not cache_k_rope.is_contiguous():
+            cache_k_rope = cache_k_rope.contiguous()
 
         # Quantize nope
         cfg = self.tq_config

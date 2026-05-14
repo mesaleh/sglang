@@ -726,9 +726,20 @@ class TurboQuantMLABackend(FlashMLABackend):
         after a smaller-bs warmup allocated buffers), we reallocate at the
         larger size. Buffers are never shrunk.
         """
+        max_total_tokens = max_bs * self.max_context_len
         if (
-            self._tq_stage1_logits is not None
+            self._tq_kv_indices is not None
+            and self._tq_kv_indices.numel() >= max_total_tokens
+            and self._tq_kv_indptr is not None
+            and self._tq_kv_indptr.numel() >= max_bs + 1
+            and self._tq_num_kv_splits is not None
+            and self._tq_num_kv_splits.numel() >= max_bs
+            and self._tq_stage1_logits is not None
             and self._tq_stage1_logits.shape[0] >= max_bs
+            and self._tq_stage1_lse is not None
+            and self._tq_stage1_lse.shape[0] >= max_bs
+            and self._tq_o_rotated is not None
+            and self._tq_o_rotated.shape[0] >= max_bs
         ):
             return
 
@@ -737,7 +748,6 @@ class TurboQuantMLABackend(FlashMLABackend):
         max_splits = self._tq_max_kv_splits
         # Max tokens across all batches = max_bs * max_context_len. This is
         # the ceiling kv_indices can ever need (bs=max_bs all at max_seqlen).
-        max_total_tokens = max_bs * self.max_context_len
 
         self._tq_kv_indices = torch.empty(
             max_total_tokens, dtype=torch.int32, device=device
