@@ -246,6 +246,8 @@ def _fused_pack_store_4bit_kernel(
     Loc,            # (tokens,) int64 — pool slot indices
     KBuffer,        # (pool_size, heads, packed_dim) uint8 — destination
     DScaleBuffer,   # (pool_size, heads) bf16 — destination
+    RopeSrc,        # optional (tokens, heads, rope_dim) bf16
+    RopeBuffer,     # optional (pool_size, heads, rope_dim) bf16
     Boundaries,
     Centroids,
     stride_y_t,
@@ -253,12 +255,18 @@ def _fused_pack_store_4bit_kernel(
     stride_kb_s,    # KBuffer stride for pool_size dim
     stride_kb_h,
     stride_ds_s,    # DScaleBuffer stride for pool_size dim
+    stride_rope_src_t,
+    stride_rope_src_h,
+    stride_rope_dst_s,
+    stride_rope_dst_h,
     stride_n_t,
     N_BOUNDARIES: tl.constexpr,
     BLOCK_PACKED: tl.constexpr,
     Lk_half: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    STORE_ROPE: tl.constexpr,
 ):
-    """Fused searchsorted + pack + dscale + scatter store to KV pool."""
+    """Fused searchsorted + pack + dscale + optional RoPE scatter store."""
     pid_t = tl.program_id(0)
     pid_h = tl.program_id(1)
 
@@ -295,6 +303,21 @@ def _fused_pack_store_4bit_kernel(
     p_ptr = KBuffer + pool_slot * stride_kb_s + pid_h * stride_kb_h + offs_pair
     tl.store(p_ptr, packed.to(tl.uint8), mask=mask_pair)
     tl.store(DScaleBuffer + pool_slot * stride_ds_s + pid_h, dscale)
+
+    if STORE_ROPE:
+        rope_mask = offs_pair < ROPE_DIM
+        rope = tl.load(
+            RopeSrc + pid_t * stride_rope_src_t + pid_h * stride_rope_src_h + offs_pair,
+            mask=rope_mask,
+            other=0.0,
+        )
+        rope_ptr = (
+            RopeBuffer
+            + pool_slot * stride_rope_dst_s
+            + pid_h * stride_rope_dst_h
+            + offs_pair
+        )
+        tl.store(rope_ptr, rope, mask=rope_mask)
 
 
 @triton.jit
@@ -494,6 +517,11 @@ def _fused_pack_store_2bit_kv_kernel(
 def fused_turboquant_quantize_and_store(
     x, signs1, signs2, centroids, boundaries, bit_width,
     kv_buffer, dscale_buffer, loc,
+    pre_unit=None,
+    pre_norms=None,
+    pre_y=None,
+    rope_src=None,
+    rope_buffer=None,
 ):
     """Fused quantize + scatter store: norm → normalize → WHT → pack+dscale → scatter to KV pool.
 
@@ -503,11 +531,40 @@ def fused_turboquant_quantize_and_store(
     from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
 
     tokens, heads, dim = x.shape
+    use_workspace = (
+        pre_unit is not None
+        and pre_norms is not None
+        and pre_y is not None
+        and pre_unit.dim() == 3
+        and pre_norms.dim() == 2
+        and pre_y.dim() == 3
+        and pre_unit.shape[0] >= tokens
+        and pre_unit.shape[1] >= heads
+        and pre_unit.shape[2] >= dim
+        and pre_norms.shape[0] >= tokens
+        and pre_norms.shape[1] >= heads
+        and pre_y.shape[0] >= tokens
+        and pre_y.shape[1] >= heads
+        and pre_y.shape[2] >= dim
+        and pre_unit.dtype == torch.float32
+        and pre_norms.dtype == torch.float32
+        and pre_y.dtype == torch.float32
+        and pre_unit.device == x.device
+        and pre_norms.device == x.device
+        and pre_y.device == x.device
+    )
 
     # Step 1: Fused norm + normalize (1 Triton kernel)
     BLOCK_DIM = triton.next_power_of_2(dim)
-    x_unit = torch.empty(tokens, heads, dim, dtype=torch.float32, device=x.device)
-    norms = torch.empty(tokens, heads, dtype=torch.float32, device=x.device)
+    if use_workspace:
+        x_unit = pre_unit[:tokens, :heads, :dim]
+        norms = pre_norms[:tokens, :heads]
+        y_out = pre_y[:tokens, :heads, :dim]
+    else:
+        x_unit = torch.empty(tokens, heads, dim, dtype=torch.float32, device=x.device)
+        norms = torch.empty(tokens, heads, dtype=torch.float32, device=x.device)
+        y_out = None
+
     grid_nn = (tokens, heads)
     _fused_norm_normalize_kernel[grid_nn](
         x, x_unit, norms,
@@ -519,24 +576,46 @@ def fused_turboquant_quantize_and_store(
 
     # Step 2: Fused WHT rotation (1 CUDA kernel)
     wht_scale = 1.0 / (dim ** 0.5)
-    y = hadamard_transform_with_signs(x_unit, signs1, signs2, scale=wht_scale)
+    y = hadamard_transform_with_signs(
+        x_unit, signs1, signs2, scale=wht_scale, out=y_out
+    )
 
     # Step 3: Fused pack + dscale + scatter store (1 Triton kernel)
+    store_rope = rope_src is not None and rope_buffer is not None
+    if (rope_src is None) != (rope_buffer is None):
+        raise ValueError("rope_src and rope_buffer must be provided together")
+    if store_rope and bit_width != 4:
+        raise ValueError("Fused RoPE write is currently supported only for 4-bit")
+
     if bit_width == 4:
         packed_dim = dim // 2
         BLOCK_PACKED = triton.next_power_of_2(packed_dim)
+        rope_dim = rope_src.shape[-1] if store_rope else 0
+        if store_rope and rope_dim > packed_dim:
+            raise ValueError(
+                f"Fused RoPE write requires rope_dim <= packed_dim, got "
+                f"{rope_dim} > {packed_dim}"
+            )
         grid_ps = (tokens, heads)
         _fused_pack_store_4bit_kernel[grid_ps](
             y, norms, loc,
             kv_buffer, dscale_buffer,
+            rope_src if store_rope else x,
+            rope_buffer if store_rope else kv_buffer,
             boundaries, centroids,
             y.stride(0), y.stride(1),
             kv_buffer.stride(0), kv_buffer.stride(1),
             dscale_buffer.stride(0),
+            rope_src.stride(0) if store_rope else 0,
+            rope_src.stride(1) if store_rope else 0,
+            rope_buffer.stride(0) if store_rope else 0,
+            rope_buffer.stride(1) if store_rope else 0,
             norms.stride(0),
             N_BOUNDARIES=boundaries.shape[0],
             BLOCK_PACKED=BLOCK_PACKED,
             Lk_half=packed_dim,
+            ROPE_DIM=rope_dim,
+            STORE_ROPE=store_rope,
             num_warps=4,
         )
     elif bit_width == 2:
@@ -659,12 +738,16 @@ def fused_turboquant_quantize_and_store_kv(
             _fused_pack_store_4bit_kernel[grid_ps](
                 k_y, k_norms, loc,
                 k_buffer, k_dscale_buffer,
+                cache_k, k_buffer,
                 k_boundaries, k_centroids,
                 k_y.stride(0), k_y.stride(1),
                 k_buffer.stride(0), k_buffer.stride(1),
-                k_dscale_buffer.stride(0), k_norms.stride(0),
+                k_dscale_buffer.stride(0),
+                0, 0, 0, 0,
+                k_norms.stride(0),
                 N_BOUNDARIES=k_boundaries.shape[0],
-                BLOCK_PACKED=BLOCK_PACKED, Lk_half=packed_dim, num_warps=4,
+                BLOCK_PACKED=BLOCK_PACKED, Lk_half=packed_dim,
+                ROPE_DIM=0, STORE_ROPE=False, num_warps=4,
             )
         elif k_bit_width == 2:
             packed_dim = dim // 4
@@ -688,12 +771,16 @@ def fused_turboquant_quantize_and_store_kv(
             _fused_pack_store_4bit_kernel[grid_ps](
                 v_y, v_norms, loc,
                 v_buffer, v_dscale_buffer,
+                cache_v, v_buffer,
                 v_boundaries, v_centroids,
                 v_y.stride(0), v_y.stride(1),
                 v_buffer.stride(0), v_buffer.stride(1),
-                v_dscale_buffer.stride(0), v_norms.stride(0),
+                v_dscale_buffer.stride(0),
+                0, 0, 0, 0,
+                v_norms.stride(0),
                 N_BOUNDARIES=v_boundaries.shape[0],
-                BLOCK_PACKED=BLOCK_PACKED, Lk_half=packed_dim, num_warps=4,
+                BLOCK_PACKED=BLOCK_PACKED, Lk_half=packed_dim,
+                ROPE_DIM=0, STORE_ROPE=False, num_warps=4,
             )
         elif v_bit_width == 2:
             packed_dim = dim // 4

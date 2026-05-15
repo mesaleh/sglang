@@ -498,6 +498,183 @@ class TestTurboQuantGPU(unittest.TestCase):
 
         torch.testing.assert_close(hat_src, hat_tgt, atol=1e-6, rtol=0)
 
+    def test_mla_fused_kv_write_matches_legacy_quantize_store(self):
+        """Verify the Phase 35A MLA NoPE fused store matches the legacy path."""
+        from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+            fused_turboquant_quantize_and_store,
+        )
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            TurboQuantConfig,
+            batched_dequantize_rotspace,
+            batched_quantize,
+        )
+
+        torch.manual_seed(42)
+        tokens = 7
+        pool_size = 32
+        lora_rank = 512
+        rope_dim = 64
+        cfg = TurboQuantConfig(
+            bit_width=4,
+            head_dim=lora_rank,
+            device=self.device,
+            k_bit_width=4,
+            v_bit_width=4,
+        )
+
+        loc = torch.tensor([1, 5, 9, 10, 17, 20, 29], device=self.device)
+        cache_k = torch.randn(
+            tokens,
+            1,
+            lora_rank + rope_dim,
+            device=self.device,
+            dtype=torch.bfloat16,
+        )
+        cache_k_nope = cache_k[..., :lora_rank]
+        cache_k_rope = cache_k[..., lora_rank:]
+
+        packed, norms, quant_norms = batched_quantize(
+            cache_k_nope.contiguous(),
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            4,
+        )
+        safe_qnorms = torch.where(
+            quant_norms > 1e-10, quant_norms, torch.ones_like(quant_norms)
+        )
+        dequant_scale = (norms / safe_qnorms).to(torch.bfloat16)
+
+        legacy_packed = torch.zeros(
+            pool_size, 1, lora_rank // 2, dtype=torch.uint8, device=self.device
+        )
+        legacy_scale = torch.zeros(
+            pool_size, 1, dtype=torch.bfloat16, device=self.device
+        )
+        legacy_rope = torch.zeros(
+            pool_size, 1, rope_dim, dtype=torch.bfloat16, device=self.device
+        )
+        legacy_packed[loc] = packed
+        legacy_scale[loc] = dequant_scale
+        legacy_rope[loc] = cache_k_rope.contiguous()
+
+        fused_packed = torch.zeros_like(legacy_packed)
+        fused_scale = torch.zeros_like(legacy_scale)
+        fused_rope = torch.zeros_like(legacy_rope)
+        pre_unit = torch.empty(
+            tokens, 1, lora_rank, dtype=torch.float32, device=self.device
+        )
+        pre_norms = torch.empty(tokens, 1, dtype=torch.float32, device=self.device)
+        pre_y = torch.empty(
+            tokens, 1, lora_rank, dtype=torch.float32, device=self.device
+        )
+        fused_turboquant_quantize_and_store(
+            cache_k_nope,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            4,
+            fused_packed,
+            fused_scale,
+            loc,
+            pre_unit=pre_unit,
+            pre_norms=pre_norms,
+            pre_y=pre_y,
+            rope_src=cache_k_rope.contiguous(),
+            rope_buffer=fused_rope,
+        )
+
+        torch.testing.assert_close(fused_packed[loc], legacy_packed[loc])
+        torch.testing.assert_close(fused_rope[loc], legacy_rope[loc])
+        torch.testing.assert_close(
+            fused_scale[loc].float(),
+            legacy_scale[loc].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+        legacy_rot = batched_dequantize_rotspace(
+            legacy_packed[loc],
+            legacy_scale[loc],
+            cfg.k_centroids,
+            4,
+            head_dim=lora_rank,
+        )
+        fused_rot = batched_dequantize_rotspace(
+            fused_packed[loc],
+            fused_scale[loc],
+            cfg.k_centroids,
+            4,
+            head_dim=lora_rank,
+        )
+        torch.testing.assert_close(
+            fused_rot.float(), legacy_rot.float(), atol=2e-2, rtol=2e-2
+        )
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        def make_pool():
+            return MLATokenToKVPoolTurboQuant(
+                size=pool_size,
+                page_size=0,
+                dtype=torch.bfloat16,
+                kv_lora_rank=lora_rank,
+                qk_rope_head_dim=rope_dim,
+                layer_num=1,
+                device=self.device,
+                enable_memory_saver=False,
+                turboquant_bits=4,
+                turboquant_k_bits=4,
+                turboquant_v_bits=4,
+                start_layer=0,
+                end_layer=0,
+            )
+
+        legacy_pool = make_pool()
+        fused_pool = make_pool()
+        fused_rope_pool = make_pool()
+        layer = SimpleNamespace(layer_id=0)
+
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            legacy_pool.set_kv_buffer(layer, loc, cache_k, cache_k)
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
+            fused_pool.set_kv_buffer(layer, loc, cache_k, cache_k)
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
+            with envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.override(True):
+                fused_rope_pool.set_kv_buffer(layer, loc, cache_k, cache_k)
+
+        torch.testing.assert_close(
+            fused_pool.kv_nope_packed_buffer[0][loc],
+            legacy_pool.kv_nope_packed_buffer[0][loc],
+        )
+        torch.testing.assert_close(
+            fused_rope_pool.kv_nope_packed_buffer[0][loc],
+            legacy_pool.kv_nope_packed_buffer[0][loc],
+        )
+        torch.testing.assert_close(
+            fused_pool.kv_rope_buffer[0][loc],
+            legacy_pool.kv_rope_buffer[0][loc],
+        )
+        torch.testing.assert_close(
+            fused_rope_pool.kv_rope_buffer[0][loc],
+            legacy_pool.kv_rope_buffer[0][loc],
+        )
+        torch.testing.assert_close(
+            fused_pool.kv_nope_scale_buffer[0][loc].float(),
+            legacy_pool.kv_nope_scale_buffer[0][loc].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            fused_rope_pool.kv_nope_scale_buffer[0][loc].float(),
+            legacy_pool.kv_nope_scale_buffer[0][loc].float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
     def test_non_128_head_dim(self):
         """Verify TurboQuant works with head_dim=64 and head_dim=256."""
         from sglang.srt.layers.quantization.kv_turboquant import (

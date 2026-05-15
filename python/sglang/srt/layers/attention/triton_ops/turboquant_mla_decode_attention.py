@@ -63,6 +63,10 @@ _TQ_MLA_DECODE_BLOCK_N = _require_power_of_two(
 )
 _TQ_MLA_DECODE_NUM_WARPS = _get_int_env("SGLANG_TQ_MLA_DECODE_NUM_WARPS", 8)
 _TQ_MLA_DECODE_NUM_STAGES = _get_int_env("SGLANG_TQ_MLA_DECODE_NUM_STAGES", 2)
+_TQ_MLA_DECODE_BLOCK_H = _require_power_of_two(
+    "SGLANG_TQ_MLA_DECODE_BLOCK_H",
+    _get_int_env("SGLANG_TQ_MLA_DECODE_BLOCK_H", 16, minimum=1),
+)
 
 
 def _normalize_lookup_impl(value: str) -> str:
@@ -458,7 +462,7 @@ def tq_mla_decode_attention_fwd(
     BLOCK_LORA_PACKED = triton.next_power_of_2(lora_packed)
     BLOCK_ROPE = triton.next_power_of_2(rope_dim)
     BLOCK_N = _TQ_MLA_DECODE_BLOCK_N
-    BLOCK_H = min(16, q_heads)
+    BLOCK_H = min(_TQ_MLA_DECODE_BLOCK_H, q_heads)
     lookup_impl = _normalize_lookup_impl(lookup_impl or _TQ_MLA_CODEBOOK_LOOKUP)
 
     grid = (
