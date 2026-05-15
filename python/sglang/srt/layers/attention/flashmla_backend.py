@@ -31,6 +31,8 @@ if TYPE_CHECKING:
 PAGE_SIZE = 64
 _TQ_MLA_FAST_METADATA = envs.SGLANG_TQ_MLA_FAST_METADATA.get()
 _TQ_MLA_FUSED_METADATA_INDICES = envs.SGLANG_TQ_MLA_FUSED_METADATA_INDICES.get()
+_TQ_MLA_STAGED_FLASHMLA = envs.SGLANG_TQ_MLA_STAGED_FLASHMLA.get()
+_TQ_MLA_STAGED_FLASHMLA_THREADS = envs.SGLANG_TQ_MLA_STAGED_FLASHMLA_THREADS.get()
 _TQ_MLA_PROFILE_NVTX = envs.SGLANG_TQ_MLA_PROFILE_NVTX.get()
 
 
@@ -804,12 +806,16 @@ class TurboQuantMLABackend(FlashMLABackend):
         self._tq_stage1_logits = None      # (max_bs, q_heads, max_kv_splits, lora_rank) fp32
         self._tq_stage1_lse = None         # (max_bs, q_heads, max_kv_splits) fp32
         self._tq_o_rotated = None          # (max_bs, q_heads, lora_rank) bf16
+        self._tq_staged_k_cache = None     # (pool_tokens, 1, lora_rank + rope_dim) bf16
+        self._tq_staged_q = None           # (max_bs, 1, q_heads, lora_rank + rope_dim) bf16
+        self._tq_staged_pages_per_req = 1
 
         # Boot-time visibility: confirms this class (not base FlashMLABackend)
         # is actually instantiated in the live pod. One-line per rank at init.
         import logging
         logging.getLogger(__name__).info(
-            "TurboQuantMLABackend active (Stage C fused Triton MLA decode)."
+            "TurboQuantMLABackend active. staged_flashmla=%s",
+            _TQ_MLA_STAGED_FLASHMLA,
         )
 
     def _tq_ensure_buffers(self, max_bs: int, device):
@@ -839,6 +845,14 @@ class TurboQuantMLABackend(FlashMLABackend):
             and self._tq_stage1_lse.shape[0] >= max_bs
             and self._tq_o_rotated is not None
             and self._tq_o_rotated.shape[0] >= max_bs
+            and (
+                not _TQ_MLA_STAGED_FLASHMLA
+                or (
+                    self._tq_staged_k_cache is not None
+                    and self._tq_staged_q is not None
+                    and self._tq_staged_q.shape[0] >= max_bs
+                )
+            )
         ):
             return
 
@@ -876,6 +890,26 @@ class TurboQuantMLABackend(FlashMLABackend):
             dtype=self.q_data_type,
             device=device,
         )
+        if _TQ_MLA_STAGED_FLASHMLA:
+            full_dim = self.kv_lora_rank + self.qk_rope_head_dim
+            source_tokens = self._tq_pool.kv_nope_packed_buffer[0].shape[0]
+            staged_tokens = triton.cdiv(
+                source_tokens, self._tq_pool.page_size
+            ) * self._tq_pool.page_size
+            self._tq_staged_k_cache = torch.empty(
+                (
+                    staged_tokens,
+                    1,
+                    full_dim,
+                ),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self._tq_staged_q = torch.empty(
+                (max_bs, 1, q_heads, full_dim),
+                dtype=self.q_data_type,
+                device=device,
+            )
 
     def _tq_warmup_kernel(self, device):
         """Pre-compile the Stage C Triton kernel so its first launch doesn't
@@ -946,6 +980,58 @@ class TurboQuantMLABackend(FlashMLABackend):
         )
         torch.cuda.synchronize()
 
+    def _tq_warmup_staged_flashmla(self, device):
+        """Pre-compile the staged CUDA op and FlashMLA path before graph capture."""
+        from sglang.srt.layers.attention.turboquant_mla_staged_flashmla import (
+            stage_tq_mla_pages_to_physical,
+        )
+
+        q_heads = self.num_q_heads
+        lora_rank = self.kv_lora_rank
+        rope_dim = self.qk_rope_head_dim
+        full_dim = lora_rank + rope_dim
+
+        q_flash = torch.zeros(
+            (1, 1, q_heads, full_dim), dtype=self.q_data_type, device=device
+        )
+        seq_lens = torch.tensor([64], dtype=torch.int32, device=device)
+        req_to_token = torch.arange(64, dtype=torch.int32, device=device).view(1, 64)
+        req_pool_indices = torch.zeros((1,), dtype=torch.int32, device=device)
+        block_kv_indices = torch.zeros((1, 1), dtype=torch.int32, device=device)
+        mla_metadata, num_splits = get_mla_metadata(
+            seq_lens,
+            q_heads,
+            1,
+            is_fp8_kvcache=False,
+        )
+
+        layer_id_rel = 0
+        stage_tq_mla_pages_to_physical(
+            req_to_token=req_to_token,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            k_nope_packed=self._tq_pool.kv_nope_packed_buffer[layer_id_rel],
+            k_scale=self._tq_pool.kv_nope_scale_buffer[layer_id_rel],
+            k_rope=self._tq_pool.kv_rope_buffer[layer_id_rel],
+            k_centroids=self._tq_config.k_centroids,
+            out_k_cache=self._tq_staged_k_cache,
+            req_stride=req_to_token.stride(0),
+            pages_per_req=1,
+            threads=_TQ_MLA_STAGED_FLASHMLA_THREADS,
+        )
+        flash_mla_with_kvcache(
+            q=q_flash,
+            k_cache=self._tq_staged_k_cache.view(-1, PAGE_SIZE, 1, full_dim),
+            block_table=block_kv_indices,
+            cache_seqlens=seq_lens,
+            head_dim_v=lora_rank,
+            tile_scheduler_metadata=mla_metadata,
+            num_splits=num_splits,
+            softmax_scale=self.scaling,
+            causal=True,
+        )
+        torch.cuda.synchronize()
+
     def init_cuda_graph_state(
         self,
         max_bs: int,
@@ -968,7 +1054,73 @@ class TurboQuantMLABackend(FlashMLABackend):
         # A JIT compile inside capture produces a broken graph with a
         # subtle "kernel missing" symptom at replay.
         with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.warmup"):
-            self._tq_warmup_kernel(device)
+            if _TQ_MLA_STAGED_FLASHMLA:
+                self._tq_warmup_staged_flashmla(device)
+            else:
+                self._tq_warmup_kernel(device)
+
+    def _forward_decode_staged_flashmla(
+        self,
+        q: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: ForwardBatch,
+        q_nope_rot: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope_packed: torch.Tensor,
+        k_scale: torch.Tensor,
+        k_rope: torch.Tensor,
+        k_centroids: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.turboquant_mla_staged_flashmla import (
+            stage_tq_mla_pages_to_physical,
+        )
+
+        bs = forward_batch.batch_size
+        q_heads = layer.tp_q_head_num
+        lora_rank = self.kv_lora_rank
+        rope_dim = self.qk_rope_head_dim
+        full_dim = lora_rank + rope_dim
+
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.staged_q_pack"):
+            q_flash = self._tq_staged_q[:bs, :, :q_heads, :]
+            q_flash[:, 0, :, :lora_rank].copy_(q_nope_rot)
+            q_flash[:, 0, :, lora_rank:].copy_(q_rope)
+
+        seq_lens_i32 = self._tq_seq_lens_i32[:bs]
+        pages_per_req = self._tq_staged_pages_per_req
+
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.stage_tq_pages"):
+            stage_tq_mla_pages_to_physical(
+                req_to_token=self.req_to_token,
+                req_pool_indices=forward_batch.req_pool_indices[:bs],
+                seq_lens=seq_lens_i32,
+                k_nope_packed=k_nope_packed,
+                k_scale=k_scale,
+                k_rope=k_rope,
+                k_centroids=k_centroids,
+                out_k_cache=self._tq_staged_k_cache,
+                req_stride=self.req_to_token.stride(0),
+                pages_per_req=pages_per_req,
+                threads=_TQ_MLA_STAGED_FLASHMLA_THREADS,
+            )
+
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.flashmla_workspace_attention"):
+            out, _ = flash_mla_with_kvcache(
+                q=q_flash,
+                k_cache=self._tq_staged_k_cache.view(-1, PAGE_SIZE, 1, full_dim),
+                block_table=self.forward_metadata.block_kv_indices[:bs],
+                cache_seqlens=seq_lens_i32,
+                head_dim_v=lora_rank,
+                tile_scheduler_metadata=self.forward_metadata.flashmla_metadata,
+                num_splits=self.forward_metadata.num_splits,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
+
+        with _tq_mla_nvtx_range("omniva.tq_mla.decode.staged_inverse_rotate"):
+            o = self._tq_config.inverse_rotate_output(out[:, 0, :, :]).to(q.dtype)
+
+        return o.view(-1, q_heads * lora_rank)
 
     def _tq_build_kv_indices(
         self,
@@ -983,6 +1135,12 @@ class TurboQuantMLABackend(FlashMLABackend):
         flat concatenation of per-batch req_to_token rows, written directly
         into the pre-allocated max-sized buffer.
         """
+        if self._tq_seq_lens_i32 is not None and self._tq_seq_lens_i32.numel() >= bs:
+            if seq_lens.dtype == torch.int32:
+                self._tq_seq_lens_i32[:bs].copy_(seq_lens[:bs])
+            else:
+                self._tq_seq_lens_i32[:bs].copy_(seq_lens[:bs].to(torch.int32))
+
         if _TQ_MLA_FUSED_METADATA_INDICES and seq_lens.is_cuda:
             with _tq_mla_nvtx_range(
                 "omniva.tq_mla.metadata.fused_indptr_kv_indices"
@@ -1049,6 +1207,10 @@ class TurboQuantMLABackend(FlashMLABackend):
         # once per forward at init time so forward_decode is alloc-free.
         if forward_batch.forward_mode.is_decode_or_idle():
             bs = forward_batch.batch_size
+            if _TQ_MLA_STAGED_FLASHMLA:
+                self._tq_staged_pages_per_req = triton.cdiv(
+                    forward_batch.seq_lens_cpu[:bs].max().item(), PAGE_SIZE
+                )
             # Non-CG path lazy-allocates and grows buffers at runtime bs. This
             # is the path used when --disable-cuda-graph is set.
             with _tq_mla_nvtx_range("omniva.tq_mla.metadata.ensure_buffers"):
@@ -1077,6 +1239,12 @@ class TurboQuantMLABackend(FlashMLABackend):
                 encoder_lens, forward_mode, spec_info,
             )
         if forward_mode.is_decode_or_idle():
+            if _TQ_MLA_STAGED_FLASHMLA:
+                # CUDA graph capture records the kernel launch grid, so the
+                # staged kernel must launch with a static page count. The
+                # kernel reads device seq_lens and returns early for invalid
+                # pages, preserving correctness on replay with longer prompts.
+                self._tq_staged_pages_per_req = self.cuda_graph_kv_indices.shape[1]
             with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.capture_tq_indices"):
                 self._tq_build_kv_indices(bs, req_pool_indices, seq_lens)
 
@@ -1101,6 +1269,8 @@ class TurboQuantMLABackend(FlashMLABackend):
                 encoder_lens, forward_mode, spec_info, seq_lens_cpu,
             )
         if forward_mode.is_decode_or_idle():
+            if _TQ_MLA_STAGED_FLASHMLA:
+                self._tq_staged_pages_per_req = self.cuda_graph_kv_indices.shape[1]
             with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.replay_tq_indices"):
                 self._tq_build_kv_indices(bs, req_pool_indices, seq_lens[:bs])
 
@@ -1172,6 +1342,19 @@ class TurboQuantMLABackend(FlashMLABackend):
             att_logits = self._tq_stage1_logits[:bs, :q_heads, :, :]
             att_lse = self._tq_stage1_lse[:bs, :q_heads, :]
             o_rotated = self._tq_o_rotated[:bs, :q_heads, :]
+
+        if _TQ_MLA_STAGED_FLASHMLA:
+            return self._forward_decode_staged_flashmla(
+                q,
+                layer,
+                forward_batch,
+                q_nope_rot,
+                q_rope,
+                k_nope_packed,
+                k_scale,
+                k_rope,
+                k_centroids,
+            )
 
         with _tq_mla_nvtx_range("omniva.tq_mla.decode.tq_attention"):
             tq_mla_decode_attention_fwd(

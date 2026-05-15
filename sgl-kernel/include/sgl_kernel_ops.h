@@ -120,6 +120,18 @@ int64_t cutlass_mla_get_workspace_size(
     int64_t num_batches,
     int64_t sm_count = 0,
     int64_t num_kv_splits = 1 /* Set to 1 to avoid cuda_graph issue by default. */);
+void stage_tq_mla_pages_to_physical(
+    const torch::Tensor& req_to_token,
+    const torch::Tensor& req_pool_indices,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& k_nope_packed,
+    const torch::Tensor& k_scale,
+    const torch::Tensor& k_rope,
+    const torch::Tensor& k_centroids,
+    torch::Tensor& out_k_cache,
+    int64_t req_stride,
+    int64_t pages_per_req,
+    int64_t threads);
 
 /*
  * From csrc/elementwise

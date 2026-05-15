@@ -111,3 +111,31 @@ def cutlass_mla_get_workspace_size(
     return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count, num_kv_splits
     )
+
+
+def stage_tq_mla_pages_to_physical(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k_nope_packed: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_rope: torch.Tensor,
+    k_centroids: torch.Tensor,
+    out_k_cache: torch.Tensor,
+    req_stride: int,
+    pages_per_req: int,
+    threads: int = 512,
+) -> None:
+    torch.ops.sgl_kernel.stage_tq_mla_pages_to_physical.default(
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        k_nope_packed,
+        k_scale,
+        k_rope,
+        k_centroids,
+        out_k_cache,
+        req_stride,
+        pages_per_req,
+        threads,
+    )

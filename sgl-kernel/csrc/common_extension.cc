@@ -57,6 +57,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "page_table, Tensor! workspace, float sm_scale, int num_kv_splits) -> ()");
   m.impl("cutlass_mla_decode", torch::kCUDA, &cutlass_mla_decode);
   m.def("cutlass_mla_get_workspace_size", &cutlass_mla_get_workspace_size);
+  m.def(
+      "stage_tq_mla_pages_to_physical(Tensor req_to_token, Tensor req_pool_indices, Tensor seq_lens, Tensor "
+      "k_nope_packed, Tensor k_scale, Tensor k_rope, Tensor k_centroids, Tensor! out_k_cache, int req_stride, "
+      "int pages_per_req, int threads) -> ()");
+  m.impl("stage_tq_mla_pages_to_physical", torch::kCUDA, &stage_tq_mla_pages_to_physical);
 
   /*
    * From csrc/elementwise
