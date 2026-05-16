@@ -1963,6 +1963,15 @@ class MLATokenToKVPool(KVCache):
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         torch.cuda.synchronize()
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_cache in self.kv_buffer:
+            kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
@@ -2002,6 +2011,17 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.kv_scale_buffer
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_scale_cache in self.kv_scale_buffer:
+            kv_scale_cache[tgt_loc_flat] = kv_scale_cache[src_loc_flat]
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -2298,6 +2318,20 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         del self._tq_mla_kv_write_unit
         del self._tq_mla_kv_write_norms
         del self._tq_mla_kv_write_y
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for buffers in (
+            self.kv_nope_packed_buffer,
+            self.kv_nope_scale_buffer,
+            self.kv_rope_buffer,
+        ):
+            for cache in buffers:
+                cache[tgt_loc_flat] = cache[src_loc_flat]
 
     def get_kv_size_bytes(self):
         total = 0
