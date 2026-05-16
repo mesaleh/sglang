@@ -149,6 +149,12 @@ class BlockFP4KVQuantizeUtil:
         return scaled.view(b, m, n).to(dtype)
 
 
+# Backward-compatible name used by the legacy MHA/MLA FP4 KV pools.
+# The newer FP4 quantization registry names the block-wise E2M1 recipe
+# explicitly, but memory_pool.py still imports the historical alias.
+KVFP4QuantizeUtil = BlockFP4KVQuantizeUtil
+
+
 class NVFP4KVQuantizeUtil:
     """Utility class for NVFP4 quantization and dequantization with two-level scaling
     (global FP32 + block FP8 E4M3).
