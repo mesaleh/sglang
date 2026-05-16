@@ -8,12 +8,10 @@ import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from sglang.srt.distributed import (
-    all_reduce_census_scope,
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    is_all_reduce_census_enabled,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -495,26 +493,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             if not get_attn_tp_context().input_scattered:
                 if self.use_attn_tp_group:
-                    if is_all_reduce_census_enabled():
-                        with all_reduce_census_scope(
-                            "vocab_parallel_embedding.attn_tp_allreduce"
-                        ):
-                            output_parallel = attn_tp_all_reduce(output_parallel)
-                    else:
-                        output_parallel = attn_tp_all_reduce(output_parallel)
+                    output_parallel = attn_tp_all_reduce(output_parallel)
                 else:
                     # Reduce across all the model parallel GPUs.
-                    if is_all_reduce_census_enabled():
-                        with all_reduce_census_scope(
-                            "vocab_parallel_embedding.tp_allreduce"
-                        ):
-                            output_parallel = tensor_model_parallel_all_reduce(
-                                output_parallel
-                            )
-                    else:
-                        output_parallel = tensor_model_parallel_all_reduce(
-                            output_parallel
-                        )
+                    output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
     def extra_repr(self) -> str:

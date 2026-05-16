@@ -40,12 +40,10 @@ from sglang.srt.configs.model_config import (
     is_deepseek_nsa,
 )
 from sglang.srt.distributed import (
-    all_reduce_census_scope,
     divide,
     get_moe_expert_parallel_world_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
-    is_all_reduce_census_enabled,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -578,14 +576,6 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-    def _final_hidden_states_all_reduce(self, final_hidden_states: torch.Tensor):
-        if is_all_reduce_census_enabled():
-            with all_reduce_census_scope(
-                f"deepseek_moe.final_allreduce.layer={self.layer_id}"
-            ):
-                return tensor_model_parallel_all_reduce(final_hidden_states)
-        return tensor_model_parallel_all_reduce(final_hidden_states)
-
     def get_moe_weights(self):
         return [
             x.data
@@ -672,9 +662,7 @@ class DeepseekV2MoE(nn.Module):
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = self._final_hidden_states_all_reduce(
-                final_hidden_states
-            )
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_normal(
@@ -762,9 +750,7 @@ class DeepseekV2MoE(nn.Module):
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = self._final_hidden_states_all_reduce(
-                final_hidden_states
-            )
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_cpu(
@@ -820,9 +806,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # is_vnni
         )
         if self.tp_size > 1 and not should_allreduce_fusion:
-            final_hidden_states = self._final_hidden_states_all_reduce(
-                final_hidden_states
-            )
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -1731,7 +1715,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
-                layer_id=self.layer_id,
             )
         else:
             self.layer_communicator = LayerCommunicator(
@@ -1743,7 +1726,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
-                layer_id=self.layer_id,
             )
 
     def _detect_gfx95_quant_format(self) -> str:

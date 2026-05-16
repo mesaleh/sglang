@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
@@ -38,9 +36,6 @@ logger = logging.getLogger(__name__)
 # How often (in decoded tokens) the scheduler force-flushes an intermediate
 # output batch for non-streaming requests.
 DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
-_OMNIVA_PP_DETAIL_MAX_RIDS = int(
-    os.getenv("SGLANG_OMNIVA_PP_TIMING_MAX_RIDS", "4")
-)
 
 
 class SchedulerOutputProcessorMixin:
@@ -48,37 +43,6 @@ class SchedulerOutputProcessorMixin:
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
-
-    def _omniva_pp_detail_timing_should_log(self: Scheduler) -> bool:
-        should_log = getattr(self, "_omniva_pp_timing_should_log", None)
-        return bool(should_log and should_log() and getattr(self, "pp_size", 1) > 1)
-
-    def _omniva_pp_detail_log(
-        self: Scheduler,
-        event: str,
-        *,
-        elapsed_ms: Optional[float] = None,
-        batch: Optional[ScheduleBatch] = None,
-        reqs: Optional[List[Req]] = None,
-        **fields,
-    ) -> None:
-        log = getattr(self, "_omniva_pp_timing_log", None)
-        if log is None or not self._omniva_pp_detail_timing_should_log():
-            return
-
-        if reqs is not None:
-            sample_reqs = reqs[:_OMNIVA_PP_DETAIL_MAX_RIDS]
-            fields.update(
-                {
-                    "has_batch": True,
-                    "batch_size": len(reqs),
-                    "rids": [str(req.rid) for req in sample_reqs],
-                    "output_lens": [len(req.output_ids) for req in sample_reqs],
-                    "decode_cts": [req.time_stats.decode_ct for req in sample_reqs],
-                }
-            )
-
-        log(event, elapsed_ms=elapsed_ms, batch=batch, **fields)
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -435,34 +399,11 @@ class SchedulerOutputProcessorMixin:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        pp_detail = self._omniva_pp_detail_timing_should_log()
-        copy_sync_ms = 0.0
-        routed_finalize_ms = 0.0
-        cpu_materialize_ms = 0.0
-        metrics_begin_ms = 0.0
-        output_update_ms = 0.0
-        finish_check_ms = 0.0
-        finish_handle_ms = 0.0
-        logprob_update_ms = 0.0
-        hidden_state_ms = 0.0
-        grammar_ms = 0.0
-        stream_output_ms = 0.0
-        free_group_end_ms = 0.0
-        report_stats_ms = 0.0
-        loop_tic = 0.0
-
-        def elapsed_since(tic: float) -> float:
-            return (time.perf_counter() - tic) * 1000 if pp_detail else 0.0
-
         if result.copy_done is not None:
-            tic = time.perf_counter() if pp_detail else 0.0
             result.copy_done.synchronize()
-            copy_sync_ms = elapsed_since(tic)
         if result.routed_experts_output is not None:
-            tic = time.perf_counter() if pp_detail else 0.0
             result.routed_experts_output.finalize()
             result.routed_experts_output = None
-            routed_finalize_ms = elapsed_since(tic)
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -470,7 +411,6 @@ class SchedulerOutputProcessorMixin:
             result.can_run_cuda_graph,
         )
 
-        tic = time.perf_counter() if pp_detail else 0.0
         if batch.spec_algorithm.is_none() or batch.is_spec_v2:
             if batch.is_spec_v2:
                 next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
@@ -494,11 +434,9 @@ class SchedulerOutputProcessorMixin:
                         v.tolist()
                         for v in logits_output.next_token_token_ids_logprobs_val
                     ]
-        cpu_materialize_ms = elapsed_since(tic)
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 
-        tic = time.perf_counter() if pp_detail else 0.0
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_drafts)
@@ -508,13 +446,11 @@ class SchedulerOutputProcessorMixin:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
-        metrics_begin_ms = elapsed_since(tic)
 
         # Spec V1 handles output_ids, check_finished, grammar, and reasoning tokens
         # in the verify phase. Non-spec and V2 handle them here in post-processing.
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
-        loop_tic = time.perf_counter() if pp_detail else 0.0
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -526,27 +462,18 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if is_spec_v1:
-                tic = time.perf_counter() if pp_detail else 0.0
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
-                finish_check_ms += elapsed_since(tic)
-                tic = time.perf_counter() if pp_detail else 0.0
                 self._handle_finished_req(req, i, logits_output)
-                finish_handle_ms += elapsed_since(tic)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
-                    tic = time.perf_counter() if pp_detail else 0.0
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
-                    hidden_state_ms += elapsed_since(tic)
                 if req.grammar is not None:
-                    tic = time.perf_counter() if pp_detail else 0.0
                     req.grammar.finished = req.finished()
-                    grammar_ms += elapsed_since(tic)
                 continue
 
             # Non-spec and V2: full post-processing
-            tic = time.perf_counter() if pp_detail else 0.0
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
@@ -556,21 +483,15 @@ class SchedulerOutputProcessorMixin:
                 new_accepted_len = len(next_token_id)
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
-            output_update_ms += elapsed_since(tic)
 
             # Update Mamba last track seqlen
-            tic = time.perf_counter() if pp_detail else 0.0
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
             req.check_finished(new_accepted_len)
-            finish_check_ms += elapsed_since(tic)
 
-            tic = time.perf_counter() if pp_detail else 0.0
             self._handle_finished_req(req, i, logits_output)
-            finish_handle_ms += elapsed_since(tic)
 
             if req.return_logprob:
-                tic = time.perf_counter() if pp_detail else 0.0
                 # Spec v1 handles logprobs inside its own worker.
                 # Normalize: non-spec has 1 token, spec v2 has multiple.
                 if batch.is_spec_v2:
@@ -601,17 +522,13 @@ class SchedulerOutputProcessorMixin:
                         req.output_token_ids_logprobs_idx.append(
                             logits_output.next_token_token_ids_logprobs_idx[flat_idx]
                         )
-                logprob_update_ms += elapsed_since(tic)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
-                tic = time.perf_counter() if pp_detail else 0.0
                 req.hidden_states.append(
                     logits_output.hidden_states[i].cpu().clone().tolist()
                 )
-                hidden_state_ms += elapsed_since(tic)
 
             if req.grammar is not None:
-                tic = time.perf_counter() if pp_detail else 0.0
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
                 try:
                     if batch.spec_algorithm.is_none():
@@ -629,64 +546,16 @@ class SchedulerOutputProcessorMixin:
                     )
                     self.abort_request(AbortReq(rid=req.rid))
                 req.grammar.finished = req.finished()
-                grammar_ms += elapsed_since(tic)
 
-        req_loop_ms = elapsed_since(loop_tic)
-        if pp_detail:
-            self._omniva_pp_detail_log(
-                "process_batch_result_decode_req_loop_breakdown",
-                elapsed_ms=req_loop_ms,
-                batch=batch,
-                output_update_ms=round(output_update_ms, 3),
-                finish_check_ms=round(finish_check_ms, 3),
-                finish_handle_ms=round(finish_handle_ms, 3),
-                logprob_update_ms=round(logprob_update_ms, 3),
-                hidden_state_ms=round(hidden_state_ms, 3),
-                grammar_ms=round(grammar_ms, 3),
-                is_spec_v1=is_spec_v1,
-            )
-
-        tic = time.perf_counter() if pp_detail else 0.0
         self.stream_output(batch.reqs, batch.return_logprob)
-        stream_output_ms = elapsed_since(tic)
-
-        tic = time.perf_counter() if pp_detail else 0.0
         self.token_to_kv_pool_allocator.free_group_end()
-        free_group_end_ms = elapsed_since(tic)
 
         self.forward_ct_decode = (self.forward_ct_decode + 1) % (1 << 30)
-        tic = time.perf_counter() if pp_detail else 0.0
         self.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
             num_accepted_drafts=result.num_accepted_drafts,
         )
-        report_stats_ms = elapsed_since(tic)
-
-        if pp_detail:
-            self._omniva_pp_detail_log(
-                "process_batch_result_decode_breakdown",
-                elapsed_ms=(
-                    copy_sync_ms
-                    + routed_finalize_ms
-                    + cpu_materialize_ms
-                    + metrics_begin_ms
-                    + req_loop_ms
-                    + stream_output_ms
-                    + free_group_end_ms
-                    + report_stats_ms
-                ),
-                batch=batch,
-                copy_sync_ms=round(copy_sync_ms, 3),
-                routed_finalize_ms=round(routed_finalize_ms, 3),
-                cpu_materialize_ms=round(cpu_materialize_ms, 3),
-                metrics_begin_ms=round(metrics_begin_ms, 3),
-                req_loop_ms=round(req_loop_ms, 3),
-                stream_output_ms=round(stream_output_ms, 3),
-                free_group_end_ms=round(free_group_end_ms, 3),
-                report_stats_ms=round(report_stats_ms, 3),
-                can_run_cuda_graph=can_run_cuda_graph,
-            )
 
     def _handle_finished_req(
         self: Scheduler, req: Req, i: int, logits_output: LogitsProcessorOutput
@@ -1084,9 +953,6 @@ class SchedulerOutputProcessorMixin:
         skip_req: Optional[Req] = None,
         is_idle_batch: bool = False,
     ):
-        pp_detail = self._omniva_pp_detail_timing_should_log()
-        total_tic = time.perf_counter() if pp_detail else 0.0
-        build_tic = time.perf_counter() if pp_detail else 0.0
         rids = []
         http_worker_ipcs = []
         finished_reasons: List[BaseFinishReason] = []
@@ -1311,20 +1177,9 @@ class SchedulerOutputProcessorMixin:
                 req.log_time_stats()
 
         dp_ranks = [self.dp_rank] * len(rids) if rids else None
-        if pp_detail:
-            self._omniva_pp_detail_log(
-                "stream_output_generation_build",
-                elapsed_ms=(time.perf_counter() - build_tic) * 1000,
-                reqs=reqs,
-                selected_outputs=len(rids),
-                return_logprob=return_logprob,
-                is_idle_batch=is_idle_batch,
-                skip_req=skip_req is not None,
-            )
 
         # Send to detokenizer
         if reqs or is_idle_batch:
-            send_tic = time.perf_counter() if pp_detail else 0.0
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,
@@ -1368,24 +1223,6 @@ class SchedulerOutputProcessorMixin:
                     load=load,
                     dp_ranks=dp_ranks,
                 )
-            )
-            if pp_detail:
-                self._omniva_pp_detail_log(
-                    "stream_output_generation_send_to_detokenizer",
-                    elapsed_ms=(time.perf_counter() - send_tic) * 1000,
-                    reqs=reqs,
-                    selected_outputs=len(rids),
-                    return_logprob=return_logprob,
-                    is_idle_batch=is_idle_batch,
-                )
-        if pp_detail:
-            self._omniva_pp_detail_log(
-                "stream_output_generation",
-                elapsed_ms=(time.perf_counter() - total_tic) * 1000,
-                reqs=reqs,
-                selected_outputs=len(rids),
-                return_logprob=return_logprob,
-                is_idle_batch=is_idle_batch,
             )
 
     def stream_output_embedding(self: Scheduler, reqs: List[Req]):

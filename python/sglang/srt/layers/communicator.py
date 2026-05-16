@@ -21,13 +21,11 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from sglang.srt.distributed import (
-    all_reduce_census_scope,
     attention_tensor_model_parallel_all_reduce,
     attention_tensor_model_parallel_quant_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
-    is_all_reduce_census_enabled,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
@@ -152,13 +150,8 @@ def _fused_rmsnorm_fp8_per_token_quant(
 
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
-# The min-latency oneshot case can use 128; SGLang keeps 2048 as the
-# default capacity for broader shapes.
-# Override SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE to trade fusion
-# capacity for lower workspace memory.
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = (
-    envs.SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE.get()
-)
+# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -439,7 +432,6 @@ class LayerCommunicator:
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
-        layer_id: Optional[int] = None,
     ):
         self.layer_scatter_modes = layer_scatter_modes
         self.input_layernorm = input_layernorm
@@ -448,16 +440,11 @@ class LayerCommunicator:
         self.is_last_layer = is_last_layer
         self.qkv_latent_func = qkv_latent_func
 
-        self._context = CommunicateContext.init_new(layer_id=layer_id)
+        self._context = CommunicateContext.init_new()
         self._post_init_communicate()
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
-
-    def _all_reduce_census_label(self, op: str) -> str:
-        if self._context.layer_id is None:
-            return op
-        return f"{op}.layer={self._context.layer_id}"
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -540,19 +527,7 @@ class LayerCommunicator:
                         )
                     )
                 else:
-                    if is_all_reduce_census_enabled():
-                        with all_reduce_census_scope(
-                            self._all_reduce_census_label(
-                                "communicator.pending_moe_allreduce_layernorm"
-                            )
-                        ):
-                            hidden_states = moe_tensor_model_parallel_all_reduce(
-                                hidden_states
-                            )
-                    else:
-                        hidden_states = moe_tensor_model_parallel_all_reduce(
-                            hidden_states
-                        )
+                    hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual
                     )
@@ -787,13 +762,12 @@ class CommunicateContext:
     tp_size: int
     cache = None
     tp_rank: int
-    layer_id: Optional[int] = None
 
     def is_same_group_size(self, a: ScatterMode, b: ScatterMode):
         return self.process_group_sizes[a] == self.process_group_sizes[b]
 
     @classmethod
-    def init_new(cls, layer_id: Optional[int] = None):
+    def init_new(cls):
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
         attn_dp_size = get_attention_dp_size()
@@ -820,14 +794,7 @@ class CommunicateContext:
             attn_cp_size=attn_cp_size,
             tp_size=tp_size,
             tp_rank=tp_rank,
-            layer_id=layer_id,
         )
-
-
-def _all_reduce_census_label_for_context(context: CommunicateContext, op: str) -> str:
-    if context.layer_id is None:
-        return op
-    return f"{op}.layer={context.layer_id}"
 
 
 class CommunicateSimpleFn:
@@ -1038,23 +1005,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
                     not forward_batch.forward_mode.is_decode_or_idle()
                     and get_global_server_args().enable_quant_communications
                 )
-                if is_all_reduce_census_enabled():
-                    with all_reduce_census_scope(
-                        _all_reduce_census_label_for_context(
-                            context, "communicator.attn_allreduce_layernorm"
-                        )
-                    ):
-                        if quantize_communications:
-                            hidden_states = (
-                                attention_tensor_model_parallel_quant_all_reduce(
-                                    hidden_states
-                                )
-                            )
-                        else:
-                            hidden_states = attention_tensor_model_parallel_all_reduce(
-                                hidden_states
-                            )
-                elif quantize_communications:
+                if quantize_communications:
                     hidden_states = attention_tensor_model_parallel_quant_all_reduce(
                         hidden_states
                     )
@@ -1100,15 +1051,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
         scattered_states = hidden_states.tensor_split(context.tp_size)[context.tp_rank]
         scattered_states += residual
-        if is_all_reduce_census_enabled():
-            with all_reduce_census_scope(
-                _all_reduce_census_label_for_context(
-                    context, "communicator.tp_residual_allreduce"
-                )
-            ):
-                residual = tensor_model_parallel_all_reduce(hidden_states)
-        else:
-            residual = tensor_model_parallel_all_reduce(hidden_states)
+        residual = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = layernorm(residual)
         return hidden_states, residual
 
