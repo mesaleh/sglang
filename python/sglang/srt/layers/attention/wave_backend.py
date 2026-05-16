@@ -170,13 +170,13 @@ class WaveAttnBackend(AttentionBackend):
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
 
         # See pick_num_kv_splits_ceiling in triton_backend.py for the shared
-        # derivation (both backends use the same flash-decoding scheduler).
-        # Honors an explicit --triton-attention-num-kv-splits if passed,
-        # otherwise derives a ceiling from device + head geometry + context.
+        # derivation. Stock-equivalent default honors the explicit server arg
+        # (8); Omniva dynamic picking is research-only and env-gated.
         user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        if user_max_kv_splits is not None:
-            self.max_kv_splits = user_max_kv_splits
-        else:
+        auto_kv_splits = get_bool_env_var(
+            "SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS", "false"
+        )
+        if auto_kv_splits:
             self.max_kv_splits = pick_num_kv_splits_ceiling(
                 device_core_count=self.device_core_count,
                 num_head=self.num_head,
@@ -184,6 +184,10 @@ class WaveAttnBackend(AttentionBackend):
                 max_context_len=self.max_context_len,
                 backend_name="wave-attention",
             )
+        elif user_max_kv_splits is not None:
+            self.max_kv_splits = user_max_kv_splits
+        else:
+            self.max_kv_splits = 8
 
     def get_num_kv_splits(
         self,

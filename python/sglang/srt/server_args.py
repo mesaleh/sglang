@@ -674,7 +674,7 @@ class ServerArgs:
     enable_nan_detection: bool = False
     enable_p2p_check: bool = False
     triton_attention_reduce_in_fp32: bool = False
-    triton_attention_num_kv_splits: Optional[int] = None
+    triton_attention_num_kv_splits: int = 8
     triton_attention_split_tile_size: Optional[int] = None
     num_continuous_decode_steps: int = 1
     delete_ckpt_after_loading: bool = False
@@ -2821,12 +2821,8 @@ class ServerArgs:
                 self.page_size = 64
 
     def _handle_amd_specifics(self):
-        # Triton attention's num_kv_splits ceiling is now picked dynamically
-        # at backend-init time based on device SM count × model head geometry
-        # (see TritonAttnBackend.__init__). The previous AMD override bumped
-        # this from 8 -> 16 but a dynamic picker supersedes it on both AMD
-        # and NVIDIA.
-        pass
+        if is_hip():
+            self.triton_attention_num_kv_splits = 16
 
     def _handle_nccl_pre_warm(self):
         # pre_warm_nccl is only used with CUDA or HIP hardware
@@ -6208,13 +6204,10 @@ class ServerArgs:
             type=int,
             default=ServerArgs.triton_attention_num_kv_splits,
             help=(
-                "Ceiling on the number of KV splits in the flash-decoding "
-                "Triton kernel. Larger values give more SM occupancy at "
-                "long-context decode but cost scratch memory per captured "
-                "CUDA graph. Leave unset (the default) to let SGLang pick "
-                "a ceiling sized to the device's SM count and the model's "
-                "attention-head count at backend init. Set explicitly to "
-                "override the auto-picked value."
+                "The number of KV splits in flash decoding Triton kernel. "
+                "Larger value is better in longer context scenarios. The "
+                "default value is 8. Omniva research dynamic picking is "
+                "available only when SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS=1."
             ),
         )
         parser.add_argument(

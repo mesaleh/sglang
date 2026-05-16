@@ -298,24 +298,19 @@ class TritonAttnBackend(AttentionBackend):
             )
 
         # Ceiling on KV splits used by the flash-decoding kernel at decode.
-        # Three precedence tiers (highest first):
-        #   1. If split_tile_size is set (--triton-attention-split-tile-size
-        #      or deterministic mode), derive the ceiling from
-        #      ceil(max_context_len / split_tile_size). Fully deterministic.
-        #   2. If --triton-attention-num-kv-splits was passed explicitly,
-        #      honor the user's choice.
-        #   3. Otherwise pick a ceiling sized to the device's SM count and
-        #      this model's attention-head geometry (pick_num_kv_splits_ceiling).
-        # The per-step `get_num_kv_splits_triton` kernel then picks a
-        # per-sequence split count bounded by this ceiling.
+        # Stock-equivalent default is the explicit server arg (8). The
+        # Omniva dynamic picker is research-only and must be enabled with
+        # SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS=1 so non-TQ stock-parity
+        # runs do not carry a default-active behavior change.
         user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        auto_kv_splits = get_bool_env_var(
+            "SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS", "false"
+        )
         if self.split_tile_size is not None:
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
-        elif user_max_kv_splits is not None:
-            self.max_kv_splits = user_max_kv_splits
-        else:
+        elif auto_kv_splits:
             self.max_kv_splits = pick_num_kv_splits_ceiling(
                 device_core_count=self.device_core_count,
                 num_head=self.num_head,
@@ -323,6 +318,10 @@ class TritonAttnBackend(AttentionBackend):
                 max_context_len=self.max_context_len,
                 backend_name="triton-attention",
             )
+        elif user_max_kv_splits is not None:
+            self.max_kv_splits = user_max_kv_splits
+        else:
+            self.max_kv_splits = _AUTO_KV_SPLITS_FALLBACK
 
         # Check arguments
         assert not (
