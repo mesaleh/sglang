@@ -36,6 +36,20 @@ _TQ_MLA_STAGED_FLASHMLA_THREADS = envs.SGLANG_TQ_MLA_STAGED_FLASHMLA_THREADS.get
 _TQ_MLA_PROFILE_NVTX = envs.SGLANG_TQ_MLA_PROFILE_NVTX.get()
 
 
+def _tq_staged_flashmla_supported(device: torch.device) -> bool:
+    if not _TQ_MLA_STAGED_FLASHMLA:
+        return False
+    if not device.type == "cuda" or not torch.cuda.is_available():
+        return False
+
+    major, _ = torch.cuda.get_device_capability(device)
+    # The staged path materializes BF16 dense KV and calls FlashMLA dense decode.
+    # Current FlashMLA supports that dense decode operator on Hopper/SM90 only;
+    # Blackwell/SM100 supports different sparse/FP8 MLA paths, so forcing this
+    # route on GB200 fails at runtime.
+    return major == 9
+
+
 class _NoOpNVTXRange:
     __slots__ = ()
 
@@ -809,13 +823,26 @@ class TurboQuantMLABackend(FlashMLABackend):
         self._tq_staged_k_cache = None     # (pool_tokens, 1, lora_rank + rope_dim) bf16
         self._tq_staged_q = None           # (max_bs, 1, q_heads, lora_rank + rope_dim) bf16
         self._tq_staged_pages_per_req = 1
+        self._tq_use_staged_flashmla = _tq_staged_flashmla_supported(
+            self.req_to_token.device
+        )
 
         # Boot-time visibility: confirms this class (not base FlashMLABackend)
         # is actually instantiated in the live pod. One-line per rank at init.
         import logging
+
+        if _TQ_MLA_STAGED_FLASHMLA and not self._tq_use_staged_flashmla:
+            logging.getLogger(__name__).warning(
+                "TurboQuant staged FlashMLA requested but disabled on device "
+                "capability %s. Falling back to the non-staged TurboQuant MLA "
+                "decode path.",
+                torch.cuda.get_device_capability(self.req_to_token.device),
+            )
         logging.getLogger(__name__).info(
-            "TurboQuantMLABackend active. staged_flashmla=%s",
+            "TurboQuantMLABackend active. staged_flashmla_requested=%s "
+            "staged_flashmla_active=%s",
             _TQ_MLA_STAGED_FLASHMLA,
+            self._tq_use_staged_flashmla,
         )
 
     def _tq_ensure_buffers(self, max_bs: int, device):
@@ -846,7 +873,7 @@ class TurboQuantMLABackend(FlashMLABackend):
             and self._tq_o_rotated is not None
             and self._tq_o_rotated.shape[0] >= max_bs
             and (
-                not _TQ_MLA_STAGED_FLASHMLA
+                not self._tq_use_staged_flashmla
                 or (
                     self._tq_staged_k_cache is not None
                     and self._tq_staged_q is not None
@@ -890,7 +917,7 @@ class TurboQuantMLABackend(FlashMLABackend):
             dtype=self.q_data_type,
             device=device,
         )
-        if _TQ_MLA_STAGED_FLASHMLA:
+        if self._tq_use_staged_flashmla:
             full_dim = self.kv_lora_rank + self.qk_rope_head_dim
             source_tokens = self._tq_pool.kv_nope_packed_buffer[0].shape[0]
             staged_tokens = triton.cdiv(
@@ -1054,7 +1081,7 @@ class TurboQuantMLABackend(FlashMLABackend):
         # A JIT compile inside capture produces a broken graph with a
         # subtle "kernel missing" symptom at replay.
         with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.warmup"):
-            if _TQ_MLA_STAGED_FLASHMLA:
+            if self._tq_use_staged_flashmla:
                 self._tq_warmup_staged_flashmla(device)
             else:
                 self._tq_warmup_kernel(device)
@@ -1135,6 +1162,14 @@ class TurboQuantMLABackend(FlashMLABackend):
         flat concatenation of per-batch req_to_token rows, written directly
         into the pre-allocated max-sized buffer.
         """
+        if not torch.is_inference_mode_enabled():
+            # CUDA graph capture can call this outside InferenceMode while the
+            # persistent metadata buffers were allocated as inference tensors.
+            # Run all metadata writes in inference mode to keep PyTorch 2.11
+            # from rejecting in-place updates to those buffers.
+            with torch.inference_mode():
+                return self._tq_build_kv_indices(bs, req_pool_indices, seq_lens)
+
         if self._tq_seq_lens_i32 is not None and self._tq_seq_lens_i32.numel() >= bs:
             if seq_lens.dtype == torch.int32:
                 self._tq_seq_lens_i32[:bs].copy_(seq_lens[:bs])
@@ -1207,7 +1242,7 @@ class TurboQuantMLABackend(FlashMLABackend):
         # once per forward at init time so forward_decode is alloc-free.
         if forward_batch.forward_mode.is_decode_or_idle():
             bs = forward_batch.batch_size
-            if _TQ_MLA_STAGED_FLASHMLA:
+            if self._tq_use_staged_flashmla:
                 self._tq_staged_pages_per_req = triton.cdiv(
                     forward_batch.seq_lens_cpu[:bs].max().item(), PAGE_SIZE
                 )
@@ -1239,7 +1274,7 @@ class TurboQuantMLABackend(FlashMLABackend):
                 encoder_lens, forward_mode, spec_info,
             )
         if forward_mode.is_decode_or_idle():
-            if _TQ_MLA_STAGED_FLASHMLA:
+            if self._tq_use_staged_flashmla:
                 # CUDA graph capture records the kernel launch grid, so the
                 # staged kernel must launch with a static page count. The
                 # kernel reads device seq_lens and returns early for invalid
@@ -1269,7 +1304,7 @@ class TurboQuantMLABackend(FlashMLABackend):
                 encoder_lens, forward_mode, spec_info, seq_lens_cpu,
             )
         if forward_mode.is_decode_or_idle():
-            if _TQ_MLA_STAGED_FLASHMLA:
+            if self._tq_use_staged_flashmla:
                 self._tq_staged_pages_per_req = self.cuda_graph_kv_indices.shape[1]
             with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.replay_tq_indices"):
                 self._tq_build_kv_indices(bs, req_pool_indices, seq_lens[:bs])
@@ -1343,7 +1378,7 @@ class TurboQuantMLABackend(FlashMLABackend):
             att_lse = self._tq_stage1_lse[:bs, :q_heads, :]
             o_rotated = self._tq_o_rotated[:bs, :q_heads, :]
 
-        if _TQ_MLA_STAGED_FLASHMLA:
+        if self._tq_use_staged_flashmla:
             return self._forward_decode_staged_flashmla(
                 q,
                 layer,

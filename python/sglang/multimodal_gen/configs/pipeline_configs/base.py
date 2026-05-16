@@ -508,7 +508,7 @@ class PipelineConfig:
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
 
-    def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
+    def gather_denoising_env_static_for_sp(self, batch, cond_kwargs: dict | None):
         return cond_kwargs
 
     @staticmethod
@@ -876,6 +876,8 @@ class ImagePipelineConfig(PipelineConfig):
     def shard_latents_for_sp(self, batch, latents):
         # latents: [B, H * W, C]
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard:
+            return latents, False
         seq_len = latents.shape[1]
 
         # TODO: reuse code in PipelineConfig::shard_latents_for_sp

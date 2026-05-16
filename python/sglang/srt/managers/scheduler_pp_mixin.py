@@ -31,9 +31,10 @@ from sglang.srt.managers.utils import (
     get_logprob_from_pp_outputs,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -951,8 +952,9 @@ class SchedulerPPMixin:
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
                 # Measure latency with device synchronization for accurate timing
+                device_module = get_device_module()
                 # Synchronize before starting timing to ensure clean measurement
-                self.device_module.synchronize()
+                device_module.synchronize()
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
@@ -966,7 +968,7 @@ class SchedulerPPMixin:
                 )
 
                 # Synchronize after forward to ensure GPU operations complete
-                self.device_module.synchronize()
+                device_module.synchronize()
 
                 latency_seconds = time.perf_counter() - start
                 latency_ms = latency_seconds * 1e3  # Convert to milliseconds
@@ -1632,7 +1634,18 @@ class SchedulerPPMixin:
                     forward_submit_epoch_ns = time.time_ns()
                     forward_start_event.record(self.device_module.current_stream())
                 tic = time.perf_counter() if pp_timing else 0.0
+                set_time_batch(
+                    self.cur_batch.reqs,
+                    "set_run_batch_cpu_start_time",
+                    trace_only=True,
+                )
                 result = self.run_batch(self.cur_batch, pp_proxy_tensors)
+                set_time_batch(
+                    self.cur_batch.reqs,
+                    "set_run_batch_cpu_end_time",
+                    trace_only=True,
+                    attrs={"pp_mb_id": mb_id},
+                )
                 if pp_gpu_timing:
                     forward_end_event = self._omniva_pp_new_event(enable_timing=True)
                     forward_end_event.record(self.device_module.current_stream())

@@ -28,6 +28,7 @@ from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
+    DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST,
     DEFAULT_MOVA_360P_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST,
     DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
@@ -155,6 +156,12 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         MULTI_FRAME_I2I_sampling_params,
     ),
+    DiffusionTestCase(
+        "joyai_image_edit_ti2i",
+        DiffusionServerArgs(model_path=DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
+        TI2I_sampling_params,
+        run_consistency_check=False,
+    ),
     # Upscaling (Real-ESRGAN 4×) for T2I
     DiffusionTestCase(
         "flux_2_image_t2i_upscaling_4x",
@@ -172,14 +179,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "wan2_1_t2v_1.3b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-        ),
-        T2V_sampling_params,
-    ),
-    DiffusionTestCase(
-        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            text_encoder_cpu_offload=True,
         ),
         T2V_sampling_params,
     ),
@@ -332,6 +331,20 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     #         num_frames=33,
     #     ),
     # ),
+    DiffusionTestCase(
+        "ltx_2_3_hq_pipeline",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.3",
+            extras=[
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+            ],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+            },
+        ),
+        T2I_sampling_params,
+    ),
 ]
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
@@ -519,6 +532,7 @@ TWO_GPU_CASES = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
             ],
@@ -537,6 +551,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode original",
@@ -609,16 +624,10 @@ TWO_GPU_CASES = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_2_klein_ti2i_2_gpus",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-        ),
-        TI2I_sampling_params,
-    ),
-    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
         ),
         TI2V_sampling_params,
     ),

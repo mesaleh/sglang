@@ -23,6 +23,7 @@ import torch
 from sglang.srt.distributed import (
     all_reduce_census_scope,
     attention_tensor_model_parallel_all_reduce,
+    attention_tensor_model_parallel_quant_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -1033,15 +1034,30 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 handled = True
 
             if not handled:
+                quantize_communications = (
+                    not forward_batch.forward_mode.is_decode_or_idle()
+                    and get_global_server_args().enable_quant_communications
+                )
                 if is_all_reduce_census_enabled():
                     with all_reduce_census_scope(
                         _all_reduce_census_label_for_context(
                             context, "communicator.attn_allreduce_layernorm"
                         )
                     ):
-                        hidden_states = attention_tensor_model_parallel_all_reduce(
-                            hidden_states
-                        )
+                        if quantize_communications:
+                            hidden_states = (
+                                attention_tensor_model_parallel_quant_all_reduce(
+                                    hidden_states
+                                )
+                            )
+                        else:
+                            hidden_states = attention_tensor_model_parallel_all_reduce(
+                                hidden_states
+                            )
+                elif quantize_communications:
+                    hidden_states = attention_tensor_model_parallel_quant_all_reduce(
+                        hidden_states
+                    )
                 else:
                     hidden_states = attention_tensor_model_parallel_all_reduce(
                         hidden_states
