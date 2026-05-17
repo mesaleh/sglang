@@ -192,6 +192,26 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _should_store_correction_bias_as_bf16(quant_config: Optional[QuantizationConfig]):
+    if quant_config is None or not get_moe_runner_backend().is_flashinfer_trtllm():
+        return False
+    if quant_config.get_name() == "modelopt_fp4":
+        return True
+    if quant_config.get_name() != "compressed_tensors":
+        return False
+
+    weights_config = (
+        getattr(quant_config, "target_scheme_map", {})
+        .get("Linear", {})
+        .get("weights")
+    )
+    return (
+        getattr(weights_config, "strategy", None) == "group"
+        and getattr(weights_config, "group_size", None) == 32
+        and getattr(weights_config, "num_bits", None) == 4
+    )
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -287,10 +307,7 @@ class MoEGate(nn.Module):
         if config.topk_method == "noaux_tc":
             correction_bias_dtype = torch.float32
             if quant_config is not None:
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
+                if _should_store_correction_bias_as_bf16(quant_config):
                     correction_bias_dtype = torch.bfloat16
                 elif _use_aiter and quant_config.get_name() in (
                     "fp8",
