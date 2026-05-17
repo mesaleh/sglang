@@ -1,9 +1,9 @@
 FROM gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:gb200-kimi-k26-phase60-correction-bias-bf16-004962e54-20260517@sha256:18a7e30f5e7d3d7eb43b3d05f1529a4a691825670f9016243ad508bb82992cca
 
 LABEL org.opencontainers.image.source="git@gitlab.aws.omniva.com:acls/security-analytics/sglang.git"
-LABEL org.opencontainers.image.revision="004962e54+phase65-pre-allreduce-add-fusion"
-LABEL omniva.sglang.source_commit="004962e54"
-LABEL com.omniva.sglang.branch="gb200-phase65-prear-add-20260517"
+LABEL org.opencontainers.image.revision="54068356f+phase65-pre-allreduce-add-fusion"
+LABEL omniva.sglang.source_commit="54068356f"
+LABEL com.omniva.sglang.branch="omniva-main"
 LABEL com.omniva.kimi.base="gb200-kimi-k26-phase60-correction-bias-bf16-004962e54-20260517"
 LABEL com.omniva.kimi.feature="gb200-phase65-pre-allreduce-add-fusion"
 LABEL com.omniva.flashinfer.base="v0.6.8.post1"
