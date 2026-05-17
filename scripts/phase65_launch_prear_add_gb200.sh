@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE="${IMAGE:-omniva/sglang:gb200-phase65-prear-add-004962e54}"
+IMAGE="${IMAGE:-gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:gb200-kimi-k26-phase65-prear-add-1bf8fe40d-20260517}"
 NAME="${NAME:-kimi-gb200-best}"
 MODEL_DIR="${MODEL_DIR:-/opt/kimi-gb200/models/Kimi-K2.6-2755962d}"
 PORT="${PORT:-30000}"
