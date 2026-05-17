@@ -582,6 +582,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
+    pre_allreduce_addition: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
@@ -602,6 +603,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
+    pre_allreduce_addition: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
@@ -652,6 +654,10 @@ def flashinfer_allreduce_residual_rmsnorm(
         not input_tensor.is_contiguous()
         or not residual.is_contiguous()
         or not weight.is_contiguous()
+        or (
+            pre_allreduce_addition is not None
+            and not pre_allreduce_addition.is_contiguous()
+        )
     ):
         logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
         return None, None
@@ -671,20 +677,24 @@ def flashinfer_allreduce_residual_rmsnorm(
     norm_out = torch.empty_like(input_tensor)
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    _flashinfer_comm.allreduce_fusion(
-        input=input_tensor,
-        workspace=workspace_manager.workspace,
-        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
-        launch_with_pdl=True,
-        trigger_completion_at_end=trigger_completion_at_end,
-        residual_out=residual_out,
-        norm_out=norm_out,
-        residual_in=residual,
-        rms_gamma=weight,
-        rms_eps=eps,
-        use_oneshot=use_oneshot,
-        fp32_acc=fp32_acc,
-    )
+    kwargs = {
+        "input": input_tensor,
+        "workspace": workspace_manager.workspace,
+        "pattern": _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        "launch_with_pdl": True,
+        "trigger_completion_at_end": trigger_completion_at_end,
+        "residual_out": residual_out,
+        "norm_out": norm_out,
+        "residual_in": residual,
+        "rms_gamma": weight,
+        "rms_eps": eps,
+        "use_oneshot": use_oneshot,
+        "fp32_acc": fp32_acc,
+    }
+    if pre_allreduce_addition is not None:
+        kwargs["pre_allreduce_add"] = pre_allreduce_addition
+
+    _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
 

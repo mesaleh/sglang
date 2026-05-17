@@ -526,7 +526,14 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
+                            pre_allreduce_addition=getattr(
+                                hidden_states,
+                                "_sglang_pre_allreduce_addition",
+                                None,
+                            ),
                         )
                     )
                 else:

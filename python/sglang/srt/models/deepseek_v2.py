@@ -390,6 +390,9 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self._enable_pre_allreduce_add_fusion = (
+            envs.SGLANG_FLASHINFER_PRE_ALLREDUCE_ADD_FUSION.get()
+        )
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
@@ -593,6 +596,25 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+    def _combine_shared_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+        should_allreduce_fusion: bool,
+    ) -> torch.Tensor:
+        if shared_output is None:
+            return final_hidden_states
+        if (
+            self._enable_pre_allreduce_add_fusion
+            and should_allreduce_fusion
+            and final_hidden_states.is_contiguous()
+            and shared_output.is_contiguous()
+        ):
+            final_hidden_states._sglang_pre_allreduce_addition = shared_output
+            return final_hidden_states
+        final_hidden_states += shared_output
+        return final_hidden_states
+
     def get_moe_weights(self):
         return [
             x.data
@@ -673,7 +695,11 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states += shared_output
+        final_hidden_states = self._combine_shared_output(
+            final_hidden_states,
+            shared_output,
+            should_allreduce_fusion,
+        )
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
@@ -760,8 +786,11 @@ class DeepseekV2MoE(nn.Module):
         ):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
-        if shared_output is not None:
-            final_hidden_states += shared_output
+        final_hidden_states = self._combine_shared_output(
+            final_hidden_states,
+            shared_output,
+            should_allreduce_fusion,
+        )
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,

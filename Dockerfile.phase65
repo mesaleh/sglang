@@ -1,0 +1,41 @@
+FROM gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:gb200-kimi-k26-phase60-correction-bias-bf16-004962e54-20260517@sha256:18a7e30f5e7d3d7eb43b3d05f1529a4a691825670f9016243ad508bb82992cca
+
+LABEL org.opencontainers.image.source="git@gitlab.aws.omniva.com:acls/security-analytics/sglang.git"
+LABEL org.opencontainers.image.revision="004962e54+phase65-pre-allreduce-add-fusion"
+LABEL omniva.sglang.source_commit="004962e54"
+LABEL com.omniva.sglang.branch="gb200-phase65-prear-add-20260517"
+LABEL com.omniva.kimi.base="gb200-kimi-k26-phase60-correction-bias-bf16-004962e54-20260517"
+LABEL com.omniva.kimi.feature="gb200-phase65-pre-allreduce-add-fusion"
+LABEL com.omniva.flashinfer.base="v0.6.8.post1"
+LABEL com.omniva.flashinfer.feature="pre-allreduce-add"
+
+RUN python3 -m pip install --upgrade "setuptools>=77,<82" && \
+    python3 -m pip uninstall -y flashinfer-jit-cache || true
+
+COPY flashinfer-gb200-phase65-prear-add-20260517 /opt/flashinfer-gb200-phase65-prear-add
+RUN python3 -m pip install --no-build-isolation --no-deps -e /opt/flashinfer-gb200-phase65-prear-add
+
+WORKDIR /sgl-workspace/sglang
+COPY python/sglang python/sglang
+
+RUN python3 -m compileall -q /sgl-workspace/sglang/python/sglang && \
+    python3 - <<'PY'
+from pathlib import Path
+import inspect
+
+import flashinfer.comm.allreduce as ar
+from sglang.srt.environ import envs
+
+sglang_init = Path("/sgl-workspace/sglang/python/sglang/__init__.py")
+deepseek = Path("/sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py")
+flashinfer_src = Path("/opt/flashinfer-gb200-phase65-prear-add")
+assert sglang_init.exists(), "missing SGLang package overlay"
+assert deepseek.exists(), "missing DeepSeek/Kimi model overlay"
+assert flashinfer_src.exists(), "missing FlashInfer source overlay"
+assert hasattr(envs, "SGLANG_FLASHINFER_PRE_ALLREDUCE_ADD_FUSION")
+assert "pre_allreduce_add" in inspect.signature(ar.allreduce_fusion).parameters
+print("sglang_path", sglang_init)
+print("deepseek_path", deepseek)
+print("flashinfer_path", flashinfer_src)
+print("GB200 Phase 65 pre-allreduce add overlay checks passed")
+PY
