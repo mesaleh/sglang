@@ -1,16 +1,25 @@
 FROM gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:gb200-kimi-k26-phase60-correction-bias-bf16-004962e54-20260517@sha256:18a7e30f5e7d3d7eb43b3d05f1529a4a691825670f9016243ad508bb82992cca
 
+ARG OMNIVA_SOURCE_COMMIT=unknown
+ARG OMNIVA_SOURCE_BRANCH=unknown
+ARG OMNIVA_UPSTREAM_TARGET=v0.5.12
+
 LABEL org.opencontainers.image.source="git@gitlab.aws.omniva.com:acls/security-analytics/sglang.git"
-LABEL org.opencontainers.image.revision="54068356f+phase65-pre-allreduce-add-fusion"
-LABEL omniva.sglang.source_commit="54068356f"
-LABEL com.omniva.sglang.branch="omniva-main"
+LABEL org.opencontainers.image.revision="${OMNIVA_SOURCE_COMMIT}+stock-sync-v0.5.12-phase65-pre-allreduce-add-fusion"
+LABEL omniva.sglang.source_commit="${OMNIVA_SOURCE_COMMIT}"
+LABEL com.omniva.sglang.branch="${OMNIVA_SOURCE_BRANCH}"
+LABEL com.omniva.sglang.upstream_target="${OMNIVA_UPSTREAM_TARGET}"
 LABEL com.omniva.kimi.base="gb200-kimi-k26-phase60-correction-bias-bf16-004962e54-20260517"
 LABEL com.omniva.kimi.feature="gb200-phase65-pre-allreduce-add-fusion"
+LABEL com.omniva.sglang_kernel.version="0.4.2.post2+cu129"
 LABEL com.omniva.flashinfer.base="v0.6.8.post1"
 LABEL com.omniva.flashinfer.feature="pre-allreduce-add"
 
 RUN python3 -m pip install --upgrade "setuptools>=77,<82" && \
     python3 -m pip uninstall -y flashinfer-jit-cache || true
+
+RUN python3 -m pip install --force-reinstall --no-deps \
+    "https://github.com/sgl-project/whl/releases/download/v0.4.2.post2/sglang_kernel-0.4.2.post2+cu129-cp310-abi3-manylinux2014_$(uname -m).whl"
 
 COPY flashinfer-gb200-phase65-prear-add-20260517 /opt/flashinfer-gb200-phase65-prear-add
 RUN test -f /opt/flashinfer-gb200-phase65-prear-add/3rdparty/cutlass/include/cutlass/arch/barrier.h && \
