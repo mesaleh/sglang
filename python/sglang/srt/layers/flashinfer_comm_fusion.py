@@ -383,12 +383,13 @@ class FlashInferWorkspaceManager:
                 hidden_dim=hidden_dim,
                 dtype=dtype,
                 force_oneshot_support=bool(use_oneshot),
+            )
+            if device_group is not None:
                 # Pin the symmetric-memory rendezvous to the actual
                 # subgroup. Without this, flashinfer >=0.6.10 falls back
                 # to WORLD and TP/EP/CP subgroup peers get addressed
                 # incorrectly (kernel hangs in cuda-graph warmup).
-                group=device_group,
-            )
+                kwargs["group"] = device_group
             if (
                 _TorchDistBackend is not None
                 and device_group is not None
@@ -534,12 +535,17 @@ def ensure_workspace_initialized(
             rank = get_moe_tensor_parallel_rank()
             coordinator = get_moe_tp_group()
 
-    # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
-    # rendezvous group from `group=...` (falling back to WORLD when None),
-    # so leaving it None silently rendezvouses on WORLD and the kernel ends
-    # up addressing the wrong peers in TP/EP/CP subgroup setups.
-    device_group = coordinator.device_group
-    cpu_group = coordinator.cpu_group
+    tp_coordinator = get_tp_group()
+    # For the full TP group, keep FlashInfer's default process-group fast
+    # path. Passing an explicit full-TP group adds measurable GB200 decode
+    # overhead. True subgroups still need an explicit group so flashinfer
+    # >=0.6.10 does not rendezvous on WORLD and address the wrong peers.
+    if coordinator.device_group is tp_coordinator.device_group:
+        device_group = None
+        cpu_group = None
+    else:
+        device_group = coordinator.device_group
+        cpu_group = coordinator.cpu_group
 
     if world_size <= 1:
         return False
