@@ -3350,6 +3350,18 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+    def _supports_pipeline_parallel_speculative_decoding(self) -> bool:
+        immediate_output_forward = os.getenv(
+            "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        return (
+            self.pp_size == 2
+            and self.disable_overlap_schedule
+            and self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE")
+            and not self.enable_multi_layer_eagle
+            and immediate_output_forward
+        )
+
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
 
@@ -7254,9 +7266,18 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            if self.speculative_algorithm is not None:
+                assert self._supports_pipeline_parallel_speculative_decoding(), (
+                    "Pipeline parallel speculative decoding is currently supported "
+                    "only for pp_size=2 with EAGLE, EAGLE3, or STANDALONE in "
+                    "non-overlap spec v1 mode and "
+                    "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD=1. Multi-layer "
+                    "EAGLE, NGRAM, DFLASH, Frozen-KV MTP, and pp_size>2 are not "
+                    "supported."
+                )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

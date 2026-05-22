@@ -703,9 +703,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
+        pp_external_eagle_spec = (
+            self.pp_size == 2
+            and not self.is_draft_worker
+            and self.spec_algorithm
+            in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+            and self.server_args.speculative_draft_model_path is not None
+            and self.server_args.disable_overlap_schedule
+            and not self.server_args.enable_multi_layer_eagle
+            and self.server_args._supports_pipeline_parallel_speculative_decoding()
+        )
+
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
+            or pp_external_eagle_spec
             or (
                 (not self.spec_algorithm.is_none())
                 and (self.num_effective_layers == model_num_layers)

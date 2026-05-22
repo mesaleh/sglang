@@ -175,6 +175,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         is_hybrid_swa: bool = False,
         hc_hidden_size: Optional[int] = None,
+        num_pp_proxy_aux_hidden_states: int = 0,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -212,11 +213,15 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {
-                    "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
                 }
                 if not is_mhc:
                     pp_proxy_tensors["residual"] = torch.zeros(
-                        (max_bs, hidden_size), dtype=dtype
+                        (max_num_token, hidden_size), dtype=dtype
+                    )
+                for aux_index in range(num_pp_proxy_aux_hidden_states):
+                    pp_proxy_tensors[f"aux_hidden_states_{aux_index}"] = torch.zeros(
+                        (max_num_token, hidden_size), dtype=dtype
                     )
             else:
                 pp_proxy_tensors = None
@@ -682,6 +687,7 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else 0
         )
+        num_pp_proxy_aux_hidden_states = self._num_pp_proxy_aux_hidden_states()
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -725,6 +731,7 @@ class CudaGraphRunner:
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
+            num_pp_proxy_aux_hidden_states=num_pp_proxy_aux_hidden_states,
         )
         self.buffers.share_buffers()
 
@@ -738,6 +745,25 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _num_pp_proxy_aux_hidden_states(self) -> int:
+        if (
+            self.pp_size <= 1
+            or self.model_runner.pp_rank == 0
+            or self.model_runner.is_draft_worker
+        ):
+            return 0
+
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        model = getattr(language_model, "model", None)
+        layers_to_capture = getattr(model, "layers_to_capture", None)
+        start_layer = getattr(model, "start_layer", None)
+        if not layers_to_capture or start_layer is None:
+            return 0
+
+        return sum(1 for layer_id in layers_to_capture if layer_id < start_layer)
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -1379,11 +1405,18 @@ class CudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                mm_input_embeds=(
+                    output.mm_input_embeds[: self.raw_num_token]
+                    if output.mm_input_embeds is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

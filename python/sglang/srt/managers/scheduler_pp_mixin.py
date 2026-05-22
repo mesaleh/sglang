@@ -24,6 +24,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -1270,11 +1271,30 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
-        tensor_dict = {
-            "next_token_ids": result.next_token_ids,
-        }
+        tensor_dict = {}
 
-        if batch.return_logprob:
+        if result.next_token_ids is not None:
+            tensor_dict["next_token_ids"] = result.next_token_ids
+
+        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+            logits_output = result.logits_output
+            if logits_output is not None:
+                if logits_output.next_token_logits is not None:
+                    tensor_dict["spec_next_token_logits"] = (
+                        logits_output.next_token_logits
+                    )
+                if logits_output.hidden_states is not None:
+                    tensor_dict["spec_hidden_states"] = logits_output.hidden_states
+                if logits_output.mm_input_embeds is not None:
+                    tensor_dict["spec_mm_input_embeds"] = (
+                        logits_output.mm_input_embeds
+                    )
+
+        if batch.return_logprob and not (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and batch.forward_mode.is_target_verify()
+        ):
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
                 **tensor_dict,
@@ -1399,17 +1419,45 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
 
-        if batch.return_logprob:
+        if batch.return_logprob and not (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and batch.forward_mode.is_target_verify()
+        ):
             (
                 logits_output,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.output_ids = pp_outputs["next_token_ids"]
+
+        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+            if logits_output is None:
+                logits_output = LogitsProcessorOutput(
+                    next_token_logits=pp_outputs.tensors.get(
+                        "spec_next_token_logits"
+                    ),
+                    hidden_states=pp_outputs.tensors.get("spec_hidden_states"),
+                    mm_input_embeds=pp_outputs.tensors.get("spec_mm_input_embeds"),
+                )
+            else:
+                logits_output.next_token_logits = pp_outputs.tensors.get(
+                    "spec_next_token_logits"
+                )
+                logits_output.hidden_states = pp_outputs.tensors.get(
+                    "spec_hidden_states"
+                )
+                logits_output.mm_input_embeds = pp_outputs.tensors.get(
+                    "spec_mm_input_embeds"
+                )
+
+        next_token_ids = pp_outputs.tensors.get("next_token_ids")
+        if next_token_ids is not None:
+            batch.output_ids = next_token_ids
+
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
-            next_token_ids=pp_outputs["next_token_ids"],
+            next_token_ids=next_token_ids,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1419,6 +1467,15 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+            if not hasattr(self.model_worker, "process_pp_batch_result"):
+                raise RuntimeError(
+                    "Pipeline parallel speculative decoding requires the "
+                    "draft worker to implement process_pp_batch_result."
+                )
+            output_result = self.model_worker.process_pp_batch_result(
+                batch, output_result
+            )
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(

@@ -2266,6 +2266,7 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
+        prev_aux_hidden_states = []
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -2276,6 +2277,14 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            if "mm_input_embeds" in pp_proxy_tensors.tensors:
+                forward_batch.mm_input_embeds = pp_proxy_tensors["mm_input_embeds"]
+            aux_index = 0
+            while f"aux_hidden_states_{aux_index}" in pp_proxy_tensors.tensors:
+                prev_aux_hidden_states.append(
+                    pp_proxy_tensors[f"aux_hidden_states_{aux_index}"]
+                )
+                aux_index += 1
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -2369,12 +2378,20 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        if prev_aux_hidden_states:
+            aux_hidden_states = prev_aux_hidden_states + aux_hidden_states
+
         if not self.pp_group.is_last_rank:
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if forward_batch.mm_input_embeds is not None:
+                proxy_tensors["mm_input_embeds"] = forward_batch.mm_input_embeds
+            for aux_index, aux_hidden_state in enumerate(aux_hidden_states):
+                proxy_tensors[f"aux_hidden_states_{aux_index}"] = aux_hidden_state
             return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
+                proxy_tensors
             )
         else:
             if not forward_batch.forward_mode.is_idle():
@@ -2549,7 +2566,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and not isinstance(
+            hidden_states, PPProxyTensors
+        ):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
@@ -2590,9 +2609,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers

@@ -30,6 +30,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
@@ -174,26 +175,46 @@ class EAGLEWorker(TpModelWorker):
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
+            load_lm_head_from_target = (
                 hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
                 and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            )
+            if self.server_args.pp_size > 1 and not load_lm_head_from_target:
+                embed = head = None
+                logger.info(
+                    "PP EAGLE3 draft keeps checkpoint embedding/head because target "
+                    "embedding/head are partitioned across PP stages."
+                )
             else:
+                embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+
+            if load_lm_head_from_target:
+                if self.server_args.pp_size > 1:
+                    raise RuntimeError(
+                        "PP EAGLE3 draft models that load lm_head from the target are "
+                        "not supported because target embedding/head are partitioned "
+                        "across PP stages."
+                    )
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            elif embed is not None:
                 self.draft_model_runner.model.set_embed(embed)
 
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                hot_token_device = (
                     embed.device
+                    if embed is not None
+                    else next(self.draft_model_runner.model.parameters()).device
+                )
+                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                    hot_token_device
                 )
 
         else:
+            embed, head = self.target_worker.model_runner.model.get_embed_and_head()
             if self.hot_token_id is not None:
                 head = head.clone()
                 self.hot_token_id = self.hot_token_id.to(head.device)
@@ -442,7 +463,11 @@ class EAGLEWorker(TpModelWorker):
     def draft_model_runner(self):
         return self.model_runner
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> GenerationBatchResult:
         """Run speculative decoding forward.
 
         NOTE: Many states of batch is modified as you go through. It is not guaranteed that
@@ -454,6 +479,9 @@ class EAGLEWorker(TpModelWorker):
             A tuple of the final logit output of the target model, next tokens accepted,
             the batch id (used for overlap schedule), and number of accepted tokens.
         """
+        if self.server_args.pp_size > 1:
+            return self.forward_batch_generation_pp(batch, pp_proxy_tensors)
+
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             (
                 logits_output,
@@ -549,6 +577,134 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
+    def forward_batch_generation_pp(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> GenerationBatchResult:
+        """Run the local PP stage for spec-v1 EAGLE.
+
+        The PP scheduler forwards the final-stage logits/hidden states around
+        the PP ring; process_pp_batch_result() then performs verify and draft
+        cache updates on every stage so request and KV state stay in sync.
+        """
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            batch_result, _ = self._forward_target_extend_result(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+            return batch_result
+
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            verify_input = self.draft(batch)
+
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
+        batch.spec_info = verify_input
+        (
+            model_worker_batch,
+            seq_lens_pre_verify,
+            grammar_state,
+        ) = self.prepare_target_verify_batch(batch)
+        batch.pp_spec_seq_lens_pre_verify = seq_lens_pre_verify
+        batch.pp_spec_grammar_state = grammar_state
+
+        return self.target_worker.forward_batch_generation(
+            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors, is_verify=True
+        )
+
+    def process_pp_batch_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_target_verify():
+            return self.process_pp_verify_result(batch, result)
+
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            logits_output = result.logits_output
+            if logits_output is None or result.next_token_ids is None:
+                raise RuntimeError(
+                    "PP speculative extend requires target hidden states and "
+                    "next_token_ids from the last pipeline stage."
+                )
+            with (
+                self.draft_tp_context(self.draft_model_runner.tp_group),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self.forward_draft_extend(
+                    batch,
+                    logits_output.hidden_states,
+                    result.next_token_ids,
+                    batch.seq_lens_cpu,
+                    logits_output.mm_input_embeds,
+                )
+            return result
+
+        return result
+
+    def process_pp_verify_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if result.logits_output is None:
+            raise RuntimeError(
+                "PP speculative verify requires logits from the last pipeline stage."
+            )
+
+        logits_output, verify_output, can_run_cuda_graph = self.finalize_target_verify(
+            batch,
+            result.logits_output,
+            result.can_run_cuda_graph,
+            batch.pp_spec_seq_lens_pre_verify,
+            batch.pp_spec_grammar_state,
+        )
+
+        if get_global_tracing_enabled():
+            for idx, req in enumerate(batch.reqs):
+                num_correct_drafts = verify_output.num_correct_drafts_per_req_cpu[idx]
+                req.time_stats.set_spec_verify_end_time(
+                    num_correct_drafts=num_correct_drafts
+                )
+
+        set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+
+        with (
+            self.draft_tp_context(self.draft_model_runner.tp_group),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            draft_extend_input = verify_output.draft_extend_input
+            if (
+                self.server_args.enable_dp_attention
+                or draft_extend_input.input_ids.shape[0] > 0
+            ):
+                batch.spec_info = draft_extend_input
+                next_draft_input = self.forward_draft_extend_after_decode(batch)
+                batch.spec_info = next_draft_input
+            else:
+                self._draft_preprocess_idle(batch)
+
+        set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
+
+        if self.adaptive_controller is not None:
+            self.adaptive_controller.on_verify_complete(
+                verify_output.num_correct_drafts_per_req_cpu
+            )
+
+        result.logits_output = logits_output
+        result.next_token_ids = verify_output.accept_tokens
+        result.num_correct_drafts = sum(verify_output.num_correct_drafts_per_req_cpu)
+        result.num_correct_drafts_per_req_cpu = (
+            verify_output.num_correct_drafts_per_req_cpu
+        )
+        result.can_run_cuda_graph = can_run_cuda_graph
+        return result
+
     def check_forward_draft_extend_after_decode(self, verify_output: EagleVerifyOutput):
         local_need_forward = verify_output.draft_extend_input.input_ids.shape[0] > 0
         if not self.server_args.enable_dp_attention:
@@ -567,6 +723,25 @@ class EAGLEWorker(TpModelWorker):
         need_forward = global_need_forward_cnt > 0
         return need_forward
 
+    def _forward_target_extend_result(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Tuple[GenerationBatchResult, Optional[torch.Tensor]]:
+        # Forward with the target model and get hidden states.
+        # We need the full hidden states to prefill the KV cache of the draft model.
+        model_worker_batch = batch.get_model_worker_batch()
+        capture_mode = (
+            CaptureHiddenMode.NULL
+            if self.speculative_algorithm.is_standalone()
+            else CaptureHiddenMode.FULL
+        )
+        model_worker_batch.capture_hidden_mode = capture_mode
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+        )
+        return batch_result, model_worker_batch.seq_lens_cpu
+
     def forward_target_extend(
         self, batch: ScheduleBatch
     ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
@@ -581,16 +756,7 @@ class EAGLEWorker(TpModelWorker):
             seq_lens_cpu: CPU copy of sequence lengths for the draft prefill path.
             can_run_cuda_graph: Whether the target prefill ran with cuda graph.
         """
-        # Forward with the target model and get hidden states.
-        # We need the full hidden states to prefill the KV cache of the draft model.
-        model_worker_batch = batch.get_model_worker_batch()
-        capture_mode = (
-            CaptureHiddenMode.NULL
-            if self.speculative_algorithm.is_standalone()
-            else CaptureHiddenMode.FULL
-        )
-        model_worker_batch.capture_hidden_mode = capture_mode
-        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        batch_result, seq_lens_cpu = self._forward_target_extend_result(batch)
         logits_output, next_token_ids = (
             batch_result.logits_output,
             batch_result.next_token_ids,
@@ -598,7 +764,7 @@ class EAGLEWorker(TpModelWorker):
         return (
             logits_output,
             next_token_ids,
-            model_worker_batch.seq_lens_cpu,
+            seq_lens_cpu,
             batch_result.can_run_cuda_graph,
         )
 
@@ -932,7 +1098,7 @@ class EAGLEWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
-    def verify(self, batch: ScheduleBatch):
+    def prepare_target_verify_batch(self, batch: ScheduleBatch):
         spec_info: EagleVerifyInput = batch.spec_info
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
@@ -949,24 +1115,38 @@ class EAGLEWorker(TpModelWorker):
         )
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
+        grammar_state = None
         if batch.has_grammar:
             retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
             retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
                 spec_info.retrieve_next_token.shape
             ).cpu()
+            grammar_state = (
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+            )
 
-        # Forward
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
-        )
-        logits_output, can_run_cuda_graph = (
-            batch_result.logits_output,
-            batch_result.can_run_cuda_graph,
-        )
+        return model_worker_batch, seq_lens_pre_verify, grammar_state
+
+    def finalize_target_verify(
+        self,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        can_run_cuda_graph: bool,
+        seq_lens_pre_verify: torch.Tensor,
+        grammar_state=None,
+    ):
+        spec_info: EagleVerifyInput = batch.spec_info
 
         vocab_mask = None
         if batch.has_grammar:
+            (
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+            ) = grammar_state
             # Generate the logit mask for structured output.
             # Overlap the CPU operations for bitmask generation with the forward pass.
             vocab_mask = generate_token_bitmask(
@@ -1024,6 +1204,30 @@ class EAGLEWorker(TpModelWorker):
         )
 
         return logits_output, res, can_run_cuda_graph
+
+    def verify(self, batch: ScheduleBatch):
+        (
+            model_worker_batch,
+            seq_lens_pre_verify,
+            grammar_state,
+        ) = self.prepare_target_verify_batch(batch)
+
+        # Forward
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
+
+        return self.finalize_target_verify(
+            batch,
+            logits_output,
+            can_run_cuda_graph,
+            seq_lens_pre_verify,
+            grammar_state,
+        )
 
     def _mamba_verify_update(
         self,

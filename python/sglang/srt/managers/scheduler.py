@@ -3068,11 +3068,9 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                kwargs = (
-                    {"pp_proxy_tensors": pp_proxy_tensors}
-                    if self.spec_algorithm.is_none()
-                    else {}
-                )
+                kwargs = {}
+                if self.spec_algorithm.is_none() or self.pp_size > 1:
+                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 batch_result = self.model_worker.forward_batch_generation(
                     worker_batch_or_batch, **kwargs
                 )
