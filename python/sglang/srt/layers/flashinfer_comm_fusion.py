@@ -34,6 +34,7 @@ _flashinfer_allreduce_unavailable = False
 _flashinfer_create_workspace_supports_group = False
 _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
+_flashinfer_allreduce_supports_pre_allreduce_add = False
 _posix_transport_override_logged = False
 
 
@@ -120,6 +121,9 @@ if is_flashinfer_available():
             )
             _flashinfer_allreduce_supports_trigger_completion = (
                 "trigger_completion_at_end" in allreduce_params
+            )
+            _flashinfer_allreduce_supports_pre_allreduce_add = (
+                "pre_allreduce_add" in allreduce_params
             )
         else:
             _flashinfer_allreduce_unavailable = True
@@ -400,9 +404,14 @@ class FlashInferWorkspaceManager:
                 force_oneshot_support=bool(use_oneshot),
             )
             create_workspace = _flashinfer_comm.create_allreduce_fusion_workspace
-            if _flashinfer_create_workspace_supports_group:
+            if (
+                _flashinfer_create_workspace_supports_group
+                and device_group is not None
+            ):
                 # Pin the symmetric-memory rendezvous to the actual subgroup.
-                # Older FlashInfer releases only support comm_backend.
+                # Without this, flashinfer >=0.6.10 falls back to WORLD and
+                # TP/EP/CP subgroup peers get addressed incorrectly. Older
+                # FlashInfer releases only support comm_backend.
                 kwargs["group"] = device_group
             if (
                 _TorchDistBackend is not None
@@ -549,12 +558,17 @@ def ensure_workspace_initialized(
             rank = get_moe_tensor_parallel_rank()
             coordinator = get_moe_tp_group()
 
-    # Always pass the coordinator's groups: flashinfer >=0.6.10 reads the
-    # rendezvous group from `group=...` (falling back to WORLD when None),
-    # so leaving it None silently rendezvouses on WORLD and the kernel ends
-    # up addressing the wrong peers in TP/EP/CP subgroup setups.
-    device_group = coordinator.device_group
-    cpu_group = coordinator.cpu_group
+    tp_coordinator = get_tp_group()
+    # For the full TP group, keep FlashInfer's default process-group fast
+    # path. Passing an explicit full-TP group adds measurable GB200 decode
+    # overhead. True subgroups still need an explicit group so flashinfer
+    # >=0.6.10 does not rendezvous on WORLD and address the wrong peers.
+    if coordinator.device_group is tp_coordinator.device_group:
+        device_group = None
+        cpu_group = None
+    else:
+        device_group = coordinator.device_group
+        cpu_group = coordinator.cpu_group
 
     if world_size <= 1:
         return False
@@ -595,6 +609,7 @@ def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
+    pre_allreduce_addition: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     max_token_num: int = 16384,
     use_oneshot: Optional[bool] = None,
@@ -615,6 +630,7 @@ def flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
     weight: torch.Tensor,
+    pre_allreduce_addition: Optional[torch.Tensor] = None,
     eps: float = 1e-6,
     max_token_num: int = 2048,
     use_oneshot: Optional[bool] = None,
@@ -665,8 +681,22 @@ def flashinfer_allreduce_residual_rmsnorm(
         not input_tensor.is_contiguous()
         or not residual.is_contiguous()
         or not weight.is_contiguous()
+        or (
+            pre_allreduce_addition is not None
+            and not pre_allreduce_addition.is_contiguous()
+        )
     ):
         logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
+        return None, None
+
+    if (
+        pre_allreduce_addition is not None
+        and not _flashinfer_allreduce_supports_pre_allreduce_add
+    ):
+        logger.debug(
+            "FlashInfer allreduce_fusion does not support pre_allreduce_add, "
+            "skipping allreduce fusion"
+        )
         return None, None
 
     if not ensure_workspace_initialized(
@@ -699,6 +729,8 @@ def flashinfer_allreduce_residual_rmsnorm(
     )
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
+    if pre_allreduce_addition is not None:
+        kwargs["pre_allreduce_add"] = pre_allreduce_addition
     _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out

@@ -157,7 +157,10 @@ def _fused_rmsnorm_fp8_per_token_quant(
 
 # TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
 # We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
-FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+# Keep the stock default, but allow GB200/H100 latency sweeps without source edits.
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = max(
+    1, envs.SGLANG_FLASHINFER_ALLREDUCE_FUSION_MAX_TOKENS.get()
+)
 
 
 def apply_flashinfer_allreduce_fusion(batch_size: int):
@@ -534,7 +537,14 @@ class LayerCommunicator:
                 ) and hasattr(self.input_layernorm, "forward_with_allreduce_fusion"):
                     hidden_states, residual = (
                         self.input_layernorm.forward_with_allreduce_fusion(
-                            hidden_states, residual, use_attn_tp_group=False
+                            hidden_states,
+                            residual,
+                            use_attn_tp_group=False,
+                            pre_allreduce_addition=getattr(
+                                hidden_states,
+                                "_sglang_pre_allreduce_addition",
+                                None,
+                            ),
                         )
                     )
                 else:

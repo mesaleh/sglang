@@ -27,6 +27,7 @@ else:
         cutlass_mla_decode,
         cutlass_mla_get_workspace_size,
         merge_state_v2,
+        stage_tq_mla_pages_to_physical,
     )
     from sgl_kernel.cutlass_moe import (
         cutlass_w4a8_moe_mm,
@@ -197,6 +198,7 @@ else:
         "sgl_per_token_quant_fp8",
         "shuffle_rows",
         "silu_and_mul",
+        "stage_tq_mla_pages_to_physical",
         "top_k_renorm_prob",
         "top_p_renorm_prob",
         "topk_sigmoid",

@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    MLATokenToKVPoolTurboQuant,
     NoOpMHATokenToKVPool,
     ReqToTokenPool,
 )
@@ -577,7 +578,27 @@ class ModelRunnerKVCacheMixin:
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
-            if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+            if hasattr(self, "turboquant_bits"):
+                # MLA + TurboQuant: compressed nope + raw rope + per-token scale.
+                # The pool class itself enforces k_bits == 4 (raises otherwise),
+                # matching the sizing assumption in pool_configurator.py.
+                self.token_to_kv_pool = MLATokenToKVPoolTurboQuant(
+                    self.max_total_num_tokens,
+                    page_size=self.page_size,
+                    dtype=self.kv_cache_dtype,
+                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                    layer_num=self.num_effective_layers,
+                    device=self.device,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    turboquant_bits=self.turboquant_bits,
+                    turboquant_k_bits=getattr(self, "turboquant_k_bits", 0),
+                    turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
+                    turboquant_uniform=getattr(self, "turboquant_uniform", False),
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                )
+            elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -617,6 +638,50 @@ class ModelRunnerKVCacheMixin:
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
                     }
+                # TurboQuant + hybrid SWA: pass MHATokenToKVPoolTurboQuant as
+                # the sub-pool class so both the full and swa pools inside
+                # SWAKVPool are packed 4-bit. SWAKVPool exposes get_tq_*
+                # passthroughs so the attention fast paths in
+                # triton_backend.py reach the right sub-pool without
+                # knowing about the SWA layout. Without this branch,
+                # SWAKVPool would default to plain MHATokenToKVPool and
+                # --kv-cache-dtype turboquant_4bit would silently downgrade
+                # to bf16 (since the attention backends look up tq_config
+                # on the pool and get None).
+                pool_class_kwargs = {}
+                if hasattr(self, "turboquant_bits"):
+                    # is_hybrid_swa_compress models (e.g. Gemma4) add
+                    # swa_head_num / swa_head_dim / swa_v_head_dim kwargs
+                    # that MHATokenToKVPoolTurboQuant's __init__ doesn't
+                    # accept. Fail loudly rather than passing them through
+                    # and getting an unhelpful TypeError deep inside pool
+                    # init. Adding TQ support for compress-SWA models
+                    # would need MHATokenToKVPoolTurboQuant to accept
+                    # asymmetric SWA head dims — a separate piece of work.
+                    assert not self.is_hybrid_swa_compress, (
+                        "TurboQuant with is_hybrid_swa_compress (Gemma4, MiMoV2Flash, "
+                        "Step3p5) is not yet supported. The MHATokenToKVPoolTurboQuant "
+                        "__init__ does not accept swa_head_num / swa_head_dim / "
+                        "swa_v_head_dim. Remove --kv-cache-dtype turboquant_* or use "
+                        "a non-compress-SWA model (e.g. GptOssForCausalLM)."
+                    )
+                    from sglang.srt.mem_cache.memory_pool import (
+                        MHATokenToKVPoolTurboQuant,
+                    )
+
+                    pool_class_kwargs["token_to_kv_pool_class"] = (
+                        MHATokenToKVPoolTurboQuant
+                    )
+                    kwargs.update(
+                        {
+                            "turboquant_bits": self.turboquant_bits,
+                            "turboquant_k_bits": getattr(self, "turboquant_k_bits", 0),
+                            "turboquant_v_bits": getattr(self, "turboquant_v_bits", 0),
+                            "turboquant_uniform": getattr(
+                                self, "turboquant_uniform", False
+                            ),
+                        }
+                    )
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
                     size_swa=self.swa_max_total_num_tokens,
@@ -633,6 +698,7 @@ class ModelRunnerKVCacheMixin:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
+                    **pool_class_kwargs,
                     **kwargs,
                 )
             elif config := self.mambaish_config:
@@ -672,7 +738,30 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if hasattr(self, "turboquant_bits"):
+                    from sglang.srt.mem_cache.memory_pool import (
+                        MHATokenToKVPoolTurboQuant,
+                    )
+
+                    self.token_to_kv_pool = MHATokenToKVPoolTurboQuant(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        turboquant_bits=self.turboquant_bits,
+                        turboquant_k_bits=getattr(self, "turboquant_k_bits", 0),
+                        turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
+                        turboquant_uniform=getattr(self, "turboquant_uniform", False),
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

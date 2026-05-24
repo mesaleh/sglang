@@ -1575,6 +1575,240 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             self.v_scale_buffer[layer_id - self.start_layer][loc] = cache_v_fp4_sf
 
 
+class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
+    """TurboQuant KV cache: WHT rotation + optimal scalar quantization.
+
+    Stores KV as packed uint8 indices + bf16 dequant scales.
+    Fused decode/extend kernels read packed KV directly — no dequant buffer needed.
+
+    Memory layout:
+      - Per-layer: k/v_buffer (uint8), k/v_dequant_scale_buffer (bf16)
+      - Shared: _quant_kv_unit, _quant_kv_norms (small pre-alloc for CUDA graph)
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        turboquant_bits: int = 4,
+        turboquant_k_bits: int = 0,
+        turboquant_v_bits: int = 0,
+        turboquant_uniform: bool = False,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        self.turboquant_bits = turboquant_bits
+        from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+        k_bits = turboquant_k_bits or turboquant_bits
+        v_bits = turboquant_v_bits or turboquant_bits
+        self.tq_config = TurboQuantConfig(
+            bit_width=turboquant_bits,
+            head_dim=head_dim,
+            device=device,
+            k_bit_width=k_bits,
+            v_bit_width=v_bits,
+            uniform=turboquant_uniform,
+        )
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            v_head_dim=v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=False,
+            enable_kv_cache_copy=False,
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+
+                # Packed quantized indices (K and V may have different dim/dtype)
+                self.k_buffer = [
+                    torch.zeros(
+                        (m, self.head_num, self.tq_config.k_packed_dim),
+                        dtype=self.tq_config.k_packed_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_buffer = [
+                    torch.zeros(
+                        (m, self.head_num, self.tq_config.v_packed_dim),
+                        dtype=self.tq_config.v_packed_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # Per-vector dequant scale: norm / max(quant_norm, eps)
+                # Precomputed at quantize time to save 2 loads + 1 div in decode kernel
+                self.k_dequant_scale_buffer = [
+                    torch.zeros(
+                        (m, self.head_num),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.v_dequant_scale_buffer = [
+                    torch.zeros(
+                        (m, self.head_num),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # Pre-allocated buffers for quantize path (avoids torch.empty inside CUDA graph)
+                max_bs = 256  # matches cuda_graph_max_bs default
+                self._quant_kv_unit = torch.empty(
+                    2 * max_bs, self.head_num, self.head_dim, dtype=torch.float32, device=self.device
+                )
+                self._quant_kv_norms = torch.empty(
+                    2 * max_bs, self.head_num, dtype=torch.float32, device=self.device
+                )
+
+        # data_ptrs / data_strides — point to packed buffers (per-layer)
+        self.k_data_ptrs = torch.tensor(
+            [self.k_buffer[i].data_ptr() for i in range(self.layer_num)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.v_data_ptrs = torch.tensor(
+            [self.v_buffer[i].data_ptr() for i in range(self.layer_num)],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        k_stride = int(np.prod(self.k_buffer[0].shape[1:])) * self.k_buffer[0].dtype.itemsize
+        v_stride = int(np.prod(self.v_buffer[0].shape[1:])) * self.v_buffer[0].dtype.itemsize
+        self.data_strides = torch.tensor(
+            [k_stride] * self.layer_num + [v_stride] * self.layer_num,
+            device=self.device,
+        )
+
+    def _clear_buffers(self):
+        del self.k_buffer
+        del self.v_buffer
+        del self.k_dequant_scale_buffer
+        del self.v_dequant_scale_buffer
+        del self._quant_kv_unit
+        del self._quant_kv_norms
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
+        layer_id_override: Optional[int] = None,
+        k_pre_rotated: bool = False,
+    ):
+        from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+            fused_turboquant_quantize_and_store_kv,
+        )
+
+        if layer_id_override is not None:
+            layer_id = layer_id_override
+        else:
+            layer_id = layer.layer_id
+        idx = layer_id - self.start_layer
+
+        cfg = self.tq_config
+
+        # Quantize K+V with batched norm+WHT, using pre-allocated buffers
+        fused_turboquant_quantize_and_store_kv(
+            cache_k, cache_v,
+            cfg.signs1, cfg.signs2,
+            cfg.k_centroids, cfg.k_boundaries, cfg.k_bit_width,
+            cfg.v_centroids, cfg.v_boundaries, cfg.v_bit_width,
+            self.k_buffer[idx], self.k_dequant_scale_buffer[idx],
+            self.v_buffer[idx], self.v_dequant_scale_buffer[idx],
+            loc,
+            pre_kv_unit=self._quant_kv_unit,
+            pre_kv_norms=self._quant_kv_norms,
+        )
+
+    def _get_key_buffer(self, layer_id: int):
+        raise NotImplementedError(
+            "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
+            "Dequant buffer path not supported. Attention backends should use "
+            "get_v_head_dim() for shape probes instead of get_key_buffer(0).shape[-1]."
+        )
+
+    def _get_value_buffer(self, layer_id: int):
+        raise NotImplementedError(
+            "TurboQuant uses fused decode/extend kernels that read packed KV directly. "
+            "Dequant buffer path not supported. Attention backends should use "
+            "get_v_head_dim() for shape probes instead of get_value_buffer(0).shape[-1]."
+        )
+
+    # Pool-agnostic accessors for the TurboQuant fast path in
+    # triton_backend.py. A flat pool just indexes its own per-layer lists;
+    # SWAKVPool implements the same interface and dispatches into the
+    # full/swa sub-pool via layers_mapping. Keeps the backend code pool-
+    # agnostic so adding new hybrid pool types does not require changes in
+    # the decode dispatch.
+    def get_tq_k_buffer(self, layer_id: int):
+        return self.k_buffer[layer_id - self.start_layer]
+
+    def get_tq_v_buffer(self, layer_id: int):
+        return self.v_buffer[layer_id - self.start_layer]
+
+    def get_tq_k_dequant_scale(self, layer_id: int):
+        return self.k_dequant_scale_buffer[layer_id - self.start_layer]
+
+    def get_tq_v_dequant_scale(self, layer_id: int):
+        return self.v_dequant_scale_buffer[layer_id - self.start_layer]
+
+    def get_v_head_dim(self):
+        return self.head_dim
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        for i in range(self.layer_num):
+            self.k_buffer[i][tgt_loc] = self.k_buffer[i][src_loc]
+            self.v_buffer[i][tgt_loc] = self.v_buffer[i][src_loc]
+            self.k_dequant_scale_buffer[i][tgt_loc] = self.k_dequant_scale_buffer[i][src_loc]
+            self.v_dequant_scale_buffer[i][tgt_loc] = self.v_dequant_scale_buffer[i][src_loc]
+
+    def get_kv_size_bytes(self):
+        """GPU memory used by TurboQuant K/V buffers, returned as
+        (k_size, v_size) to match the parent MHATokenToKVPool contract.
+
+        Dequant-scale buffers are charged against the K and V sides
+        respectively so SWAKVPool.get_kv_size_bytes (which sums the two
+        ints from each sub-pool) reports a total that includes them.
+        """
+        k_size = 0
+        v_size = 0
+        for i in range(self.layer_num):
+            k_size += self.k_buffer[i].nbytes + self.k_dequant_scale_buffer[i].nbytes
+            v_size += self.v_buffer[i].nbytes + self.v_dequant_scale_buffer[i].nbytes
+        return k_size, v_size
+
+
 class HybridLinearKVPool(KVCache):
     """KV cache with separate pools for full and linear attention layers."""
 
@@ -2052,6 +2286,15 @@ class MLATokenToKVPool(KVCache):
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
         current_platform.synchronize()
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_cache in self.kv_buffer:
+            kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
+
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def _create_buffers(self):
@@ -2090,6 +2333,17 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
     def _clear_buffers(self):
         del self.kv_buffer
         del self.kv_scale_buffer
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        super().move_kv_cache(tgt_loc, src_loc)
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for kv_scale_cache in self.kv_scale_buffer:
+            kv_scale_cache[tgt_loc_flat] = kv_scale_cache[src_loc_flat]
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
@@ -2184,6 +2438,853 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_rope_fp4_sf,
             )
 
+
+class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
+    """TurboQuant KV cache for MLA (DeepSeek-V2/V3, Kimi K2-family) models.
+
+    MLA stores a shared latent per token of shape (kv_lora_rank + qk_rope_head_dim).
+    For Kimi K2.6: kv_lora_rank=512, qk_rope_head_dim=64, total=576.
+
+    Design:
+      - NOPE half (kv_lora_rank = 512): compressed via WHT rotation + k-bit
+        scalar quantization (TurboQuant, paper arXiv:2504.19874).
+      - ROPE half (qk_rope_head_dim = 64): stored UNCOMPRESSED in bfloat16.
+        Rotary phase does not tolerate random rotation; skipping it is the
+        safe default (closed PR #21628 reached the same conclusion via
+        SGLANG_KV_CACHE_TURBOQUANT_ROPE=0).
+
+    Effective compression at 4-bit nope, bf16 rope:
+        (lora_rank * 4 bits + rope_dim * 16 bits + scale overhead) /
+        ((lora_rank + rope_dim) * 16 bits)
+      = (512 * 0.5 + 64 * 2 + 2) B  /  (576 * 2 B)
+      = 386 / 1152  ≈  0.335  → ~3x compression vs bf16, ~1.5x vs fp8.
+
+    Storage layout (per layer):
+      - kv_nope_packed_buffer: (size+page, 1, lora_rank // 2) uint8
+          packed 4-bit nope indices (2 values per byte at 4-bit)
+      - kv_nope_scale_buffer: (size+page, 1) bfloat16
+          one dequant-scale (norm / max(qnorm, eps)) per token
+      - kv_rope_buffer: (size+page, 1, qk_rope_head_dim) bfloat16
+          raw rope values
+
+    Correctness approach:
+      This class overrides get_key_buffer / get_value_buffer / get_mla_kv_buffer
+      to dequantize on-demand into bf16 tensors with the same shapes attention
+      backends currently expect. No attention-backend changes required to boot.
+      Performance cost: dequant runs every attention call rather than once.
+      Acceptable for a first-cut validation; G3 (backend integration) will
+      add fused paths later.
+    """
+
+    is_mla_turboquant_pool = True
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        turboquant_bits: int = 4,
+        turboquant_k_bits: int = 0,
+        turboquant_v_bits: int = 0,
+        turboquant_uniform: bool = False,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        # For MLA, V is derived from the same latent as K (no separate V buffer).
+        # We honor turboquant_v_bits for API symmetry with the MHA pool, but
+        # apply a single bit_width to the nope-half latent.
+        # If the caller asked for asymmetric K/V bits, we warn and use K bits.
+        k_bits = turboquant_k_bits or turboquant_bits
+        v_bits = turboquant_v_bits or turboquant_bits
+        if v_bits != k_bits:
+            logger.warning(
+                "MLA TurboQuant: asymmetric K/V bits not meaningful (single "
+                "shared latent). Using k_bits=%d for the nope-half; ignoring "
+                "v_bits=%d.",
+                k_bits,
+                v_bits,
+            )
+        if k_bits != 4:
+            # 2-bit path is not yet wired for MLA; guard explicitly.
+            raise NotImplementedError(
+                f"MLA TurboQuant currently supports only 4-bit; got {k_bits}."
+            )
+        self.turboquant_bits = k_bits
+
+        # Build a TurboQuantConfig for the NOPE dim only. The WHT sign vectors
+        # and codebook all key off this dim; RoPE is stored raw, so no config
+        # is needed for it.
+        from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+        self.tq_config = TurboQuantConfig(
+            bit_width=k_bits,
+            head_dim=kv_lora_rank,
+            device=device,
+            k_bit_width=k_bits,
+            v_bit_width=k_bits,
+            uniform=turboquant_uniform,
+        )
+
+        # Guard: dim constraints for packing (2 values per byte at 4-bit).
+        # kv_lora_rank must be even. For Kimi K2.6 it is 512 (even).
+        if kv_lora_rank % 2 != 0:
+            raise ValueError(
+                f"MLA TurboQuant 4-bit requires kv_lora_rank even; got {kv_lora_rank}."
+            )
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+
+        # Zero-guard thresholds for the dequant-scale division. Matches the
+        # PR #23135 fused Triton kernel semantics exactly:
+        #   safe_qnorm = tl.where(qnorm > 1e-10, qnorm, 1.0)
+        #   dscale     = norm / safe_qnorm
+        # We use torch.where (NOT torch.maximum) so that when qnorm is tiny
+        # we REPLACE it with 1.0 (not clamp to some eps). Using torch.maximum
+        # with eps=1e-6 would divide by 1e-6 and produce huge dequant scales
+        # for near-zero quantized-vector norms — this was observed to
+        # produce garbage model output at end-to-end inference while still
+        # passing a cosine-similarity round-trip test.
+        self._qnorm_threshold = torch.tensor(
+            1e-10, dtype=torch.bfloat16, device=self.device
+        )
+        self._qnorm_replacement = torch.tensor(
+            1.0, dtype=torch.bfloat16, device=self.device
+        )
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                lora = self.kv_lora_rank
+                rope = self.qk_rope_head_dim
+                packed_dim = lora // 2  # 4-bit: 2 values per byte
+
+                # Packed nope: uint8, 2 x 4-bit values per byte.
+                self.kv_nope_packed_buffer = [
+                    torch.zeros(
+                        (m, 1, packed_dim),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # Per-token dequant scale for nope (norm / max(quant_norm, eps)).
+                # Stored as bf16 to match MHA pool convention.
+                self.kv_nope_scale_buffer = [
+                    torch.zeros(
+                        (m, 1),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+                # RoPE stored uncompressed in bf16 (raw rotary values).
+                self.kv_rope_buffer = [
+                    torch.zeros(
+                        (m, 1, rope),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        workspace_tokens = max(1, envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.get())
+        self._tq_mla_kv_write_unit = torch.empty(
+            (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
+        )
+        self._tq_mla_kv_write_norms = torch.empty(
+            (workspace_tokens, 1), dtype=torch.float32, device=self.device
+        )
+        self._tq_mla_kv_write_y = torch.empty(
+            (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
+        )
+
+        # The parent MLATokenToKVPool.__init__ reads `self.kv_buffer` to build
+        # data_ptrs after _create_buffers returns. We don't have a single
+        # per-layer fused KV buffer, so alias kv_buffer to the packed nope
+        # buffer — external consumers that index data_ptrs (e.g. disagg) will
+        # see pointers to the compressed nope storage. Clients that need the
+        # full bf16 KV layout should call get_mla_kv_buffer / get_key_buffer,
+        # which dequantize on demand.
+        self.kv_buffer = self.kv_nope_packed_buffer
+
+        if envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get():
+            self._warmup_mla_fused_kv_write()
+
+    def _clear_buffers(self):
+        # Clear the alias first (breaks the reference cycle before we drop
+        # the real buffers), then drop each underlying buffer.
+        if hasattr(self, "kv_buffer"):
+            del self.kv_buffer
+        del self.kv_nope_packed_buffer
+        del self.kv_nope_scale_buffer
+        del self.kv_rope_buffer
+        del self._tq_mla_kv_write_unit
+        del self._tq_mla_kv_write_norms
+        del self._tq_mla_kv_write_y
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for buffers in (
+            self.kv_nope_packed_buffer,
+            self.kv_nope_scale_buffer,
+            self.kv_rope_buffer,
+        ):
+            for cache in buffers:
+                cache[tgt_loc_flat] = cache[src_loc_flat]
+
+    def get_kv_size_bytes(self):
+        total = 0
+        for i in range(self.layer_num):
+            total += self.kv_nope_packed_buffer[i].nbytes
+            total += self.kv_nope_scale_buffer[i].nbytes
+            total += self.kv_rope_buffer[i].nbytes
+        return total
+
+    # ------------------------------------------------------------------
+    # On-demand dequant helpers
+    # ------------------------------------------------------------------
+
+    def _dequant_nope(
+        self,
+        packed: torch.Tensor,
+        dequant_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        """Dequantize packed nope indices back to original-domain bf16.
+
+        Matches the semantics of the PR #23135 fused decode kernel:
+          value = centroid[index] * dequant_scale     (in rotated domain)
+          out   = inverse_WHT(value)                  (original domain)
+
+        We deliberately do NOT use `batched_dequantize` from the
+        kv_turboquant module: that helper normalizes reconstructed vectors
+        to unit norm before scaling by its `norms` argument. Our stored
+        `dequant_scale` = norm / max(quant_norm, eps) already absorbs the
+        norm-correction step, so applying batched_dequantize's internal
+        y_hat_norm pass would double-normalize and produce wrong magnitudes.
+
+        Args:
+            packed: (n, 1, lora_rank // 2) uint8 packed 4-bit indices.
+            dequant_scale: (n, 1) bf16 per-token scale.
+
+        Returns:
+            (n, 1, lora_rank) bfloat16 in the original (un-rotated) domain.
+        """
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            batched_dequantize_rotspace,
+        )
+
+        cfg = self.tq_config
+
+        # Step 1: unpack + centroid-lookup + multiply by dequant_scale
+        # (this stays in WHT-rotated space, matches the fused kernel's math).
+        x_rot = batched_dequantize_rotspace(
+            packed,
+            dequant_scale,
+            cfg.k_centroids,
+            self.turboquant_bits,
+            head_dim=self.kv_lora_rank,
+        )  # (n, 1, lora_rank) bf16
+
+        # Step 2: inverse WHT back to the original domain.
+        # Forward was D2 @ H_norm @ D1; inverse is D1 @ H_norm @ D2.
+        # cfg.inverse_rotate_output fuses the (signs2 * H * signs1) path
+        # into a single CUDA kernel via hadamard_transform_with_signs.
+        # Matches the same transform used by the fused decode kernel's Q
+        # path, keeping decode-space and dequant-space consistent.
+        y = cfg.inverse_rotate_output(x_rot)
+        # inverse_rotate_output returns fp32 regardless of input dtype;
+        # cast back to bf16 for downstream attention consumers.
+        return y.to(torch.bfloat16)
+
+    def _dequant_nope_full(self, layer_id_rel: int) -> torch.Tensor:
+        """Full-pool dequant — used by get_key_buffer fallbacks.
+
+        Shape: (size+page, 1, kv_lora_rank), dtype bf16.
+        Expensive: runs inverse WHT over every slot in the pool.
+        """
+        packed = self.kv_nope_packed_buffer[layer_id_rel]  # (m, 1, packed_dim)
+        scale = self.kv_nope_scale_buffer[layer_id_rel]  # (m, 1)
+        return self._dequant_nope(packed, scale)
+
+    def _get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
+        """Reconstruct the (nope||rope) layout that the baseline MLA pool
+        exposes: shape (size+page, 1, lora_rank+rope_dim), dtype bf16.
+
+        This is the expensive path: full inverse WHT on the entire pool
+        per call. Use only where callers expect the combined layout.
+        """
+        layer_id_rel = layer_id - self.start_layer
+        nope = self._dequant_nope_full(layer_id_rel)  # (m, 1, lora)
+        rope = self.kv_rope_buffer[layer_id_rel]  # (m, 1, rope)
+        return torch.cat([nope, rope], dim=-1)  # (m, 1, lora+rope)
+
+    # ------------------------------------------------------------------
+    # Overrides of MLATokenToKVPool accessors
+    # ------------------------------------------------------------------
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._get_fused_kv_buffer(layer_id)
+
+    def get_value_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        # Baseline MLA returns kv_buffer[..., :kv_lora_rank] for V.
+        return self._dequant_nope_full(layer_id - self.start_layer)
+
+    def get_kv_buffer(self, layer_id: int):
+        return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        """Single-tensor write (split into nope/rope and route to MLA path)."""
+        # cache_k is the full (tokens, 1, lora+rope) latent in the MLA convention.
+        # cache_v is ignored (MLA reuses latent for V).
+        assert cache_k.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim, (
+            f"set_kv_buffer expected dim {self.kv_lora_rank + self.qk_rope_head_dim}; "
+            f"got {cache_k.shape[-1]}"
+        )
+        cache_k_nope = cache_k[..., : self.kv_lora_rank]
+        cache_k_rope = cache_k[..., self.kv_lora_rank:]
+        self.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+
+    def _can_use_fused_kv_write(
+        self,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> bool:
+        tokens = cache_k_nope.shape[0] if cache_k_nope.dim() > 0 else 0
+        return (
+            envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get()
+            and self.turboquant_bits == 4
+            and cache_k_nope.is_cuda
+            and cache_k_rope.is_cuda
+            and loc.is_cuda
+            and cache_k_nope.device == cache_k_rope.device
+            and cache_k_nope.device == loc.device
+            and cache_k_nope.dim() == 3
+            and cache_k_rope.dim() == 3
+            and cache_k_rope.shape[0] == cache_k_nope.shape[0]
+            and cache_k_nope.shape[1] == 1
+            and cache_k_rope.shape[1] == 1
+            and cache_k_nope.shape[-1] == self.kv_lora_rank
+            and cache_k_rope.shape[-1] == self.qk_rope_head_dim
+            and cache_k_nope.stride(-1) == 1
+            and cache_k_rope.stride(-1) == 1
+            and loc.dim() == 1
+            and loc.numel() == tokens
+            and self._tq_mla_kv_write_unit.shape[0] >= tokens
+            and self._tq_mla_kv_write_unit.shape[1] >= cache_k_nope.shape[1]
+            and self._tq_mla_kv_write_unit.shape[2] >= cache_k_nope.shape[-1]
+            and self._tq_mla_kv_write_norms.shape[0] >= tokens
+            and self._tq_mla_kv_write_norms.shape[1] >= cache_k_nope.shape[1]
+            and self._tq_mla_kv_write_y.shape[0] >= tokens
+            and self._tq_mla_kv_write_y.shape[1] >= cache_k_nope.shape[1]
+            and self._tq_mla_kv_write_y.shape[2] >= cache_k_nope.shape[-1]
+        )
+
+    def _set_mla_kv_buffer_fused(
+        self,
+        layer_id_rel: int,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+            fused_turboquant_quantize_and_store,
+        )
+
+        cfg = self.tq_config
+        fuse_rope_write = self._can_fuse_rope_write(
+            layer_id_rel, cache_k_nope, cache_k_rope
+        )
+        fused_turboquant_quantize_and_store(
+            cache_k_nope,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            self.turboquant_bits,
+            self.kv_nope_packed_buffer[layer_id_rel],
+            self.kv_nope_scale_buffer[layer_id_rel],
+            loc,
+            pre_unit=self._tq_mla_kv_write_unit,
+            pre_norms=self._tq_mla_kv_write_norms,
+            pre_y=self._tq_mla_kv_write_y,
+            rope_src=cache_k_rope if fuse_rope_write else None,
+            rope_buffer=self.kv_rope_buffer[layer_id_rel] if fuse_rope_write else None,
+        )
+        if not fuse_rope_write:
+            self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+
+    def _can_fuse_rope_write(
+        self,
+        layer_id_rel: int,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ) -> bool:
+        return (
+            envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.get()
+            and cache_k_nope.shape[-1] // 2 >= cache_k_rope.shape[-1]
+            and self.kv_rope_buffer[layer_id_rel].is_cuda
+            and self.kv_rope_buffer[layer_id_rel].device == cache_k_rope.device
+            and self.kv_rope_buffer[layer_id_rel].stride(-1) == 1
+        )
+
+    def _warmup_mla_fused_kv_write(self):
+        if self.layer_num <= 0:
+            return
+
+        cache_k_nope = torch.zeros(
+            (1, 1, self.kv_lora_rank), dtype=torch.bfloat16, device=self.device
+        )
+        cache_k_rope = torch.zeros(
+            (1, 1, self.qk_rope_head_dim), dtype=torch.bfloat16, device=self.device
+        )
+        loc = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._set_mla_kv_buffer_fused(0, loc, cache_k_nope, cache_k_rope)
+        torch.cuda.synchronize()
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        """Quantize nope, store rope raw."""
+        from sglang.srt.layers.quantization.kv_turboquant import batched_quantize
+
+        layer_id_rel = layer.layer_id - self.start_layer
+
+        # Upstream shape conventions for MLA write callers vary: some pass
+        # (tokens, hidden) and some pass (tokens, 1, hidden). Normalize to
+        # (tokens, 1, hidden) for our quantizer.
+        if cache_k_nope.dim() == 2:
+            cache_k_nope = cache_k_nope.unsqueeze(1)
+        if cache_k_rope.dim() == 2:
+            cache_k_rope = cache_k_rope.unsqueeze(1)
+
+        assert cache_k_nope.shape[-1] == self.kv_lora_rank, (
+            f"nope last-dim {cache_k_nope.shape[-1]} != kv_lora_rank {self.kv_lora_rank}"
+        )
+        assert cache_k_rope.shape[-1] == self.qk_rope_head_dim, (
+            f"rope last-dim {cache_k_rope.shape[-1]} != "
+            f"qk_rope_head_dim {self.qk_rope_head_dim}"
+        )
+
+        # Cast inputs to bfloat16 unconditionally for storage consistency.
+        # batched_quantize internally runs fp32, so no accuracy cost from
+        # a bf16 input; but its output `norms` tensor takes on the input
+        # dtype (line 164 of kv_turboquant.py: norms.to(x.dtype)). If we
+        # allowed fp16 input through, `norms` would be fp16 and the later
+        # division `norms / torch.maximum(quant_norms, self._eps)` would
+        # raise a dtype-mismatch error since `self._eps` is bf16.
+        # Casting here keeps all downstream arithmetic in bf16.
+        if cache_k_nope.dtype != torch.bfloat16:
+            cache_k_nope = cache_k_nope.to(torch.bfloat16)
+        if cache_k_rope.dtype != torch.bfloat16:
+            cache_k_rope = cache_k_rope.to(torch.bfloat16)
+
+        if self._can_use_fused_kv_write(loc, cache_k_nope, cache_k_rope):
+            self._set_mla_kv_buffer_fused(
+                layer_id_rel, loc, cache_k_nope, cache_k_rope
+            )
+            return
+
+        if not cache_k_nope.is_contiguous():
+            cache_k_nope = cache_k_nope.contiguous()
+        if not cache_k_rope.is_contiguous():
+            cache_k_rope = cache_k_rope.contiguous()
+
+        # Quantize nope
+        cfg = self.tq_config
+        packed, norms, quant_norms = batched_quantize(
+            cache_k_nope,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            self.turboquant_bits,
+        )
+        # dequant_scale = norms / (qnorm if qnorm > 1e-10 else 1.0).
+        # Matches the PR #23135 fused Triton kernel math exactly (turboquant_quantize.py
+        # lines 63-65). torch.where replaces tiny qnorms with 1.0 rather than
+        # clamping to a small eps; clamping to 1e-6 produced dequant_scale
+        # magnitudes ~1e6× too large and broke end-to-end inference even
+        # though the in-memory round-trip still passed cosine-sim checks.
+        safe_qnorm = torch.where(
+            quant_norms > self._qnorm_threshold,
+            quant_norms,
+            self._qnorm_replacement,
+        )
+        dequant_scale = norms / safe_qnorm
+
+        # Write packed nope + scale at loc.
+        self.kv_nope_packed_buffer[layer_id_rel][loc] = packed
+        self.kv_nope_scale_buffer[layer_id_rel][loc] = dequant_scale
+
+        # Write rope raw at loc.
+        self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        """Dequantize the requested tokens' nope and pass rope through.
+
+        This is the row-gathered fast path: we dequant only the rows at `loc`
+        rather than the whole pool. Still O(n * lora_rank * log(lora_rank))
+        for the inverse WHT, but with n = loc.shape[0] rather than size+page.
+        """
+        layer_id_rel = layer.layer_id - self.start_layer
+        dst_dtype = dst_dtype or torch.bfloat16
+
+        packed_rows = self.kv_nope_packed_buffer[layer_id_rel][loc]  # (n, 1, packed_dim)
+        scale_rows = self.kv_nope_scale_buffer[layer_id_rel][loc]  # (n, 1)
+        rope_rows = self.kv_rope_buffer[layer_id_rel][loc]  # (n, 1, rope_dim)
+
+        nope = self._dequant_nope(packed_rows, scale_rows)
+
+        if nope.dtype != dst_dtype:
+            nope = nope.to(dst_dtype)
+        if rope_rows.dtype != dst_dtype:
+            rope_rows = rope_rows.to(dst_dtype)
+        return nope, rope_rows
+
+    def get_contiguous_buf_infos(self):
+        """Disaggregation support — return packed-nope pointers per layer.
+
+        Note: consumers that expect the baseline (lora+rope) bf16 layout
+        will see only the packed nope here. Full KV transfer across
+        disagg boundaries is not yet supported for TurboQuant MLA;
+        this method returns something coherent so bookkeeping paths don't
+        crash, but cross-instance KV migration will need a proper
+        serialize/deserialize path in a later change.
+        """
+        kv_data_ptrs = [
+            self.kv_nope_packed_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        kv_data_lens = [
+            self.kv_nope_packed_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        kv_item_lens = [
+            self.kv_nope_packed_buffer[i][0].nbytes * self.page_size
+            for i in range(self.layer_num)
+        ]
+        return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_cpu_copy(self, indices, **kwargs):
+        """Copy quantized buffers to CPU. Keeps them in their compressed
+        form on the host so round-trip stays symmetric (CPU -> GPU preserves
+        quantized storage). Full-bf16 reconstruction only happens in
+        get_mla_kv_buffer / get_key_buffer at actual attention time.
+        """
+        torch.cuda.synchronize()
+        kv_cache_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            layer_chunks = []
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                packed_cpu = self.kv_nope_packed_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                scale_cpu = self.kv_nope_scale_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                rope_cpu = self.kv_rope_buffer[layer_id][chunk_indices].to(
+                    "cpu", non_blocking=True
+                )
+                layer_chunks.append((packed_cpu, scale_cpu, rope_cpu))
+            kv_cache_cpu.append(layer_chunks)
+        torch.cuda.synchronize()
+        return kv_cache_cpu
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+        """Inverse of get_cpu_copy: restore quantized buffers from host."""
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(indices), chunk_size):
+                chunk_indices = indices[i : i + chunk_size]
+                packed_cpu, scale_cpu, rope_cpu = kv_cache_cpu[layer_id][
+                    i // chunk_size
+                ]
+                dev = self.kv_nope_packed_buffer[0].device
+                self.kv_nope_packed_buffer[layer_id][chunk_indices] = packed_cpu.to(
+                    dev, non_blocking=True
+                )
+                self.kv_nope_scale_buffer[layer_id][chunk_indices] = scale_cpu.to(
+                    dev, non_blocking=True
+                )
+                self.kv_rope_buffer[layer_id][chunk_indices] = rope_cpu.to(
+                    dev, non_blocking=True
+                )
+        torch.cuda.synchronize()
+
+
+class NSATokenToKVPool(MLATokenToKVPool):
+    quant_block_size = 128
+    index_k_with_scale_buffer_dtype = torch.uint8
+    rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        kv_lora_rank: int,
+        dtype: torch.dtype,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool,
+        kv_cache_dim: int,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        index_buf_size: Optional[int] = None,
+    ):
+
+        override_dim = (
+            kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
+        )
+
+        super().__init__(
+            size,
+            page_size,
+            dtype,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            layer_num,
+            device,
+            enable_memory_saver,
+            start_layer,
+            end_layer,
+            use_nsa=True,
+            override_kv_cache_dim=override_dim,
+        )
+        # self.index_k_dtype = torch.float8_e4m3fn
+        # self.index_k_scale_dtype = torch.float32
+        self.index_head_dim = index_head_dim
+        if index_buf_size is None:
+            index_buf_size = size
+        # num head == 1 and head dim == 128 for index_k in NSA
+        assert index_head_dim == 128
+
+        if _is_hip:
+            if aiter_can_use_preshuffle_paged_mqa():
+                assert (
+                    self.page_size % 16 == 0
+                ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
+            else:
+                assert (
+                    self.page_size == 1
+                ), f"HIP legacy NSA path requires page_size == 1, got {self.page_size}"
+        else:
+            assert self.page_size == 64
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.custom_mem_pool
+            else nullcontext()
+        ):
+            self.index_k_with_scale_buffer = [
+                torch.zeros(
+                    # Layout:
+                    #     ref: test_attention.py :: kv_cache_cast_to_fp8
+                    #     shape: (num_pages, page_size 64 * head_dim 128 + page_size 64 * fp32_nbytes 4)
+                    #     data: for page i,
+                    #         * buf[i, :page_size * head_dim] for fp8 data
+                    #         * buf[i, page_size * head_dim:].view(float32) for scale
+                    (
+                        (index_buf_size + page_size + 1) // self.page_size,
+                        self.page_size
+                        * (
+                            index_head_dim + index_head_dim // self.quant_block_size * 4
+                        ),
+                    ),
+                    dtype=self.index_k_with_scale_buffer_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+        self._finalize_allocation_log(size)
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+        del self.index_k_with_scale_buffer
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetK.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        """
+        Fused method to get both index K and scale data in a single call using Triton.
+        More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
+
+        :param layer_id: Layer index
+        :param seq_len: Sequence length
+        :param page_indices: Page indices tensor
+        :return: tuple of (k_fp8, k_scale) where
+                 k_fp8: (seq_len, index_head_dim), uint8
+                 k_scale: (seq_len, 4), uint8
+        """
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetKAndS.execute(
+            self,
+            buf,
+            page_indices=page_indices,
+            seq_len_tensor=seq_len_tensor,
+            seq_len_sum=seq_len_sum,
+            max_seq_len=max_seq_len,
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
+
+    def get_cpu_copy(self, indices):
+        # NSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
+        # Retract frees the slots/pages and they get reused by other reqs'
+        # set_index_k_scale_buffer, so we must offload it here too -- otherwise
+        # resume restores kv_buffer but leaves foreign index/scale in place and
+        # NSA attention reads garbage at those token positions.
+        kv_cache_cpu = super().get_cpu_copy(indices)
+
+        page_indices = indices[:: self.page_size] // self.page_size
+        torch.cuda.synchronize()
+        index_k_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            index_k_cpu.append([])
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = self.index_k_with_scale_buffer[layer_id][
+                    chunk_page_indices
+                ].to("cpu", non_blocking=True)
+                index_k_cpu[-1].append(idx_cpu)
+        torch.cuda.synchronize()
+
+        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
+
+    def load_cpu_copy(self, kv_cache_cpu_dict, indices):
+        super().load_cpu_copy(kv_cache_cpu_dict["kv"], indices)
+
+        page_indices = indices[:: self.page_size] // self.page_size
+        index_k_cpu = kv_cache_cpu_dict["index_k"]
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
+                assert idx_cpu.shape[0] == len(chunk_page_indices)
+                idx_chunk = idx_cpu.to(
+                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                )
+                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+        torch.cuda.synchronize()
+
+    def get_state_buf_infos(self):
+        data_ptrs = [
+            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        data_lens = [
+            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        item_lens = [
+            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+        ]
+        return data_ptrs, data_lens, item_lens
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = super().get_kv_size_bytes()
+        for index_k_cache in self.index_k_with_scale_buffer:
+            kv_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return kv_size_bytes
 
 class DSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
@@ -2421,7 +3522,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
-
 
 def move_kv_cache_native(
     k_buffer: List[torch.Tensor],

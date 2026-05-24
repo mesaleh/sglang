@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import time
 from array import array
 from collections import defaultdict, deque
@@ -23,6 +25,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -40,6 +43,47 @@ from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_py
 from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
+
+_OMNIVA_PP_TIMING_ENABLED = os.getenv("SGLANG_OMNIVA_PP_TIMING", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_OMNIVA_PP_TIMING_TP_RANKS = {
+    item.strip()
+    for item in os.getenv("SGLANG_OMNIVA_PP_TIMING_TP_RANKS", "0").lower().split(",")
+}
+_OMNIVA_PP_TIMING_LOG_ALL_TP = "all" in _OMNIVA_PP_TIMING_TP_RANKS
+_OMNIVA_PP_TIMING_MAX_RIDS = int(os.getenv("SGLANG_OMNIVA_PP_TIMING_MAX_RIDS", "4"))
+_OMNIVA_PP_PAIR_TIMING_ENABLED = os.getenv(
+    "SGLANG_OMNIVA_PP_PAIR_TIMING", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_OMNIVA_PP_GPU_TIMING_ENABLED = os.getenv(
+    "SGLANG_OMNIVA_PP_GPU_TIMING", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD_ENABLED = os.getenv(
+    "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD", "0"
+).lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_OMNIVA_PP_META_PREFIX = "__omniva_pp_"
+_OMNIVA_PP_MSG_ID_KEY = "__omniva_pp_msg_id__"
+_OMNIVA_PP_SEND_EPOCH_NS_KEY = "__omniva_pp_send_epoch_ns__"
+_OMNIVA_PP_SEND_PERF_NS_KEY = "__omniva_pp_send_perf_ns__"
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
@@ -60,9 +104,206 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    forward_start_event: Optional[torch.Event] = None
+    forward_end_event: Optional[torch.Event] = None
+    forward_submit_epoch_ns: Optional[int] = None
 
 
 class SchedulerPPMixin:
+    def _omniva_pp_timing_enabled(self: Scheduler) -> bool:
+        return _OMNIVA_PP_TIMING_ENABLED
+
+    def _omniva_pp_timing_should_log(self: Scheduler) -> bool:
+        if not self._omniva_pp_timing_enabled():
+            return False
+
+        return _OMNIVA_PP_TIMING_LOG_ALL_TP or str(self.tp_rank) in (
+            _OMNIVA_PP_TIMING_TP_RANKS
+        )
+
+    def _omniva_pp_pair_timing_enabled(self: Scheduler) -> bool:
+        return _OMNIVA_PP_PAIR_TIMING_ENABLED and self._omniva_pp_timing_should_log()
+
+    def _omniva_pp_gpu_timing_enabled(self: Scheduler) -> bool:
+        return _OMNIVA_PP_GPU_TIMING_ENABLED and self._omniva_pp_timing_should_log()
+
+    def _omniva_pp_immediate_output_forward_enabled(self: Scheduler) -> bool:
+        return (
+            _OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD_ENABLED
+            and self.pp_size == 2
+            and not self.pp_group.is_last_rank
+        )
+
+    def _omniva_pp_tensor_keys(
+        self: Scheduler, tensor_dict: Dict[str, object]
+    ) -> List[str]:
+        return sorted(
+            str(key)
+            for key in tensor_dict.keys()
+            if not str(key).startswith(_OMNIVA_PP_META_PREFIX)
+        )
+
+    def _omniva_pp_new_event(self: Scheduler, *, enable_timing: bool = False):
+        try:
+            return self.device_module.Event(enable_timing=enable_timing)
+        except TypeError:
+            return self.device_module.Event()
+
+    def _omniva_pp_next_message_id(self: Scheduler, msg_type: str) -> str:
+        seq = getattr(self, "_omniva_pp_message_seq", 0) + 1
+        self._omniva_pp_message_seq = seq
+        return (
+            f"pp{self.pp_rank}-tp{self.tp_rank}-{msg_type}-"
+            f"f{self.forward_ct}-m{seq}"
+        )
+
+    def _omniva_pp_add_message_metadata(
+        self: Scheduler,
+        tensor_dict: Dict[str, object],
+        msg_type: str,
+    ) -> Dict[str, object]:
+        if not self._omniva_pp_pair_timing_enabled():
+            return {}
+
+        metadata: Dict[str, object] = {
+            _OMNIVA_PP_MSG_ID_KEY: self._omniva_pp_next_message_id(msg_type),
+            _OMNIVA_PP_SEND_EPOCH_NS_KEY: time.time_ns(),
+            _OMNIVA_PP_SEND_PERF_NS_KEY: time.perf_counter_ns(),
+            "__omniva_pp_send_msg_type__": msg_type,
+            "__omniva_pp_send_forward_ct__": self.forward_ct,
+            "__omniva_pp_send_pp_rank__": self.pp_rank,
+            "__omniva_pp_send_tp_rank__": self.tp_rank,
+        }
+        tensor_dict.update(metadata)
+        return metadata
+
+    def _omniva_pp_message_metadata(
+        self: Scheduler, tensor_dict: Dict[str, object]
+    ) -> Dict[str, object]:
+        if not self._omniva_pp_pair_timing_enabled():
+            return {}
+
+        metadata: Dict[str, object] = {}
+        for key, value in tensor_dict.items():
+            key_str = str(key)
+            if key_str.startswith(_OMNIVA_PP_META_PREFIX):
+                metadata[key_str] = value
+
+        send_epoch_ns = metadata.get(_OMNIVA_PP_SEND_EPOCH_NS_KEY)
+        if isinstance(send_epoch_ns, int):
+            metadata["paired_send_to_recv_wall_ms"] = round(
+                (time.time_ns() - send_epoch_ns) / 1e6, 3
+            )
+        return metadata
+
+    def _omniva_pp_log_forward_gpu_elapsed(
+        self: Scheduler, mb_id: int, batch: Optional[ScheduleBatch]
+    ) -> None:
+        if not self._omniva_pp_gpu_timing_enabled():
+            return
+
+        metadata = self.mb_metadata[mb_id]
+        if (
+            metadata is None
+            or metadata.forward_start_event is None
+            or metadata.forward_end_event is None
+        ):
+            return
+
+        try:
+            elapsed_ms = metadata.forward_start_event.elapsed_time(
+                metadata.forward_end_event
+            )
+        except Exception as exc:
+            self._omniva_pp_timing_log(
+                "run_batch_gpu_elapsed_error",
+                mb_id=mb_id,
+                batch=batch,
+                error=repr(exc),
+            )
+            return
+
+        fields: Dict[str, object] = {}
+        if metadata.forward_submit_epoch_ns is not None:
+            fields["forward_submit_age_ms"] = round(
+                (time.time_ns() - metadata.forward_submit_epoch_ns) / 1e6, 3
+            )
+        self._omniva_pp_timing_log(
+            "run_batch_gpu_elapsed",
+            elapsed_ms=elapsed_ms,
+            mb_id=mb_id,
+            batch=batch,
+            **fields,
+        )
+
+    def _omniva_pp_batch_summary(
+        self: Scheduler, batch: Optional[ScheduleBatch]
+    ) -> Dict[str, object]:
+        if batch is None:
+            return {"has_batch": False}
+
+        reqs = batch.reqs
+        now = time.perf_counter()
+        sample_reqs = reqs[:_OMNIVA_PP_TIMING_MAX_RIDS]
+        return {
+            "has_batch": True,
+            "forward_mode": batch.forward_mode.name,
+            "batch_size": len(reqs),
+            "rids": [str(req.rid) for req in sample_reqs],
+            "output_lens": [len(req.output_ids) for req in sample_reqs],
+            "extend_lens": [
+                getattr(req, "extend_input_len", None) for req in sample_reqs
+            ],
+            "decode_cts": [req.time_stats.decode_ct for req in sample_reqs],
+            "queue_ms": [
+                round(req.time_stats.get_queueing_time() * 1000, 3)
+                if req.time_stats.forward_entry_time
+                and req.time_stats.wait_queue_entry_time
+                else None
+                for req in sample_reqs
+            ],
+            "age_since_forward_ms": [
+                round((now - req.time_stats.forward_entry_time) * 1000, 3)
+                if req.time_stats.forward_entry_time
+                else None
+                for req in sample_reqs
+            ],
+        }
+
+    def _omniva_pp_timing_log(
+        self: Scheduler,
+        event: str,
+        *,
+        elapsed_ms: Optional[float] = None,
+        mb_id: Optional[int] = None,
+        batch: Optional[ScheduleBatch] = None,
+        **fields,
+    ) -> None:
+        if not self._omniva_pp_timing_should_log():
+            return
+
+        running_batch = getattr(self, "running_batch", None)
+        payload = {
+            "event": event,
+            "pp_rank": self.pp_rank,
+            "tp_rank": self.tp_rank,
+            "forward_ct": self.forward_ct,
+            "waiting_queue": len(getattr(self, "waiting_queue", [])),
+            "running_reqs": len(running_batch.reqs)
+            if running_batch is not None
+            else 0,
+        }
+        if elapsed_ms is not None:
+            payload["elapsed_ms"] = round(elapsed_ms, 3)
+        if mb_id is not None:
+            payload["mb_id"] = mb_id
+        payload.update(self._omniva_pp_batch_summary(batch))
+        payload.update(fields)
+        logger.info(
+            "[omniva_pp_timing] %s",
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        )
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -89,6 +330,7 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        pp_timing = self._omniva_pp_timing_should_log()
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -96,23 +338,55 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                tic = time.perf_counter() if pp_timing else 0.0
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
+                if pp_timing and recv_reqs:
+                    self._omniva_pp_timing_log(
+                        "recv_requests",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=mb_id,
+                        recv_reqs=len(recv_reqs),
+                    )
                 if not self.pp_group.is_last_rank:
+                    tic = time.perf_counter() if pp_timing else 0.0
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
                             async_send=True,
                         )
+                    if pp_timing and recv_reqs:
+                        self._omniva_pp_timing_log(
+                            "send_reqs_to_next_stage",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=mb_id,
+                            recv_reqs=len(recv_reqs),
+                        )
+                tic = time.perf_counter() if pp_timing else 0.0
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
+                if pp_timing and self.mbs[mb_id] is not None:
+                    self._omniva_pp_timing_log(
+                        "get_next_batch_to_run",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=mb_id,
+                        batch=self.mbs[mb_id],
+                    )
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
+                    tic = time.perf_counter() if pp_timing else 0.0
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "recv_proxy_tensors",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=mb_id,
+                            batch=self.cur_batch,
+                        )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -123,7 +397,21 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                pending_proxy_work_items = len(self.send_proxy_work)
+                tic = (
+                    time.perf_counter()
+                    if pp_timing and pending_proxy_work_items
+                    else 0.0
+                )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                if pp_timing and pending_proxy_work_items:
+                    self._omniva_pp_timing_log(
+                        "commit_send_proxy_work",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=mb_id,
+                        batch=self.cur_batch,
+                        work_items=pending_proxy_work_items,
+                    )
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -139,11 +427,38 @@ class SchedulerPPMixin:
                         )
                     )
                 if self.mbs[next_mb_id] is not None:
+                    total_tic = time.perf_counter() if pp_timing else 0.0
+                    tic = time.perf_counter() if pp_timing else 0.0
                     d2h_event.synchronize()
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "process_batch_result_d2h_wait",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=next_mb_id,
+                            batch=self.mbs[next_mb_id],
+                        )
+                    tic = time.perf_counter() if pp_timing else 0.0
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
+                        )
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "process_batch_result_core",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=next_mb_id,
+                            batch=self.mbs[next_mb_id],
+                        )
+                    self._omniva_pp_log_forward_gpu_elapsed(
+                        next_mb_id, self.mbs[next_mb_id]
+                    )
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "process_batch_result",
+                            elapsed_ms=(time.perf_counter() - total_tic) * 1000,
+                            mb_id=next_mb_id,
+                            batch=self.mbs[next_mb_id],
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
                 if not self.pp_group.is_last_rank:
@@ -151,6 +466,7 @@ class SchedulerPPMixin:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
+                        tic = time.perf_counter() if pp_timing else 0.0
                         with torch.profiler.record_function(
                             "send_proxy_dict_to_next_stage"
                         ):
@@ -158,6 +474,13 @@ class SchedulerPPMixin:
                                 result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                                 msg_type="proxy",
+                            )
+                        if pp_timing:
+                            self._omniva_pp_timing_log(
+                                "send_proxy_dict_to_next_stage",
+                                elapsed_ms=(time.perf_counter() - tic) * 1000,
+                                mb_id=mb_id,
+                                batch=self.cur_batch,
                             )
 
                 self.pp_outputs = next_pp_outputs
@@ -556,6 +879,7 @@ class SchedulerPPMixin:
         self.send_proxy_work = []
         self.send_output_work = []
         self.launch_event = None
+        self._omniva_pp_message_seq = 0
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
@@ -899,7 +1223,18 @@ class SchedulerPPMixin:
         Optional[GenerationBatchResult],
         Optional[torch.Event],
     ]:
+        pp_timing = self._omniva_pp_timing_should_log()
+        pending_work_items = len(self.send_output_work)
+        tic = time.perf_counter() if pp_timing and pending_work_items else 0.0
         self._pp_commit_comm_work(work=self.send_output_work)
+        if pp_timing and pending_work_items:
+            self._omniva_pp_timing_log(
+                "commit_send_output_work",
+                elapsed_ms=(time.perf_counter() - tic) * 1000,
+                mb_id=next_first_rank_mb_id,
+                batch=self.mbs[next_first_rank_mb_id],
+                work_items=pending_work_items,
+            )
         (
             next_pp_outputs,
             next_batch_result,
@@ -963,11 +1298,30 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
-        tensor_dict = {
-            "next_token_ids": result.next_token_ids,
-        }
+        tensor_dict = {}
 
-        if batch.return_logprob:
+        if result.next_token_ids is not None:
+            tensor_dict["next_token_ids"] = result.next_token_ids
+
+        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+            logits_output = result.logits_output
+            if logits_output is not None:
+                if logits_output.next_token_logits is not None:
+                    tensor_dict["spec_next_token_logits"] = (
+                        logits_output.next_token_logits
+                    )
+                if logits_output.hidden_states is not None:
+                    tensor_dict["spec_hidden_states"] = logits_output.hidden_states
+                if logits_output.mm_input_embeds is not None:
+                    tensor_dict["spec_mm_input_embeds"] = (
+                        logits_output.mm_input_embeds
+                    )
+
+        if batch.return_logprob and not (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and batch.forward_mode.is_target_verify()
+        ):
             logprob_dict = get_logprob_dict_from_result(result)
             tensor_dict = {
                 **tensor_dict,
@@ -988,6 +1342,9 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        pp_timing = self._omniva_pp_timing_should_log()
+        metadata = self._omniva_pp_add_message_metadata(tensor_dict, msg_type)
+        tic = time.perf_counter() if pp_timing else 0.0
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
@@ -998,6 +1355,16 @@ class SchedulerPPMixin:
                 async_send=async_send,
             )
         )
+        if pp_timing:
+            self._omniva_pp_timing_log(
+                "send_tensor_dict_to_next_stage",
+                elapsed_ms=(time.perf_counter() - tic) * 1000,
+                msg_type=msg_type,
+                async_send=async_send,
+                work_items=len(p2p_work),
+                tensor_keys=self._omniva_pp_tensor_keys(tensor_dict),
+                **metadata,
+            )
         return p2p_work
 
     def _pp_recv_typed_dict(
@@ -1016,6 +1383,8 @@ class SchedulerPPMixin:
                 return inbox_queue.popleft()
 
         while True:
+            pp_timing = self._omniva_pp_timing_should_log()
+            tic = time.perf_counter() if pp_timing else 0.0
             tensor_dict = self.pp_group.recv_tensor_dict(
                 all_gather_group=all_gather_group
             )
@@ -1025,6 +1394,15 @@ class SchedulerPPMixin:
                     logger.warning_once(
                         f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
                         "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
+                    )
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_tensor_dict_from_prev_stage",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        expected_kind=expected_kind,
+                        received_kind=received_kind,
+                        tensor_keys=self._omniva_pp_tensor_keys(tensor_dict),
+                        **self._omniva_pp_message_metadata(tensor_dict),
                     )
                 return tensor_dict
             else:
@@ -1092,21 +1470,49 @@ class SchedulerPPMixin:
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
 
-        if batch.return_logprob:
+        if batch.return_logprob and not (
+            not batch.spec_algorithm.is_none()
+            and not batch.is_spec_v2
+            and batch.forward_mode.is_target_verify()
+        ):
             (
                 logits_output,
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        batch.input_ids = pp_outputs["next_token_ids"].to(torch.int64)
-        # PP rank 0 also relays into output_tokens_buf so the next iter's
-        # resolve_forward_inputs finds these tokens for the decode portion
-        # of mixed-chunk batches (which gather via mix_running_indices).
-        self.future_map.stash(batch.req_pool_indices, batch.input_ids)
+
+        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+            if logits_output is None:
+                logits_output = LogitsProcessorOutput(
+                    next_token_logits=pp_outputs.tensors.get(
+                        "spec_next_token_logits"
+                    ),
+                    hidden_states=pp_outputs.tensors.get("spec_hidden_states"),
+                    mm_input_embeds=pp_outputs.tensors.get("spec_mm_input_embeds"),
+                )
+            else:
+                logits_output.next_token_logits = pp_outputs.tensors.get(
+                    "spec_next_token_logits"
+                )
+                logits_output.hidden_states = pp_outputs.tensors.get(
+                    "spec_hidden_states"
+                )
+                logits_output.mm_input_embeds = pp_outputs.tensors.get(
+                    "spec_mm_input_embeds"
+                )
+
+        next_token_ids = pp_outputs.tensors.get("next_token_ids")
+        if next_token_ids is not None:
+            batch.output_ids = next_token_ids
+            batch.input_ids = next_token_ids.to(torch.int64)
+            # PP rank 0 also relays into output_tokens_buf so the next iter's
+            # resolve_forward_inputs finds these tokens for the decode portion
+            # of mixed-chunk batches (which gather via mix_running_indices).
+            self.future_map.stash(batch.req_pool_indices, batch.input_ids)
         output_result = GenerationBatchResult(
             logits_output=logits_output,
             pp_hidden_states_proxy_tensors=None,
-            next_token_ids=pp_outputs["next_token_ids"],
+            next_token_ids=next_token_ids,
             extend_input_len_per_req=extend_input_len_per_req,
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
@@ -1116,6 +1522,15 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
+        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+            if not hasattr(self.model_worker, "process_pp_batch_result"):
+                raise RuntimeError(
+                    "Pipeline parallel speculative decoding requires the "
+                    "draft worker to implement process_pp_batch_result."
+                )
+            output_result = self.model_worker.process_pp_batch_result(
+                batch, output_result
+            )
         self.process_batch_result(batch, output_result)
 
     def _pp_send_output_to_next_stage(
@@ -1135,7 +1550,16 @@ class SchedulerPPMixin:
                     not target.forward_mode.is_prebuilt()
                     and not _pp_can_skip_output_comm(target)
                 ):
+                    pp_timing = self._omniva_pp_timing_should_log()
+                    tic = time.perf_counter() if pp_timing else 0.0
                     self.device_module.current_stream().wait_event(q_event)
+                    if pp_timing:
+                        self._omniva_pp_timing_log(
+                            "send_output_ready_wait",
+                            elapsed_ms=(time.perf_counter() - tic) * 1000,
+                            mb_id=next_first_rank_mb_id,
+                            batch=target,
+                        )
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
                             pp_outputs_to_send.tensors,
@@ -1184,14 +1608,28 @@ class SchedulerPPMixin:
         # CUDA: send first
         # XPU: even ranks send first, odd ranks recv first.
         send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
+        pp_timing = self._omniva_pp_timing_should_log()
+        immediate_output_forward = (
+            self._omniva_pp_immediate_output_forward_enabled()
+        )
 
         def _do_send():
-            return self._pp_send_output_to_next_stage(
+            tic = time.perf_counter() if pp_timing else 0.0
+            work = self._pp_send_output_to_next_stage(
                 next_first_rank_mb_id,
                 mbs,
                 last_rank_comm_queue,
                 pp_outputs,
             )
+            if pp_timing and (work or mbs[next_first_rank_mb_id] is not None):
+                self._omniva_pp_timing_log(
+                    "send_output_to_next_stage",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_first_rank_mb_id,
+                    batch=mbs[next_first_rank_mb_id],
+                    work_items=len(work),
+                )
+            return work
 
         def _do_recv():
             nonlocal next_pp_outputs, batch_result, d2h_event
@@ -1203,22 +1641,100 @@ class SchedulerPPMixin:
                     self._pp_make_skip_output_result(target, mb_metadata[next_mb_id])
                 )
                 return
+            total_tic = time.perf_counter() if pp_timing else 0.0
+            tic = time.perf_counter() if pp_timing else 0.0
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                tensor_dict = self._pp_recv_dict_from_prev_stage()
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "recv_output_from_prev_stage_recv_dict",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                    tensor_keys=self._omniva_pp_tensor_keys(tensor_dict),
+                    **self._omniva_pp_message_metadata(tensor_dict),
+                )
+            tic = time.perf_counter() if pp_timing else 0.0
+            next_pp_outputs = PPProxyTensors(tensor_dict)
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "recv_output_from_prev_stage_proxy_wrap",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                )
             with self.copy_stream_ctx:
+                tic = time.perf_counter() if pp_timing else 0.0
                 self.copy_stream.wait_stream(self.schedule_stream)
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_output_from_prev_stage_copy_wait",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=next_mb_id,
+                        batch=mbs[next_mb_id],
+                    )
+                tic = time.perf_counter() if pp_timing else 0.0
                 batch_result = self._pp_prep_batch_result(
                     target, mb_metadata[next_mb_id], next_pp_outputs
                 )
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_output_from_prev_stage_prep_batch_result",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=next_mb_id,
+                        batch=mbs[next_mb_id],
+                    )
+                tic = time.perf_counter() if pp_timing else 0.0
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "recv_output_from_prev_stage_event_record",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=next_mb_id,
+                        batch=mbs[next_mb_id],
+                    )
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "recv_output_from_prev_stage",
+                    elapsed_ms=(time.perf_counter() - total_tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                )
+
+        def _forward_received_output_immediately():
+            nonlocal next_pp_outputs
+            if not immediate_output_forward or next_pp_outputs is None:
+                return
+
+            tic = time.perf_counter() if pp_timing else 0.0
+            work = self._pp_send_output_to_next_stage(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                next_pp_outputs,
+            )
+            send_output_work.extend(work)
+            if pp_timing:
+                self._omniva_pp_timing_log(
+                    "forward_output_to_next_stage_immediate",
+                    elapsed_ms=(time.perf_counter() - tic) * 1000,
+                    mb_id=next_mb_id,
+                    batch=mbs[next_mb_id],
+                    work_items=len(work),
+                )
+            next_pp_outputs = None
 
         if send_first:
-            send_output_work = _do_send()
+            if not immediate_output_forward:
+                send_output_work = _do_send()
             _do_recv()
+            _forward_received_output_immediately()
         else:
             _do_recv()
-            send_output_work = _do_send()
+            _forward_received_output_immediately()
+            if not immediate_output_forward:
+                send_output_work = _do_send()
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
@@ -1229,9 +1745,21 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        pp_timing = self._omniva_pp_timing_should_log()
+        pp_gpu_timing = self._omniva_pp_gpu_timing_enabled()
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                forward_start_event = None
+                forward_end_event = None
+                forward_submit_epoch_ns = None
+                if pp_gpu_timing:
+                    forward_start_event = self._omniva_pp_new_event(
+                        enable_timing=True
+                    )
+                    forward_submit_epoch_ns = time.time_ns()
+                    forward_start_event.record(self.device_module.current_stream())
+                tic = time.perf_counter() if pp_timing else 0.0
                 set_time_batch(
                     self.cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -1244,8 +1772,22 @@ class SchedulerPPMixin:
                     trace_only=True,
                     attrs={"pp_mb_id": mb_id},
                 )
+                if pp_gpu_timing:
+                    forward_end_event = self._omniva_pp_new_event(enable_timing=True)
+                    forward_end_event.record(self.device_module.current_stream())
+                if pp_timing:
+                    self._omniva_pp_timing_log(
+                        "run_batch",
+                        elapsed_ms=(time.perf_counter() - tic) * 1000,
+                        mb_id=mb_id,
+                        batch=self.cur_batch,
+                        can_run_cuda_graph=result.can_run_cuda_graph,
+                    )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    forward_start_event=forward_start_event,
+                    forward_end_event=forward_end_event,
+                    forward_submit_epoch_ns=forward_submit_epoch_ns,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())

@@ -738,9 +738,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if loop_num > 1:
             self.num_effective_layers = self.num_effective_layers * loop_num
 
+        pp_external_eagle_spec = (
+            self.pp_size == 2
+            and not self.is_draft_worker
+            and self.spec_algorithm
+            in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+            and self.server_args.speculative_draft_model_path is not None
+            and self.server_args.disable_overlap_schedule
+            and not self.server_args.enable_multi_layer_eagle
+            and self.server_args._supports_pipeline_parallel_speculative_decoding()
+        )
+
         assert (
             (not model_has_mtp_layers)
             or (self.spec_algorithm.is_none())
+            or pp_external_eagle_spec
             or (
                 (not self.spec_algorithm.is_none())
                 and (self.num_effective_layers == model_num_layers)
@@ -791,6 +803,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_runner=self,
             token_oracle_manager=self._token_oracle_manager,
         )
+
+        # TurboQuant: fuse inverse WHT rotation into o_proj weights
+        self._maybe_fuse_tq_output_rotation()
 
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
@@ -2282,6 +2297,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+        elif self.server_args.kv_cache_dtype.startswith("turboquant_"):
+            import re
+
+            tq_str = self.server_args.kv_cache_dtype.split("_", 1)[1]
+            # Check for uniform quantization suffix
+            self.turboquant_uniform = tq_str.endswith("_uniform")
+            if self.turboquant_uniform:
+                tq_str = tq_str.rsplit("_uniform", 1)[0]
+            # Asymmetric: "k4v2"
+            asym_match = re.match(r"k(\d)v(\d)", tq_str)
+            if asym_match:
+                self.turboquant_k_bits = int(asym_match.group(1))
+                self.turboquant_v_bits = int(asym_match.group(2))
+                self.turboquant_bits = self.turboquant_k_bits  # for backwards compat
+            else:
+                # Symmetric: "2bit", "4bit"
+                bits = int(tq_str.replace("bit", ""))
+                self.turboquant_k_bits = bits
+                self.turboquant_v_bits = bits
+                self.turboquant_bits = bits
+            self.kv_cache_dtype = torch.bfloat16
+            # TurboQuant fused decode kernel is Triton-only and MHA-only (from PR #23135).
+            # On the MLA path (e.g. Kimi K2.6, DeepSeek-V2), MLATokenToKVPoolTurboQuant
+            # dequantizes on read into a shared bf16 buffer, so flashmla / flashinfer-mla
+            # see ordinary bf16 tensors and need no TurboQuant awareness. Forcing the
+            # triton decode backend here would route MLA decode through an MHA-only
+            # kernel and produce garbage. Only override DECODE backend to triton on MHA.
+            if not self.use_mla_backend:
+                if self.server_args.decode_attention_backend is None or \
+                   self.server_args.decode_attention_backend != "triton":
+                    prev = self.server_args.decode_attention_backend or "default"
+                    self.server_args.decode_attention_backend = "triton"
+                    logger.info(
+                        f"TurboQuant: overriding decode-attention-backend={prev} → triton "
+                        f"(fused decode kernel). Prefill backend unchanged for optimal throughput."
+                    )
+            else:
+                logger.info(
+                    "TurboQuant+MLA: keeping decode-attention-backend="
+                    f"{self.server_args.decode_attention_backend or 'default'} "
+                    "(MLA pool dequantizes on read; fused Triton decode kernel is MHA-only)."
+                )
+            # Fused decode kernel supports symmetric and asymmetric 2-bit and 4-bit.
+            # On MLA path we never use the fused decode kernel, so CUDA graph stays
+            # governed by the chosen MLA backend (flashmla, flashinfer-mla) — not by
+            # has_fused. Only gate CUDA graph on the MHA path.
+            has_fused = (
+                self.turboquant_k_bits in (2, 4)
+                and self.turboquant_v_bits in (2, 4)
+            )
+            if not self.use_mla_backend and not has_fused:
+                if not self.server_args.disable_cuda_graph:
+                    logger.warning(
+                        f"TurboQuant K={self.turboquant_k_bits}bit V={self.turboquant_v_bits}bit: "
+                        f"no fused decode kernel, disabling CUDA graph."
+                    )
+                    self.server_args.disable_cuda_graph = True
+            logger.info(
+                f"TurboQuant K={self.turboquant_k_bits}bit V={self.turboquant_v_bits}bit KV cache enabled"
+            )
         else:
             raise ValueError(
                 f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
@@ -2392,6 +2467,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             pp_parallel_deep_gemm_warmup(self)
 
+        # Pre-warm TurboQuant JIT kernels so they're compiled before CUDA graph capture
+        if hasattr(self, "turboquant_bits"):
+            self._warmup_turboquant_kernels()
+
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Pre-initialize flashinfer allreduce fusion workspaces.
 
@@ -2412,6 +2491,131 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             hidden_dim=self.model_config.hidden_size,
             dtype=self.dtype,
         )
+
+    def _warmup_turboquant_kernels(self):
+        """Trigger JIT compilation of hadamard + Triton kernels before graph capture."""
+        from sglang.jit_kernel.hadamard import hadamard_transform
+
+        head_dim = self.model_config.head_dim
+        dummy = torch.randn(1, 1, head_dim, dtype=torch.float32, device=self.device)
+        scale = 1.0 / (head_dim ** 0.5)
+        # Warm up JIT hadamard kernel
+        hadamard_transform(dummy, scale=scale)
+
+        # Warm up fused Triton quantize kernel (4-bit only)
+        if self.turboquant_k_bits == 4:
+            from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+                fused_turboquant_quantize,
+            )
+            from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+            cfg = TurboQuantConfig(
+                bit_width=4, head_dim=head_dim, device=self.device,
+                k_bit_width=self.turboquant_k_bits, v_bit_width=self.turboquant_v_bits,
+                uniform=getattr(self, 'turboquant_uniform', False),
+            )
+            dummy_kv = torch.randn(1, 1, head_dim, dtype=torch.bfloat16, device=self.device)
+            fused_turboquant_quantize(
+                dummy_kv, cfg.signs1, cfg.signs2,
+                cfg.k_centroids, cfg.k_boundaries, 4,
+            )
+
+    def _maybe_fuse_tq_output_rotation(self):
+        if not hasattr(self, "turboquant_bits") or self.turboquant_bits is None:
+            return
+        if self.token_to_kv_pool_allocator is None:
+            return
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        tq_cfg = getattr(kvcache, "tq_config", None)
+        if tq_cfg is None:
+            return
+
+        import logging
+        logger = logging.getLogger(__name__)
+        # Skip on MLA path: MLATokenToKVPoolTurboQuant._dequant_nope already
+        # applies the inverse WHT on read, so downstream attention sees
+        # un-rotated KV and produces un-rotated output. Pre-rotating o_proj
+        # here would double-inverse-rotate via the compensation path and
+        # corrupt the output projection, producing token-salad despite
+        # numerically correct pool round-trip. For MHA TurboQuant the kernel
+        # returns attention output in rotated space and o_proj pre-rotation
+        # is the correct fusion, but that contract does not hold on MLA.
+        if self.use_mla_backend:
+            logger.info(
+                "TurboQuant+MLA: skipping o_proj rotation fusion "
+                "(MLA pool dequantizes+inverse-rotates on read; attention "
+                "output is already in original domain)."
+            )
+            return
+        logger.info("TurboQuant: fusing inverse WHT rotation into o_proj weights...")
+        # Dtypes that are safe to rotate in-place: only real floating-point
+        # weights whose elementwise algebra matches the rotation math.
+        # Quantized / packed formats (FP8 with external scales, INT4/INT8 packed
+        # as int32/uint8 via compressed-tensors or GPTQ/AWQ/Marlin, etc.) cannot
+        # be safely rotated because the packed integer values do not represent
+        # a linear space that rotation preserves. Corrupting these silently
+        # breaks the model with no obvious error message.
+        _safe_fuse_dtypes = (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        )
+        fused = 0
+        skipped_quantized = 0
+        skipped_other = 0
+        for _, mod in self.model.named_modules():
+            if hasattr(mod, "o_proj") and hasattr(mod.o_proj, "weight"):
+                w = mod.o_proj.weight
+                # Skip any non-real-float dtype. This covers FP8 (both variants),
+                # INT4/INT8/UINT8 packed quant formats, and anything exotic.
+                if w.dtype not in _safe_fuse_dtypes:
+                    skipped_quantized += 1
+                    continue
+                # Additional guard: modules using quantized weight methods often
+                # expose qweight/qzeros/scales siblings even when .weight is a
+                # shim. If any of those attrs exist on the layer, skip.
+                if any(
+                    hasattr(mod.o_proj, attr)
+                    for attr in ("qweight", "qzeros", "scales", "weight_scale")
+                ):
+                    skipped_quantized += 1
+                    continue
+                n_heads = w.shape[1] // tq_cfg.head_dim
+                if w.shape[1] % tq_cfg.head_dim == 0 and n_heads > 0:
+                    with torch.no_grad():
+                        wt = w.data.t().contiguous()
+                        wf = tq_cfg.fuse_inverse_rotation_into_o_proj(wt, n_heads)
+                        w.data.copy_(wf.t().contiguous())
+                        fused += 1
+                else:
+                    skipped_other += 1
+        if skipped_quantized > 0:
+            logger.info(
+                f"TurboQuant: skipping rotation fusion on {skipped_quantized} "
+                f"quantized o_proj layers (FP8 / INT4 / packed). "
+                f"Using runtime inverse rotation for those layers."
+            )
+        if skipped_other > 0:
+            logger.warning(
+                f"TurboQuant: {skipped_other} o_proj layers had unexpected "
+                f"shape and were skipped."
+            )
+        if fused > 0:
+            # Only mark as fused if ALL o_proj layers were fused. If some were
+            # skipped, the model has mixed-state o_proj layers and we must use
+            # runtime inverse rotation to stay correct.
+            if skipped_quantized == 0 and skipped_other == 0:
+                tq_cfg.output_rotation_fused = True
+                logger.info(
+                    "TurboQuant: fused inverse rotation into %d o_proj layers", fused
+                )
+            else:
+                logger.info(
+                    "TurboQuant: fused %d layers but skipped %d; "
+                    "using runtime inverse rotation for correctness.",
+                    fused,
+                    skipped_quantized + skipped_other,
+                )
 
     def _should_run_flashinfer_autotune(self) -> bool:
         """Check if flashinfer autotune should be run."""

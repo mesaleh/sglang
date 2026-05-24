@@ -209,6 +209,26 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _should_store_correction_bias_as_bf16(quant_config: Optional[QuantizationConfig]):
+    if quant_config is None or not get_moe_runner_backend().is_flashinfer_trtllm():
+        return False
+    if quant_config.get_name() == "modelopt_fp4":
+        return True
+    if quant_config.get_name() != "compressed_tensors":
+        return False
+
+    weights_config = (
+        getattr(quant_config, "target_scheme_map", {})
+        .get("Linear", {})
+        .get("weights")
+    )
+    return (
+        getattr(weights_config, "strategy", None) == "group"
+        and getattr(weights_config, "group_size", None) == 32
+        and getattr(weights_config, "num_bits", None) == 4
+    )
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -423,10 +443,7 @@ class MoEGate(nn.Module):
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
             if quant_config is not None:
-                if (
-                    quant_config.get_name() == "modelopt_fp4"
-                    and get_moe_runner_backend().is_flashinfer_trtllm()
-                ):
+                if _should_store_correction_bias_as_bf16(quant_config):
                     correction_bias_dtype = torch.bfloat16
                 elif _use_aiter and quant_config.get_name() in (
                     "fp8",
@@ -528,6 +545,9 @@ class DeepseekV2MoE(nn.Module):
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        self._enable_pre_allreduce_add_fusion = (
+            envs.SGLANG_FLASHINFER_PRE_ALLREDUCE_ADD_FUSION.get()
+        )
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
@@ -796,6 +816,58 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
+    def _combine_shared_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+        should_allreduce_fusion: bool,
+    ) -> torch.Tensor:
+        if shared_output is None:
+            return final_hidden_states
+        if (
+            self._enable_pre_allreduce_add_fusion
+            and should_allreduce_fusion
+            and final_hidden_states.is_contiguous()
+            and shared_output.is_contiguous()
+        ):
+            final_hidden_states._sglang_pre_allreduce_addition = shared_output
+            return final_hidden_states
+        final_hidden_states += shared_output
+        return final_hidden_states
+
+    def _scale_routed_and_combine_shared_output(
+        self,
+        final_hidden_states: torch.Tensor,
+        shared_output: Optional[torch.Tensor],
+        should_allreduce_fusion: bool,
+    ) -> torch.Tensor:
+        shared_for_combine = None if self._shared_expert_tp1 else shared_output
+        if (
+            self._enable_pre_allreduce_add_fusion
+            and should_allreduce_fusion
+            and shared_for_combine is not None
+            and final_hidden_states.is_contiguous()
+            and shared_for_combine.is_contiguous()
+        ):
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None,
+                self.routed_scaling_factor,
+            )
+            return self._combine_shared_output(
+                final_hidden_states,
+                shared_for_combine,
+                should_allreduce_fusion,
+            )
+
+        return maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            final_hidden_states,
+            shared_for_combine,
+            self.routed_scaling_factor,
+        )
+
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
         # slots live after each rank's routed slots and must stay stable.
@@ -911,14 +983,9 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
-
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
+        final_hidden_states = self._scale_routed_and_combine_shared_output(
+            final_hidden_states, shared_output, should_allreduce_fusion
         )
-
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
@@ -1026,13 +1093,9 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, gemm_output_zero_allocator
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
+        final_hidden_states = self._scale_routed_and_combine_shared_output(
+            final_hidden_states, shared_output, should_allreduce_fusion
         )
-
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
@@ -2372,6 +2435,7 @@ class DeepseekV2Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         total_num_layers = self.end_layer - self.start_layer
+        prev_aux_hidden_states = []
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -2382,6 +2446,14 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            if "mm_input_embeds" in pp_proxy_tensors.tensors:
+                forward_batch.mm_input_embeds = pp_proxy_tensors["mm_input_embeds"]
+            aux_index = 0
+            while f"aux_hidden_states_{aux_index}" in pp_proxy_tensors.tensors:
+                prev_aux_hidden_states.append(
+                    pp_proxy_tensors[f"aux_hidden_states_{aux_index}"]
+                )
+                aux_index += 1
         device = hidden_states.device
         zero_allocator = BumpAllocator(
             buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
@@ -2477,12 +2549,20 @@ class DeepseekV2Model(nn.Module):
                 zero_allocator=zero_allocator,
             )
 
+        if prev_aux_hidden_states:
+            aux_hidden_states = prev_aux_hidden_states + aux_hidden_states
+
         if not self.pp_group.is_last_rank:
+            proxy_tensors = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if forward_batch.mm_input_embeds is not None:
+                proxy_tensors["mm_input_embeds"] = forward_batch.mm_input_embeds
+            for aux_index, aux_hidden_state in enumerate(aux_hidden_states):
+                proxy_tensors[f"aux_hidden_states_{aux_index}"] = aux_hidden_state
             return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
+                proxy_tensors
             )
         else:
             if not forward_batch.forward_mode.is_idle():
@@ -2697,7 +2777,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
-        if self.capture_aux_hidden_states:
+        if self.capture_aux_hidden_states and not isinstance(
+            hidden_states, PPProxyTensors
+        ):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
@@ -2738,9 +2820,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         )
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if not self.pp_group.is_last_rank:
-            return
-
         if layer_ids is None:
             self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers

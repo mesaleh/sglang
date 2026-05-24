@@ -132,22 +132,48 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                cell_size = (cell_size // 2) + (
-                    (
-                        (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                        // scale_block_size
-                    )
+            if hasattr(mr, "turboquant_bits"):
+                # MLA + TurboQuant: nope half is packed k-bit + per-token scale,
+                # rope half stays uncompressed bf16. Matches storage layout in
+                # MLATokenToKVPoolTurboQuant.
+                #   nope_packed:  (lora_rank // 2) bytes    (4-bit: 2 values/byte)
+                #   scale:        2 bytes                   (bf16, one per token)
+                #   rope_raw:     qk_rope_head_dim * 2 bytes (bf16 unmodified)
+                # Only 4-bit is supported for MLA in this first implementation
+                # (the pool class raises on k_bits != 4). We assert here so the
+                # sizing math cannot silently diverge from what the pool creates.
+                k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+                assert k_bits == 4, (
+                    f"MLA TurboQuant pool sizing currently assumes 4-bit; "
+                    f"got k_bits={k_bits}. Update both sites together."
+                )
+                lora = model_config.kv_lora_rank
+                rope = model_config.qk_rope_head_dim
+                # 4-bit packed nope: 2 values per byte => lora // 2 bytes.
+                nope_packed_bytes = lora // 2
+                # Per-token dequant scale for nope (bf16).
+                scale_bytes = 2
+                # Raw rope (bf16).
+                rope_bytes = rope * 2
+                per_layer_per_token = nope_packed_bytes + scale_bytes + rope_bytes
+                cell_size = per_layer_per_token * num_layers
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                     * num_layers
                     * kv_size
                 )
+                if is_float4_e2m1fn_x2(kv_cache_dtype):
+                    # kv_scale_buffer
+                    scale_block_size = 16
+                    cell_size = (cell_size // 2) + (
+                        (
+                            (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                            // scale_block_size
+                        )
+                        * num_layers
+                        * kv_size
+                    )
 
             # Add indexer KV cache overhead for DSA models (DeepSeek V3.2)
             if is_deepseek_dsa(model_config.hf_config):
@@ -168,7 +194,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 * kv_size
             )
 
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if hasattr(mr, "turboquant_bits"):
+                # TurboQuant: packed indices + bf16 dequant_scale per layer.
+                # No shared dequant buffer (fused kernels read packed directly).
+                n = model_config.get_num_kv_heads(tp_size)
+                d = model_config.head_dim
+                k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+                v_bits = getattr(mr, "turboquant_v_bits", mr.turboquant_bits)
+
+                def _packed_bytes(bits, n, d):
+                    if bits == 2:
+                        return n * (d // 4)  # uint8, 4 values/byte
+                    else:  # 4-bit
+                        return n * (d // 2)  # uint8, 2 values/byte
+
+                per_layer_per_token = (
+                    _packed_bytes(k_bits, n, d) + _packed_bytes(v_bits, n, d)
+                    + 2 * n * 2  # k_dequant_scale + v_dequant_scale (bf16)
+                )
+                cell_size = per_layer_per_token * num_layers
+            elif is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
                 n = model_config.get_num_kv_heads(tp_size)
@@ -214,19 +259,61 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
-        # Full layer per-token memory (bytes)
-        self._full_per_token = (
-            model_config.get_num_kv_heads(tp_size)
-            * (model_config.head_dim + model_config.v_head_dim)
-            * kv_size
-        )
+        # TurboQuant hybrid-SWA sizing: when --kv-cache-dtype is turboquant_*,
+        # the full and swa sub-pools inside SWAKVPool are packed
+        # MHATokenToKVPoolTurboQuant instances. kv_size (bf16) overstates the
+        # per-token footprint 3-4×, so we replace the bf16 formula with the
+        # TQ packed-layout formula (matches the DefaultPoolConfigurator
+        # non-MLA TQ branch below: packed_k + packed_v + k_scale_bf16 +
+        # v_scale_bf16 per token per layer). Without this branch the pool
+        # configurator sizes admission cap for bf16 and we lose the TQ
+        # memory advantage at 128K context on gpt-oss-120b.
+        if hasattr(mr, "turboquant_bits"):
+            k_bits = getattr(mr, "turboquant_k_bits", mr.turboquant_bits)
+            v_bits = getattr(mr, "turboquant_v_bits", mr.turboquant_bits)
 
-        # SWA layer per-token memory (bytes)
-        self._swa_per_token = (
-            model_config.get_swa_num_kv_heads(tp_size)
-            * (model_config.swa_head_dim + model_config.swa_v_head_dim)
-            * kv_size
-        )
+            def _packed_bytes(bits: int, n: int, d: int) -> int:
+                if bits == 2:
+                    return n * (d // 4)  # 4 values per byte
+                return n * (d // 2)  # 4-bit: 2 values per byte
+
+            full_n = model_config.get_num_kv_heads(tp_size)
+            full_k_d = model_config.head_dim
+            full_v_d = model_config.v_head_dim
+            swa_n = model_config.get_swa_num_kv_heads(tp_size)
+            swa_k_d = model_config.swa_head_dim
+            swa_v_d = model_config.swa_v_head_dim
+
+            # Full attention layer: packed K + packed V + 2 × bf16 scale.
+            # K and V dims are threaded separately so the formula stays
+            # correct on models with asymmetric head dims (most GQA
+            # models, including gpt-oss, have head_dim == v_head_dim, so
+            # in practice these collapse).
+            self._full_per_token = (
+                _packed_bytes(k_bits, full_n, full_k_d)
+                + _packed_bytes(v_bits, full_n, full_v_d)
+                + 2 * full_n * 2  # k_dequant_scale + v_dequant_scale (bf16)
+            )
+            # SWA attention layer: same formula, SWA head counts / dims.
+            self._swa_per_token = (
+                _packed_bytes(k_bits, swa_n, swa_k_d)
+                + _packed_bytes(v_bits, swa_n, swa_v_d)
+                + 2 * swa_n * 2
+            )
+        else:
+            # Full layer per-token memory (bytes)
+            self._full_per_token = (
+                model_config.get_num_kv_heads(tp_size)
+                * (model_config.head_dim + model_config.v_head_dim)
+                * kv_size
+            )
+
+            # SWA layer per-token memory (bytes)
+            self._swa_per_token = (
+                model_config.get_swa_num_kv_heads(tp_size)
+                * (model_config.swa_head_dim + model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         # Bytes per token of max_total_num_tokens.
         #

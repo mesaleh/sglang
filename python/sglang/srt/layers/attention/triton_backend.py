@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -40,6 +42,140 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------------
+# Flash-decoding num_kv_splits ceiling picker
+#
+# Used by both TritonAttnBackend and WaveAttnBackend; the shared helper keeps
+# them from drifting. See the docstring on pick_num_kv_splits_ceiling().
+# ----------------------------------------------------------------------------
+
+# Fallback ceiling when device SM count is unavailable (e.g. older CUDA
+# runtime that doesn't expose it, or non-NVIDIA/AMD device without a
+# well-defined "core count"). Historically this was the hardcoded
+# --triton-attention-num-kv-splits default on SGLang and is a safe
+# no-regression baseline.
+_AUTO_KV_SPLITS_FALLBACK = 8
+
+# Target SM-occupancy safety margin. We want grid_blocks ≥ SMs so every
+# SM has work; 1.5× gives the Triton scheduler some flex (co-scheduling
+# with other kernels, register spill variants, etc.). Empirically this
+# lands in the monotonic-improvement region of the 2026-05-01 gpt-oss
+# sweep on H100 (splits 8→16→32→64 yielded 29→47→66→84 tok/s at 81K
+# c=1 decode; splits=128 plateaued at 82). Because the inner kernel
+# log-scales its SM demand with context length, the picker multiplies
+# the raw SM count by log2(max_context_len/64) before applying this
+# safety margin — so at long advertised contexts the ceiling saturates
+# at _AUTO_KV_SPLITS_MAX, which matches the plateau we observed.
+_AUTO_KV_SPLITS_SM_SAFETY = 1.5
+
+# Hard floor and ceiling. Floor: never pick below the prior default
+# (avoid regressing existing workloads that worked fine at low ceilings).
+# Ceiling: the Triton kernel allocates scratch buffers sized by
+# max_kv_splits per CUDA-graph bucket; past 128 the merge overhead
+# dominates and memory grows without speed benefit (observed in sweep).
+_AUTO_KV_SPLITS_MIN = 8
+_AUTO_KV_SPLITS_MAX = 128
+
+
+def pick_num_kv_splits_ceiling(
+    *,
+    device_core_count: Optional[int],
+    num_head: int,
+    num_kv_head: int,
+    max_context_len: Optional[int],
+    backend_name: str = "triton-attention",
+) -> int:
+    """Pick the KV-splits ceiling for a flash-decoding backend at init.
+
+    Intent: give the per-step ``get_num_kv_splits_triton`` kernel enough
+    headroom to fully saturate the device's SMs at c=1 bs=1 decode across
+    the full advertised context length. Two competing factors:
+
+    1. **Grid-block count**: the inner kernel's token_grid at decode is
+       ``num_seq * num_group * cdiv(num_head, BLOCK_H=16)`` (see the
+       hybrid-attention branch of ``get_num_kv_splits_triton``). At c=1
+       bs=1 this collapses to ``cdiv(num_head, 16)`` for GQA or
+       ``num_head`` for MHA.
+    2. **The inner kernel's log-scaling of the effective SM budget**:
+       at max_seq_len it computes
+       ``ext_device_core_count = device_core_count * max(log2(seq/64), 1.0)``
+       to size the KV chunks. That's what actually determines how many
+       splits it wants; we must at least match its demand or we clamp
+       it low. Mirroring the same formula at ``max_context_len`` gives
+       a ceiling that scales with the model's full context.
+
+    We pick a ceiling such that
+        splits * token_grid(c=1) >= ext_SM * safety
+    which rearranges to
+        splits >= ceil(ext_SM * safety / cdiv(num_head, 16))
+
+    Bounded below by ``_AUTO_KV_SPLITS_MIN`` (no-regression vs prior
+    default) and above by ``_AUTO_KV_SPLITS_MAX`` (past this point
+    scratch memory grows faster than speed improves — observed
+    empirically in the 2026-05-01 gpt-oss sweep).
+
+    Returns the picked ceiling and logs the derivation at INFO level.
+    ``backend_name`` shows up in the log line for attribution.
+    """
+    if device_core_count is None or device_core_count <= 0:
+        logger.info(
+            "%s num_kv_splits: SM count unavailable (device_core_count=%s), "
+            "using fallback ceiling of %d.",
+            backend_name,
+            device_core_count,
+            _AUTO_KV_SPLITS_FALLBACK,
+        )
+        return _AUTO_KV_SPLITS_FALLBACK
+
+    # Mirror the Triton kernel's token_grid math at c=1 bs=1.
+    BLOCK_H = 16
+    if num_kv_head == 0:
+        # Shouldn't happen on a real model, but defend against it —
+        # divide-by-zero in num_kv_group below would be ugly.
+        return _AUTO_KV_SPLITS_FALLBACK
+    num_kv_group = num_head // num_kv_head
+    if num_kv_group <= 1:
+        token_grid_c1 = max(1, num_head)
+    else:
+        token_grid_c1 = max(1, math.ceil(num_head / min(BLOCK_H, num_kv_group)))
+
+    # Mirror the inner kernel's ext_device_core_count = SMs * log2(seq/64)
+    # at the full advertised context length.
+    if max_context_len and max_context_len > 64:
+        ext_multiplier = max(1.0, math.log2(max_context_len / 64.0))
+    else:
+        ext_multiplier = 1.0
+    ext_sm = device_core_count * ext_multiplier
+
+    target_blocks = ext_sm * _AUTO_KV_SPLITS_SM_SAFETY
+    raw_splits = math.ceil(target_blocks / token_grid_c1)
+    picked = max(_AUTO_KV_SPLITS_MIN, min(raw_splits, _AUTO_KV_SPLITS_MAX))
+
+    logger.info(
+        "%s num_kv_splits auto-picked: %d "
+        "(device_core_count=%d, max_context_len=%d, ext_multiplier=%.2f, "
+        "num_head=%d, num_kv_head=%d, token_grid@c=1=%d, target_blocks=%.1f, "
+        "raw=%d, bounded to [%d, %d]). "
+        "Pass --triton-attention-num-kv-splits to override.",
+        backend_name,
+        picked,
+        device_core_count,
+        max_context_len or 0,
+        ext_multiplier,
+        num_head,
+        num_kv_head,
+        token_grid_c1,
+        target_blocks,
+        raw_splits,
+        _AUTO_KV_SPLITS_MIN,
+        _AUTO_KV_SPLITS_MAX,
+    )
+    return picked
 
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
@@ -105,10 +241,18 @@ class TritonAttnBackend(AttentionBackend):
             extend_attention_fwd,
             extend_attention_fwd_unified,
         )
+        from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+            tq_decode_attention_fwd,
+        )
+        from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
+            tq_extend_attention_fwd,
+        )
 
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
+        self.tq_decode_attention_fwd = torch.compiler.disable(tq_decode_attention_fwd)
+        self.tq_extend_attention_fwd = torch.compiler.disable(tq_extend_attention_fwd)
         self.extend_attention_fwd = torch.compiler.disable(extend_attention_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
             extend_attention_fwd_unified
@@ -155,9 +299,11 @@ class TritonAttnBackend(AttentionBackend):
             self.v_head_dim = model_runner.token_to_kv_pool.get_v_head_dim()
             self.swa_v_head_dim = None
         else:
-            self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[
-                -1
-            ]
+            pool = model_runner.token_to_kv_pool
+            if hasattr(pool, "get_v_head_dim"):
+                self.v_head_dim = pool.get_v_head_dim()
+            else:
+                self.v_head_dim = pool.get_value_buffer(0).shape[-1]
             self.swa_v_head_dim = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
@@ -209,10 +355,37 @@ class TritonAttnBackend(AttentionBackend):
                 model_runner.server_args.triton_attention_split_tile_size
             )
 
+        # Ceiling on KV splits used by the flash-decoding kernel at decode.
+        # Stock-equivalent default is the explicit server arg (8). The
+        # Omniva dynamic picker is research-only and must be enabled with
+        # SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS=1 so non-TQ stock-parity
+        # runs do not carry a default-active behavior change.
+        user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        auto_kv_splits = get_bool_env_var(
+            "SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS", "false"
+        )
         if self.split_tile_size is not None:
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
+        elif auto_kv_splits:
+            self.max_kv_splits = pick_num_kv_splits_ceiling(
+                device_core_count=self.device_core_count,
+                num_head=self.num_head,
+                num_kv_head=self.num_kv_head,
+                max_context_len=self.max_context_len,
+                backend_name="triton-attention",
+            )
+        elif user_max_kv_splits is not None:
+            self.max_kv_splits = user_max_kv_splits
+        else:
+            self.max_kv_splits = _AUTO_KV_SPLITS_FALLBACK
+        if self.use_mla and not auto_kv_splits and self.split_tile_size is None:
+            self.max_kv_splits = _mla_decode_kv_splits_cap(
+                self.max_kv_splits,
+                self.device_core_count,
+                self.max_context_len,
+            )
 
         # Check arguments
         assert not (
@@ -1039,8 +1212,10 @@ class TritonAttnBackend(AttentionBackend):
         else:
             o = torch.empty_like(q)
 
+        _kv_from_pool = False  # Track if K/V came from dequant buffer (already rotspace)
         if k is None and v is None:
-            pool = self.token_to_kv_pool
+            _kv_from_pool = True
+            pool = forward_batch.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
                 cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
@@ -1113,11 +1288,56 @@ class TritonAttnBackend(AttentionBackend):
         ):
             causal = False
 
+        # TurboQuant: rotate Q into WHT domain; rotate K/V only if fresh (not from pool)
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
+        )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        if tq_config is not None:
+            if (
+                not _kv_from_pool
+                and k is not None
+                and v is not None
+                and layer.qk_head_dim == layer.v_head_dim
+            ):
+                # Batch Q+K+V rotation into single WHT launch (3→1)
+                q_shape, k_shape, v_shape = q.shape, k.shape, v.shape
+                q_flat = q.reshape(-1, layer.qk_head_dim)
+                k_flat = k.reshape(-1, layer.qk_head_dim)
+                v_flat = v.reshape(-1, layer.v_head_dim)
+                nq, nk = q_flat.shape[0], k_flat.shape[0]
+                qkv_rot = tq_config.rotate_query(
+                    torch.cat([q_flat, k_flat, v_flat], dim=0)
+                )
+                q = qkv_rot[:nq].view(q_shape)
+                k = qkv_rot[nq : nq + nk].view(k_shape)
+                v = qkv_rot[nq + nk :].view(v_shape)
+            else:
+                # Fallback: separate rotations (pool KV or asymmetric head dims)
+                q = tq_config.rotate_query(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                ).reshape(q.shape)
+                if not _kv_from_pool:
+                    if k is not None:
+                        k = tq_config.rotate_query(
+                            k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
+                        ).reshape(k.shape)
+                    if v is not None:
+                        v = tq_config.rotate_query(
+                            v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
+                        ).reshape(v.shape)
+
         # Deterministic mode: use unified 1-stage kernel
         if self.enable_deterministic:
-            return self._forward_extend_unified(
+            o = self._forward_extend_unified(
                 q, o, layer, forward_batch, causal, logits_soft_cap, sinks
             )
+            if tq_config is not None:
+                o = tq_config.inverse_rotate_output(
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                ).reshape(o.shape)
+            return o
 
         # Normal mode: use original 2-stage kernel
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
@@ -1140,29 +1360,102 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            self.forward_metadata.qo_indptr,
-            kv_indptr,
-            kv_indices,
-            self.forward_metadata.custom_mask,
-            causal,
-            self.forward_metadata.mask_indptr,
-            self.forward_metadata.max_extend_len,
-            k_descale,
-            v_descale,
-            layer.scaling,
-            logit_cap=logits_soft_cap,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
-            window_kv_offsets=window_kv_offsets,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        # Get prefix KV buffers
+        pool = forward_batch.token_to_kv_pool
+        if (tq_config is not None
+            and tq_config.k_bit_width in (2, 4)
+            and tq_config.v_bit_width in (2, 4)
+            and not self.enable_deterministic
+            and kv_indptr is not None):
+            # Fused TQ extend: read packed uint8 KV directly, skip dequant buffer.
+            # Supports symmetric and asymmetric K/V bit widths, plus
+            # sliding-window attention (sliding_window_size > 0) via the
+            # windowed kernel path in turboquant_extend_attention.py. The
+            # pool-agnostic get_tq_* accessors route to the right sub-pool
+            # when `pool` is a SWAKVPool wrapping TQ sub-pools (gpt-oss
+            # hybrid-SWA case).
+            if hasattr(pool, "get_tq_k_buffer"):
+                k_buf = pool.get_tq_k_buffer(layer.layer_id)
+                v_buf = pool.get_tq_v_buffer(layer.layer_id)
+                k_scale_buf = pool.get_tq_k_dequant_scale(layer.layer_id)
+                v_scale_buf = pool.get_tq_v_dequant_scale(layer.layer_id)
+            else:
+                idx = layer.layer_id - pool.start_layer
+                k_buf = pool.k_buffer[idx]
+                v_buf = pool.v_buffer[idx]
+                k_scale_buf = pool.k_dequant_scale_buffer[idx]
+                v_scale_buf = pool.v_dequant_scale_buffer[idx]
+            self.tq_extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                k_buf,
+                v_buf,
+                k_scale_buf,
+                v_scale_buf,
+                tq_config.k_centroids,
+                tq_config.v_centroids,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                sm_scale=layer.scaling,
+                k_bit_width=tq_config.k_bit_width,
+                v_bit_width=tq_config.v_bit_width,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                sliding_window_size=sliding_window_size,
+                window_kv_offsets=window_kv_offsets,
+            )
+        else:
+            # Fallback: standard extend kernel (non-TQ path)
+            if tq_config is not None:
+                # enable_deterministic=True is not yet routed through the
+                # fused TQ extend kernel (would need bitwise-stable split-dot
+                # order — possible but extra work). Sliding_window is now
+                # supported above; the only remaining unsupported TQ extend
+                # configuration is enable_deterministic.
+                raise RuntimeError(
+                    "TurboQuant extend fallback not supported: "
+                    "enable_deterministic must be False."
+                )
+            key_buffer = pool.get_key_buffer(layer.layer_id)
+            value_buffer = pool.get_value_buffer(layer.layer_id)
+
+            self.extend_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                key_buffer,
+                value_buffer,
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.custom_mask,
+                causal,
+                self.forward_metadata.mask_indptr,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                logit_cap=logits_soft_cap,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_kv_offsets=window_kv_offsets,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        # TurboQuant: inverse-rotate output back to original domain
+        # (skipped when rotation is fused into o_proj weights)
+        if tq_config is not None and not getattr(tq_config, 'output_rotation_fused', False):
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
         return o
 
     def _forward_extend_unified(
@@ -1380,26 +1673,91 @@ class TritonAttnBackend(AttentionBackend):
         ):
             attn_logits = self.forward_metadata.swa_attn_logits
 
-        self.decode_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            self.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            self.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            kv_indptr,
-            kv_indices,
-            attn_logits,
-            self.forward_metadata.attn_lse,
-            self.forward_metadata.num_kv_splits,
-            self.max_kv_splits,
-            layer.scaling,
-            k_descale,
-            v_descale,
-            logit_cap=logits_soft_cap,
-            sinks=sinks,
-            xai_temperature_len=layer.xai_temperature_len,
-            has_mla=self.use_mla,
-            use_pdl=self.use_pdl,
+        # TurboQuant: rotate Q into WHT domain
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            get_mha_turboquant_config,
         )
+
+        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        if tq_config is not None:
+            q = tq_config.rotate_query(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            ).reshape(q.shape)
+
+        if tq_config is not None and tq_config.k_bit_width in (2, 4) and tq_config.v_bit_width in (2, 4):
+            # Fused TQ decode: read packed uint8 KV directly, skip dequant buffer.
+            # Supports symmetric (K=V) and asymmetric (K!=V) bit widths.
+            #
+            # Buffer access goes through get_tq_* accessors rather than direct
+            # .k_buffer[idx] indexing so the fast path works for both flat
+            # MHATokenToKVPoolTurboQuant pools (where the accessor is just
+            # self.k_buffer[layer_id - start_layer]) and hybrid SWAKVPool
+            # wrappers (which dispatch to full/swa sub-pool via layers_mapping).
+            # Models that go through SWA — e.g. GptOssForCausalLM — need this
+            # indirection; the plain list-index fails because SWAKVPool has
+            # no top-level k_buffer attribute, only sub-pools do.
+            pool = forward_batch.token_to_kv_pool
+            if hasattr(pool, "get_tq_k_buffer"):
+                k_buf = pool.get_tq_k_buffer(layer.layer_id)
+                v_buf = pool.get_tq_v_buffer(layer.layer_id)
+                k_scale_buf = pool.get_tq_k_dequant_scale(layer.layer_id)
+                v_scale_buf = pool.get_tq_v_dequant_scale(layer.layer_id)
+            else:
+                idx = layer.layer_id - pool.start_layer
+                k_buf = pool.k_buffer[idx]
+                v_buf = pool.v_buffer[idx]
+                k_scale_buf = pool.k_dequant_scale_buffer[idx]
+                v_scale_buf = pool.v_dequant_scale_buffer[idx]
+            self.tq_decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k_buf,
+                v_buf,
+                k_scale_buf,
+                v_scale_buf,
+                tq_config.k_centroids,
+                tq_config.v_centroids,
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_bit_width=tq_config.k_bit_width,
+                v_bit_width=tq_config.v_bit_width,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                uniform=getattr(tq_config, 'uniform', False),
+            )
+        else:
+            self.decode_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                kv_indptr,
+                kv_indices,
+                attn_logits,
+                self.forward_metadata.attn_lse,
+                self.forward_metadata.num_kv_splits,
+                self.max_kv_splits,
+                layer.scaling,
+                k_descale,
+                v_descale,
+                logit_cap=logits_soft_cap,
+                sinks=sinks,
+                xai_temperature_len=layer.xai_temperature_len,
+                has_mla=self.use_mla,
+                use_pdl=self.use_pdl,
+            )
+
+        # TurboQuant: inverse-rotate output back to original domain
+        if tq_config is not None and not getattr(tq_config, 'output_rotation_fused', False):
+            o = tq_config.inverse_rotate_output(
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            ).reshape(o.shape)
         return o
 
 

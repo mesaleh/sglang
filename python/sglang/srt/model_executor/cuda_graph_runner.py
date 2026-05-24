@@ -22,9 +22,10 @@ import inspect
 import logging
 import os
 from contextlib import contextmanager
+from dataclasses import dataclass
 from functools import partial
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import tqdm
@@ -68,7 +69,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.input_buffers import share_input_buffers_in
+from sglang.srt.model_executor.input_buffers import (
+    ForwardInputBuffers,
+    share_input_buffers_in,
+)
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.utils import (
     empty_context,
@@ -157,134 +161,306 @@ def build_replay_fb_view(
     )
 
 
-def _allocate_decode_buffers(
-    *,
-    device: torch.device,
-    max_bs: int,
-    max_num_token: int,
-    hidden_size: int,
-    vocab_size: int,
-    dtype: torch.dtype,
-    dp_size: int,
-    pp_size: int,
-    is_encoder_decoder: bool,
-    require_mlp_tp_gather: bool,
-    seq_len_fill_value: int,
-    encoder_len_fill_value: int,
-    num_tokens_per_bs: int,
-    cache_loc_dtype: torch.dtype,
-    enable_mamba_track: bool,
-    ne_token_table: Optional[torch.Tensor] = None,
-    hc_hidden_size: Optional[int] = None,
-) -> SimpleNamespace:
-    """Allocate the FB-shared decode buffers as a namespace adopted by
-    ``build_decode_registry(source=...)``."""
-    with torch.device(device):
-        input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
-        input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
-        req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
-        seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
-        out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
-        positions = torch.zeros((max_num_token,), dtype=torch.int64)
-        mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
-        num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
-        custom_mask = torch.ones(
-            (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
-            dtype=torch.bool,
-        )
-        next_token_logits_buffer = torch.zeros(
-            (max_num_token, vocab_size),
-            dtype=torch.float,
-        )
-        mamba_track_indices = (
-            torch.zeros((max_bs,), dtype=torch.int64) if enable_mamba_track else None
-        )
-        mamba_track_mask = (
-            torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
-        )
+_has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
-        if pp_size > 1:
-            # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
-            is_mhc = hc_hidden_size is not None
-            hs = hc_hidden_size if is_mhc else hidden_size
-            pp_proxy_tensors = {
-                "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
-            }
-            if not is_mhc:
-                pp_proxy_tensors["residual"] = torch.zeros(
-                    (max_bs, hidden_size), dtype=dtype
+
+def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+    """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
+
+    def foreach_copy(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
+        if _has_foreach_copy:
+            torch._foreach_copy_(dsts, srcs)
+        else:
+            for dst, src in zip(dsts, srcs):
+                dst.copy_(src)
+
+    groups: Dict[Tuple[torch.dtype, torch.dtype], Tuple[List, List]] = {}
+    for dst, src in zip(dsts, srcs):
+        key = (dst.dtype, src.dtype)
+        if key not in groups:
+            groups[key] = ([], [])
+        groups[key][0].append(dst)
+        groups[key][1].append(src)
+    for group_dsts, group_srcs in groups.values():
+        foreach_copy(group_dsts, group_srcs)
+
+
+@dataclass
+class DecodeInputBuffers(ForwardInputBuffers):
+
+    input_ids: torch.Tensor
+    input_embeds: torch.Tensor
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    out_cache_loc: torch.Tensor
+    out_cache_loc_swa: Optional[torch.Tensor]
+    positions: torch.Tensor
+    mrope_positions: torch.Tensor
+    num_token_non_padded: torch.Tensor
+    custom_mask: torch.Tensor
+    next_token_logits_buffer: torch.Tensor
+    mamba_track_indices: Optional[torch.Tensor]
+    mamba_track_mask: Optional[torch.Tensor]
+    global_num_tokens_gpu: torch.Tensor
+    global_num_tokens_for_logprob_gpu: torch.Tensor
+    encoder_lens: Optional[torch.Tensor]
+    pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
+    ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        device: torch.device,
+        max_bs: int,
+        max_num_token: int,
+        hidden_size: int,
+        vocab_size: int,
+        dtype: torch.dtype,
+        dp_size: int,
+        pp_size: int,
+        is_encoder_decoder: bool,
+        require_mlp_tp_gather: bool,
+        seq_len_fill_value: int,
+        encoder_len_fill_value: int,
+        num_tokens_per_bs: int,
+        cache_loc_dtype: torch.dtype,
+        enable_mamba_track: bool,
+        ne_token_table: Optional[torch.Tensor] = None,
+        is_hybrid_swa: bool = False,
+        hc_hidden_size: Optional[int] = None,
+        num_pp_proxy_aux_hidden_states: int = 0,
+    ) -> "DecodeInputBuffers":
+        with torch.device(device):
+            input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
+            input_embeds = torch.zeros((max_num_token, hidden_size), dtype=dtype)
+            req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
+            seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
+            out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            out_cache_loc_swa = (
+                torch.zeros((max_num_token,), dtype=torch.int32)
+                if is_hybrid_swa
+                else None
+            )
+            positions = torch.zeros((max_num_token,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, max_num_token), dtype=torch.int64)
+            num_token_non_padded = torch.zeros((1,), dtype=torch.int32)
+            custom_mask = torch.ones(
+                (max_bs * seq_len_fill_value + max_num_token) * num_tokens_per_bs,
+                dtype=torch.bool,
+            )
+            next_token_logits_buffer = torch.zeros(
+                (max_num_token, vocab_size),
+                dtype=torch.float,
+            )
+            mamba_track_indices = (
+                torch.zeros((max_bs,), dtype=torch.int64)
+                if enable_mamba_track
+                else None
+            )
+            mamba_track_mask = (
+                torch.zeros((max_bs,), dtype=torch.bool) if enable_mamba_track else None
+            )
+
+            if pp_size > 1:
+                # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+                is_mhc = hc_hidden_size is not None
+                hs = hc_hidden_size if is_mhc else hidden_size
+                pp_proxy_tensors = {
+                    "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
+                }
+                if not is_mhc:
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        (max_num_token, hidden_size), dtype=dtype
+                    )
+                for aux_index in range(num_pp_proxy_aux_hidden_states):
+                    pp_proxy_tensors[f"aux_hidden_states_{aux_index}"] = torch.zeros(
+                        (max_num_token, hidden_size), dtype=dtype
+                    )
+            else:
+                pp_proxy_tensors = None
+
+            if is_encoder_decoder:
+                encoder_lens = torch.full(
+                    (max_bs,), encoder_len_fill_value, dtype=torch.int32
                 )
-        else:
-            pp_proxy_tensors = None
+            else:
+                encoder_lens = None
 
-        if is_encoder_decoder:
-            encoder_lens = torch.full(
-                (max_bs,), encoder_len_fill_value, dtype=torch.int32
-            )
-        else:
-            encoder_lens = None
+            if require_mlp_tp_gather:
+                global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
+                global_num_tokens_for_logprob_gpu = torch.zeros(
+                    (dp_size,), dtype=torch.int32
+                )
+            else:
+                global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
+                global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
-        if require_mlp_tp_gather:
-            global_num_tokens_gpu = torch.zeros((dp_size,), dtype=torch.int32)
-            global_num_tokens_for_logprob_gpu = torch.zeros(
-                (dp_size,), dtype=torch.int32
+            ngram_embedding_info = (
+                NgramEmbeddingInfo(
+                    token_table=ne_token_table,
+                    column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                    req_lens=torch.ones([max_bs], dtype=torch.int32),
+                    out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
+                    out_req_lens=torch.ones([max_bs], dtype=torch.int32),
+                )
+                if ne_token_table is not None
+                else None
             )
-        else:
-            global_num_tokens_gpu = torch.zeros((1,), dtype=torch.int32)
-            global_num_tokens_for_logprob_gpu = torch.zeros((1,), dtype=torch.int32)
 
-        ngram_embedding_info = (
-            NgramEmbeddingInfo(
-                token_table=ne_token_table,
-                column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                req_lens=torch.ones([max_bs], dtype=torch.int32),
-                out_column_starts=torch.zeros([max_bs], dtype=torch.int32),
-                out_req_lens=torch.ones([max_bs], dtype=torch.int32),
-            )
-            if ne_token_table is not None
-            else None
+        # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
+        seq_lens_cpu = torch.full(
+            (max_bs,),
+            seq_len_fill_value,
+            dtype=torch.int32,
+            device="cpu",
         )
 
-        if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
-            rids_int = torch.zeros((max_bs,), dtype=torch.int64)
-            bootstrap_room_ids_int = torch.full((max_bs,), -1, dtype=torch.int64)
-        else:
-            rids_int = None
-            bootstrap_room_ids_int = None
+        return cls(
+            input_ids=input_ids,
+            input_embeds=input_embeds,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=out_cache_loc,
+            out_cache_loc_swa=out_cache_loc_swa,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            num_token_non_padded=num_token_non_padded,
+            custom_mask=custom_mask,
+            next_token_logits_buffer=next_token_logits_buffer,
+            mamba_track_indices=mamba_track_indices,
+            mamba_track_mask=mamba_track_mask,
+            encoder_lens=encoder_lens,
+            global_num_tokens_gpu=global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            pp_proxy_tensors=pp_proxy_tensors,
+            ngram_embedding_info=ngram_embedding_info,
+        )
 
-    seq_lens_cpu = torch.full(
-        (max_bs,),
-        seq_len_fill_value,
-        dtype=torch.int32,
-        device="cpu",
-    )
+    def populate_from_forward_batch(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        raw_bs: int,
+        raw_num_token: int,
+        bs: int,
+        seq_len_fill_value: int,
+        require_gathered_buffer: bool,
+        num_tokens_per_bs: int,
+        nsa_enable_prefill_cp: bool,
+        enable_num_token_non_padded_flag: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        if bs != raw_bs:
+            self.seq_lens.fill_(seq_len_fill_value)
+            self.out_cache_loc.zero_()
+            # Padded SWA indices left over from a previous replay would point
+            # into real SWA slots, so set_kv_buffer on padded tokens would
+            # corrupt active requests' KV. Zero the whole buffer so padded
+            # positions map to the sentinel slot (matches piecewise runner).
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
+            if self.mamba_track_indices is not None:
+                self.mamba_track_indices.zero_()
+            if self.mamba_track_mask is not None:
+                self.mamba_track_mask.fill_(False)
 
-    return SimpleNamespace(
-        input_ids=input_ids,
-        input_embeds=input_embeds,
-        req_pool_indices=req_pool_indices,
-        seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens_cpu,
-        out_cache_loc=out_cache_loc,
-        positions=positions,
-        mrope_positions=mrope_positions,
-        num_token_non_padded=num_token_non_padded,
-        custom_mask=custom_mask,
-        next_token_logits_buffer=next_token_logits_buffer,
-        mamba_track_indices=mamba_track_indices,
-        mamba_track_mask=mamba_track_mask,
-        encoder_lens=encoder_lens,
-        global_num_tokens_gpu=global_num_tokens_gpu,
-        global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
-        pp_proxy_tensors=pp_proxy_tensors,
-        ngram_embedding_info=ngram_embedding_info,
-        rids_int=rids_int,
-        bootstrap_room_ids_int=bootstrap_room_ids_int,
-    )
+        # Build batched copy lists for all GPU tensors.
+        dsts = [
+            self.input_ids[:raw_num_token],
+            self.req_pool_indices[:raw_bs],
+            self.seq_lens[:raw_bs],
+            self.out_cache_loc[:raw_num_token],
+            self.positions[:raw_num_token],
+        ]
+        srcs = [
+            forward_batch.input_ids,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+        ]
+
+        if self.ngram_embedding_info is not None:
+            ngram_embedding_info = forward_batch.ngram_embedding_info
+            self.ngram_embedding_info.column_starts[:raw_bs].copy_(
+                ngram_embedding_info.column_starts
+            )
+            self.ngram_embedding_info.req_lens[:raw_bs].copy_(
+                ngram_embedding_info.req_lens
+            )
+
+        if (
+            self.mamba_track_indices is not None
+            and forward_batch.mamba_track_indices is not None
+        ):
+            dsts.append(self.mamba_track_indices[:raw_bs])
+            srcs.append(forward_batch.mamba_track_indices)
+        if (
+            self.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask is not None
+        ):
+            dsts.append(self.mamba_track_mask[:raw_bs])
+            srcs.append(forward_batch.mamba_track_mask)
+
+        if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
+            dsts.append(self.encoder_lens[:raw_bs])
+            srcs.append(forward_batch.encoder_lens)
+
+        if forward_batch.mrope_positions is not None:
+            dsts.append(self.mrope_positions[:, :raw_num_token])
+            srcs.append(forward_batch.mrope_positions)
+
+        if require_gathered_buffer:
+            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
+            self.global_num_tokens_for_logprob_gpu.fill_(bs * num_tokens_per_bs)
+
+        if enable_num_token_non_padded_flag:
+            if require_gathered_buffer and not nsa_enable_prefill_cp:
+                num_tokens_per_dp = bs * num_tokens_per_bs
+                local = compute_local_num_token_non_padded(
+                    global_num_token_non_padded=forward_batch.num_token_non_padded,
+                    num_tokens_per_dp=num_tokens_per_dp,
+                )
+                dsts.append(self.num_token_non_padded)
+                srcs.append(local)
+            else:
+                dsts.append(self.num_token_non_padded)
+                srcs.append(forward_batch.num_token_non_padded)
+
+        # Pipeline-parallel proxy tensors.
+        if pp_proxy_tensors is not None and self.pp_proxy_tensors is not None:
+            for key, buf in self.pp_proxy_tensors.items():
+                src = pp_proxy_tensors.tensors[key]
+                dim = src.shape[0]
+                dsts.append(buf[:dim])
+                srcs.append(src)
+
+        # SWA cache location (int32, separate from the int64 batch above).
+        if (
+            self.out_cache_loc_swa is not None
+            and forward_batch.out_cache_loc_swa is not None
+        ):
+            dsts.append(self.out_cache_loc_swa[:raw_num_token])
+            srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
+
+        # Batch all GPU copies, grouped by dtype pair.
+        _grouped_foreach_copy_(dsts, srcs)
+
+        # CPU tensor copy (cannot be batched with GPU tensors).
+        if forward_batch.seq_lens_cpu is not None:
+            if bs != raw_bs:
+                self.seq_lens_cpu.fill_(seq_len_fill_value)
+            self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
 
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
+# When capturing dual MoE backends, tracks which variant is being captured.
+# None = not dual, "lora" = capturing lora variant, "nolora" = capturing nolora variant.
+_capture_lora_variant: Optional[str] = None
 
 
 def get_is_capture_mode():
@@ -295,6 +471,16 @@ def compile_in_capture_mode(func):
     if get_is_capture_mode():
         return torch.compile(func)
     return func
+
+
+def get_capture_lora_variant() -> Optional[str]:
+    """Return the lora variant being captured, or None if not in dual capture."""
+    return _capture_lora_variant
+
+
+def _set_capture_lora_variant(variant: Optional[str]):
+    global _capture_lora_variant
+    _capture_lora_variant = variant
 
 
 @contextmanager
@@ -556,6 +742,7 @@ class CudaGraphRunner:
             if self.is_encoder_decoder
             else 0
         )
+        num_pp_proxy_aux_hidden_states = self._num_pp_proxy_aux_hidden_states()
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -598,6 +785,7 @@ class CudaGraphRunner:
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
+            num_pp_proxy_aux_hidden_states=num_pp_proxy_aux_hidden_states,
         )
         share_input_buffers_in(self.buffers)
         # The registry adopts these buffers (one data_ptr for capture + replay).
@@ -628,6 +816,25 @@ class CudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _num_pp_proxy_aux_hidden_states(self) -> int:
+        if (
+            self.pp_size <= 1
+            or self.model_runner.pp_rank == 0
+            or self.model_runner.is_draft_worker
+        ):
+            return 0
+
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        model = getattr(language_model, "model", None)
+        layers_to_capture = getattr(model, "layers_to_capture", None)
+        start_layer = getattr(model, "start_layer", None)
+        if not layers_to_capture or start_layer is None:
+            return 0
+
+        return sum(1 for layer_id in layers_to_capture if layer_id < start_layer)
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -1226,11 +1433,18 @@ class CudaGraphRunner:
                     if output.hidden_states is not None
                     else None
                 ),
+                mm_input_embeds=(
+                    output.mm_input_embeds[: self.raw_num_token]
+                    if output.mm_input_embeds is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

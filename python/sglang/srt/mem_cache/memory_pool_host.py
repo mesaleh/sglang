@@ -37,6 +37,8 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
+    MLATokenToKVPoolTurboQuant,
+    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.mmap_allocator import alloc_mmap
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -1314,6 +1316,261 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         )
         base_aligned = self.kv_buffer.data_ptr() % page_size_bytes == 0
         return base_aligned and stride % page_size_bytes == 0
+
+
+class MLATokenToKVPoolHostTurboQuant(HostKVCache):
+    """Host-side mirror of MLATokenToKVPoolTurboQuant's packed layout.
+
+    The parent MLATokenToKVPoolHost assumes a uniform element layout:
+    kv_cache_dim = kv_lora_rank + qk_rope_head_dim, single dtype, single
+    buffer. TurboQuant-MLA stores three separate device buffers per layer
+    with different dtypes and per-token widths:
+
+      - kv_nope_packed:  (size, 1, kv_lora_rank // 2) uint8   — packed 4-bit
+      - kv_nope_scale:   (size, 1)                  bfloat16  — per-token scale
+      - kv_rope:         (size, 1, qk_rope_head_dim) bfloat16  — raw rope
+
+    Total per-token-per-layer bytes (Kimi K2.6, lora=512, rope=64, k=4):
+      packed_nope (256) + scale (2) + rope (128) = 386 bytes.
+
+    We mirror this on pinned CPU memory as three separate contiguous
+    pinned tensors (one per layer per sub-buffer). Three small transfers
+    per layer per swap — simpler than a fused packed host layout, and
+    correctness-first as per the design doc.
+
+    v1 scope:
+      - layout = "layer_first" only.
+      - io_backend = "direct" only (simple cudaMemcpy, no JIT kernel).
+      - page_first / page_first_direct / kernel / kernel_ascend / disagg
+        pointer registration: raise NotImplementedError to surface early.
+
+    See OmniSec/Inference/Performance Optimization/Design - Hicache MLA
+    packed-layout transfer.md for the full rationale, prior-art references,
+    and falsification criteria.
+    """
+
+    device_pool: MLATokenToKVPoolTurboQuant
+
+    def __init__(
+        self,
+        device_pool: MLATokenToKVPoolTurboQuant,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
+        layout: str,
+        pin_memory: bool = True,
+        device: str = "cpu",
+        allocator_type: str = "default",
+    ):
+        # We don't honor override_kv_cache_dim — our layout is non-uniform.
+        # Parent's init reads get_size_per_token() to size the host pool,
+        # then calls init_kv_buffer(). We override both.
+        if layout != "layer_first":
+            raise NotImplementedError(
+                f"MLATokenToKVPoolHostTurboQuant v1 supports only "
+                f"layout='layer_first'; got {layout!r}."
+            )
+
+        # Store the device pool's layout params for buffer shaping (parent's
+        # __init__ calls get_size_per_token before self.device_pool is set, so
+        # we set it ourselves up-front).
+        self.device_pool = device_pool
+        self.kv_lora_rank = device_pool.kv_lora_rank
+        self.qk_rope_head_dim = device_pool.qk_rope_head_dim
+        self.layer_num = device_pool.layer_num
+        # 4-bit packed: 2 values per byte.
+        self.packed_dim = self.kv_lora_rank // 2
+        # Per-token-per-layer bytes for sizing the pool.
+        self._cell_bytes = self.packed_dim + 2 + self.qk_rope_head_dim * 2
+
+        super().__init__(
+            device_pool,
+            host_to_device_ratio,
+            host_size,
+            page_size,
+            layout,
+            pin_memory,
+            device,
+            allocator_type,
+        )
+
+    # ------------------------------------------------------------------
+    # Sizing (for parent pool allocator)
+    # ------------------------------------------------------------------
+
+    def get_size_per_token(self):
+        # Parent multiplies this by self.size to decide host memory. Units
+        # are bytes here — we override init_kv_buffer to allocate uint8
+        # tensors directly, so dtype.itemsize=1 on our buffers.
+        return self._cell_bytes * self.layer_num
+
+    def get_ksize_per_token(self):
+        # MLA has no separate K/V — this equals get_size_per_token.
+        return self.get_size_per_token()
+
+    # ------------------------------------------------------------------
+    # Buffer allocation
+    # ------------------------------------------------------------------
+
+    def init_kv_buffer(self):
+        # Three separate pinned CPU buffers per layer. Allocate each sub-buffer
+        # as a single contiguous per-layer tensor for simple indexing.
+        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+
+        # Packed nope: (layer_num, size, 1, packed_dim) uint8
+        self.kv_nope_packed_host = alloc_func(
+            (self.layer_num, self.size, 1, self.packed_dim),
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        # Scale: (layer_num, size, 1) bfloat16
+        self.kv_nope_scale_host = alloc_func(
+            (self.layer_num, self.size, 1),
+            dtype=torch.bfloat16,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+        # Rope: (layer_num, size, 1, qk_rope_head_dim) bfloat16
+        self.kv_rope_host = alloc_func(
+            (self.layer_num, self.size, 1, self.qk_rope_head_dim),
+            dtype=torch.bfloat16,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            allocator=self.allocator,
+        )
+
+        # Parent reads self.dtype to compute element_size in asserts / logs.
+        # Our "dtype" is heterogeneous; use uint8 as the accounting unit
+        # (matches get_size_per_token's byte accounting).
+        self.dtype = torch.uint8
+
+        # Parent also reads self.kv_buffer for debug paths. Return the
+        # largest sub-buffer (packed nope) as the nominal "kv_buffer" so
+        # any accidental use of .data_ptr() / .nbytes doesn't crash — but
+        # downstream logic in transfer methods must use the three named
+        # sub-buffers, not self.kv_buffer.
+        return self.kv_nope_packed_host
+
+    # ------------------------------------------------------------------
+    # Transfer: host -> device
+    # ------------------------------------------------------------------
+
+    def load_to_device_per_layer(
+        self, device_pool, host_indices, device_indices, layer_id, io_backend
+    ):
+        """Copy one layer's packed KV for host_indices into device_pool's
+        corresponding rows at device_indices. Three sub-transfers.
+        """
+        if io_backend != "direct":
+            raise NotImplementedError(
+                f"MLATokenToKVPoolHostTurboQuant v1 supports only "
+                f"io_backend='direct'; got {io_backend!r}. Use "
+                f"--hicache-io-backend direct."
+            )
+
+        # The parent 'direct' path for MLATokenToKVPoolHost uses
+        # transfer_kv_direct with src_layers=[...], dst_layers=[...].
+        # We call it three times, once per sub-buffer. Each sub-buffer
+        # has a different element size, which transfer_kv_direct handles
+        # by striding over its internal page_size parameter.
+        transfer_kv_direct(
+            src_layers=[self.kv_nope_packed_host[layer_id]],
+            dst_layers=[device_pool.kv_nope_packed_buffer[layer_id]],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+        )
+        transfer_kv_direct(
+            src_layers=[self.kv_nope_scale_host[layer_id]],
+            dst_layers=[device_pool.kv_nope_scale_buffer[layer_id]],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+        )
+        transfer_kv_direct(
+            src_layers=[self.kv_rope_host[layer_id]],
+            dst_layers=[device_pool.kv_rope_buffer[layer_id]],
+            src_indices=host_indices,
+            dst_indices=device_indices,
+            page_size=self.page_size,
+        )
+
+    # ------------------------------------------------------------------
+    # Transfer: device -> host
+    # ------------------------------------------------------------------
+
+    def backup_from_device_all_layer(
+        self, device_pool, host_indices, device_indices, io_backend
+    ):
+        """Copy all layers' packed KV from device_pool's device_indices into
+        host rows at host_indices. Three sub-transfers across all layers.
+        """
+        if io_backend != "direct":
+            raise NotImplementedError(
+                f"MLATokenToKVPoolHostTurboQuant v1 supports only "
+                f"io_backend='direct'; got {io_backend!r}."
+            )
+
+        # transfer_kv_direct accepts lists of per-layer tensors on each side.
+        transfer_kv_direct(
+            src_layers=device_pool.kv_nope_packed_buffer,
+            dst_layers=[self.kv_nope_packed_host[i] for i in range(self.layer_num)],
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            page_size=self.page_size,
+        )
+        transfer_kv_direct(
+            src_layers=device_pool.kv_nope_scale_buffer,
+            dst_layers=[self.kv_nope_scale_host[i] for i in range(self.layer_num)],
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            page_size=self.page_size,
+        )
+        transfer_kv_direct(
+            src_layers=device_pool.kv_rope_buffer,
+            dst_layers=[self.kv_rope_host[i] for i in range(self.layer_num)],
+            src_indices=device_indices,
+            dst_indices=host_indices,
+            page_size=self.page_size,
+        )
+
+    # ------------------------------------------------------------------
+    # External persistence (disagg / storage backends) — out of v1 scope
+    # ------------------------------------------------------------------
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        raise NotImplementedError(
+            "MLATokenToKVPoolHostTurboQuant v1 does not support external "
+            "persistence / storage backends (get_data_page). Our three-buffer "
+            "layout needs a purpose-built serialization format first."
+        )
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        # Return a zero uint8 page of the right total bytes. Used during
+        # warmup / prefetch placeholder; not semantically meaningful for us
+        # but must not raise.
+        return torch.zeros(
+            (self.layer_num * self.page_size * self._cell_bytes,),
+            dtype=torch.uint8,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        raise NotImplementedError(
+            "MLATokenToKVPoolHostTurboQuant v1 does not support external "
+            "persistence (set_from_flat_data_page)."
+        )
+
+    def get_contiguous_buf_infos(self):
+        raise NotImplementedError(
+            "MLATokenToKVPoolHostTurboQuant v1 does not support disaggregated "
+            "transfer engine (get_contiguous_buf_infos). Three-buffer layout "
+            "would need to register all three sub-buffers per layer."
+        )
 
 
 class MambaPoolHost(HostKVCache):

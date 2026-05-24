@@ -230,6 +230,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
+    "omniva_mxfp4",
     "aiter",
     "marlin",
 ]
@@ -3660,6 +3661,18 @@ class ServerArgs:
                 "Pipeline parallelism is incompatible with overlap schedule."
             )
 
+    def _supports_pipeline_parallel_speculative_decoding(self) -> bool:
+        immediate_output_forward = os.getenv(
+            "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD", "0"
+        ).lower() in ("1", "true", "yes", "on")
+        return (
+            self.pp_size == 2
+            and self.disable_overlap_schedule
+            and self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE")
+            and not self.enable_multi_layer_eagle
+            and immediate_output_forward
+        )
+
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.
 
@@ -4747,8 +4760,8 @@ class ServerArgs:
             "--kv-cache-dtype",
             type=str,
             default=ServerArgs.kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1", "turboquant_2bit", "turboquant_4bit", "turboquant_4bit_uniform", "turboquant_k4v2"],
+            help='Data type for kv cache storage. "auto" will use model data type. "turboquant_Xbit" for codebook quantization, "turboquant_Xbit_uniform" for uniform quantization (faster decode, slightly lower accuracy).',
         )
         parser.add_argument(
             "--enable-fp32-lm-head",
@@ -6717,7 +6730,12 @@ class ServerArgs:
             "--triton-attention-num-kv-splits",
             type=int,
             default=ServerArgs.triton_attention_num_kv_splits,
-            help="The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
+            help=(
+                "The number of KV splits in flash decoding Triton kernel. "
+                "Larger value is better in longer context scenarios. The "
+                "default value is 8. Omniva research dynamic picking is "
+                "available only when SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS=1."
+            ),
         )
         parser.add_argument(
             "--triton-attention-split-tile-size",
@@ -7421,9 +7439,18 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            assert self.disable_overlap_schedule, (
+                "Pipeline parallelism is not compatible with overlap schedule"
+            )
+            if self.speculative_algorithm is not None:
+                assert self._supports_pipeline_parallel_speculative_decoding(), (
+                    "Pipeline parallel speculative decoding is currently supported "
+                    "only for pp_size=2 with EAGLE, EAGLE3, or STANDALONE in "
+                    "non-overlap spec v1 mode and "
+                    "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD=1. Multi-layer "
+                    "EAGLE, NGRAM, DFLASH, Frozen-KV MTP, and pp_size>2 are not "
+                    "supported."
+                )
 
         assert not (
             self.dp_size > 1 and self.nnodes != 1 and not self.enable_dp_attention

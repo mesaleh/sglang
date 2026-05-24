@@ -394,6 +394,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        self.use_omniva_mxfp4 = get_moe_runner_backend().is_omniva_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
@@ -853,6 +854,33 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
 
+        if self.use_omniva_mxfp4:
+            # Omniva MXFP4 runner consumes weights exactly as registered by
+            # create_weights: uint8 [E, 2N, K/2] values + [E, 2N, K/32] E8M0
+            # scales + bf16 [E, 2N] biases. No swizzle (we don't use TMA)
+            # and no bf16 upcast (fits in 80 GiB only when packed).
+            #
+            # The only adjustment vs create_weights output: make the weight
+            # tensors strictly contiguous on their inner (packed) axis so
+            # stride_bk == 1. create_weights already allocates this way, but
+            # bf16 autograd-quantize paths sometimes re-wrap the buffers;
+            # .contiguous() is a no-op when already contiguous.
+            layer.w13_weight = Parameter(
+                layer.w13_weight.data.contiguous(), requires_grad=False
+            )
+            layer.w13_weight_scale = Parameter(
+                layer.w13_weight_scale.data.contiguous(), requires_grad=False
+            )
+            layer.w2_weight = Parameter(
+                layer.w2_weight.data.contiguous(), requires_grad=False
+            )
+            layer.w2_weight_scale = Parameter(
+                layer.w2_weight_scale.data.contiguous(), requires_grad=False
+            )
+            # Biases stay bf16. Keep for inline add in the runner.
+            torch.cuda.empty_cache()
+            return
+
         if self.use_triton_kernels:
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
@@ -1062,7 +1090,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
+        if self.use_omniva_mxfp4:
+            moe_runner_backend = MoeRunnerBackend.OMNIVA_MXFP4
+        elif moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
             if _use_aiter and get_moe_a2a_backend().supports_aiter():
                 moe_runner_backend = MoeRunnerBackend.AITER
@@ -1076,6 +1106,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(
                 moe_runner_backend, replace(moe_runner_config, activation="swiglu")
             )
+        elif moe_runner_backend.is_omniva_mxfp4():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif (
             moe_runner_backend.is_triton_kernels()
             or moe_runner_backend.is_triton()
@@ -1306,7 +1338,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
+        if backend.is_omniva_mxfp4():
+            from sglang.srt.layers.moe.moe_runner.omniva_mxfp4 import (
+                OmnivaMxfp4QuantInfo,
+            )
+
+            assert (
+                layer.moe_ep_size == 1
+            ), "Expert parallel is not supported by omniva_mxfp4 runner"
+            quant_info = OmnivaMxfp4QuantInfo(
+                w13_weight=layer.w13_weight,
+                w13_weight_scale=layer.w13_weight_scale,
+                w13_weight_bias=layer.w13_weight_bias,
+                w2_weight=layer.w2_weight,
+                w2_weight_scale=layer.w2_weight_scale,
+                w2_weight_bias=layer.w2_weight_bias,
+            )
+        elif backend.is_triton_kernels():
             from sglang.srt.layers.moe.moe_runner.triton_kernels import (
                 TritonKernelsQuantInfo,
             )

@@ -250,6 +250,15 @@ class Envs:
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
+    SGLANG_TQ_MLA_FUSED_KV_WRITE = EnvBool(False)
+    SGLANG_TQ_MLA_FUSED_ROPE_WRITE = EnvBool(False)
+    SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS = EnvInt(256)
+    SGLANG_TQ_MLA_FAST_METADATA = EnvBool(False)
+    SGLANG_TQ_MLA_FUSED_METADATA_INDICES = EnvBool(False)
+    SGLANG_TQ_MLA_STAGED_FLASHMLA = EnvBool(False)
+    SGLANG_TQ_MLA_STAGED_FLASHMLA_ALLOW_JIT = EnvBool(False)
+    SGLANG_TQ_MLA_STAGED_FLASHMLA_THREADS = EnvInt(512)
+    SGLANG_TQ_MLA_PROFILE_NVTX = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
     SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
@@ -505,6 +514,11 @@ class Envs:
     # SGLang needs to know FlashInfer NVFP4 4over6 config to compute the global scale factor.
     FLASHINFER_NVFP4_4OVER6 = EnvBool(False)
     FLASHINFER_NVFP4_4OVER6_E4M3_USE_256 = EnvBool(False)
+    # Token capacity for FlashInfer allreduce-fusion workspace pre-initialization.
+    SGLANG_FLASHINFER_ALLREDUCE_MAX_BATCH_SIZE = EnvInt(2048)
+    # Research gate: add an optional tensor to FlashInfer allreduce input before
+    # the allreduce. Used to fuse Kimi routed-output + shared-output on GB200.
+    SGLANG_FLASHINFER_PRE_ALLREDUCE_ADD_FUSION = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
@@ -608,6 +622,7 @@ class Envs:
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
+    SGLANG_FLASHINFER_ALLREDUCE_FUSION_MAX_TOKENS = EnvInt(2048)
     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE = EnvInt(4096)
     SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE = EnvInt(256)
 

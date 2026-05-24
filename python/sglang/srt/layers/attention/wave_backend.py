@@ -8,6 +8,7 @@ import torch
 import triton
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.triton_backend import pick_num_kv_splits_ceiling
 from sglang.srt.layers.attention.triton_ops.kv_indices import (
     create_flashinfer_kv_indices_triton,
 )
@@ -104,8 +105,17 @@ class WaveAttnBackend(AttentionBackend):
         self.static_kv_splits = get_bool_env_var(
             "SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS", "false"
         )
-        self.max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
-        self.v_head_dim = model_runner.token_to_kv_pool.get_value_buffer(0).shape[-1]
+        # max_kv_splits is assigned below, after max_context_len /
+        # device_core_count are known — the dynamic picker needs both.
+
+        # Prefer get_v_head_dim() when the pool exposes it. Packed-KV pool
+        # types (e.g. MHATokenToKVPoolTurboQuant) cannot serve a bf16 value
+        # buffer for shape probes.
+        pool = model_runner.token_to_kv_pool
+        if hasattr(pool, "get_v_head_dim"):
+            self.v_head_dim = pool.get_v_head_dim()
+        else:
+            self.v_head_dim = pool.get_value_buffer(0).shape[-1]
 
         self.forward_metadata: ForwardMetadata = None
 
@@ -113,6 +123,26 @@ class WaveAttnBackend(AttentionBackend):
 
         self.device = model_runner.device
         self.device_core_count = get_device_core_count(model_runner.gpu_id)
+
+        # See pick_num_kv_splits_ceiling in triton_backend.py for the shared
+        # derivation. Stock-equivalent default honors the explicit server arg
+        # (8); Omniva dynamic picking is research-only and env-gated.
+        user_max_kv_splits = model_runner.server_args.triton_attention_num_kv_splits
+        auto_kv_splits = get_bool_env_var(
+            "SGLANG_TRITON_DECODE_ATTN_AUTO_KV_SPLITS", "false"
+        )
+        if auto_kv_splits:
+            self.max_kv_splits = pick_num_kv_splits_ceiling(
+                device_core_count=self.device_core_count,
+                num_head=self.num_head,
+                num_kv_head=self.num_kv_head,
+                max_context_len=self.max_context_len,
+                backend_name="wave-attention",
+            )
+        elif user_max_kv_splits is not None:
+            self.max_kv_splits = user_max_kv_splits
+        else:
+            self.max_kv_splits = 8
 
     def get_num_kv_splits(
         self,

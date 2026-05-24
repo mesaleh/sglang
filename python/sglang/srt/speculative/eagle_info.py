@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_pp_group, get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.dp_attention import (
@@ -420,6 +420,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
 
+        pp_group = get_pp_group()
+        if pp_group.world_size > 1:
+            pp_group.broadcast(predict, src=0)
+            pp_group.broadcast(accept_index, src=0)
+            pp_group.broadcast(num_correct_drafts, src=0)
+
         if SIMULATE_ACC_LEN > 0.0:
             # Do simulation
             accept_index = generate_simulated_accept_index(
@@ -429,6 +435,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 bs=bs,
                 spec_steps=self.spec_steps,
             )
+            if pp_group.world_size > 1:
+                pp_group.broadcast(predict, src=0)
+                pp_group.broadcast(accept_index, src=0)
+                pp_group.broadcast(num_correct_drafts, src=0)
 
         # accept_index values index batch.out_cache_loc (size = bs * draft_token_num);
         # -1 is the reject sentinel.
