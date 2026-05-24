@@ -2548,7 +2548,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def kernel_warmup(self):
         """
         Warmup and tune kernels before cuda graph capture.
-        Currently only doing FlashInfer autotune.
+        Covers framework-level warmups and optional model-specific warmups.
         """
         if self.device != "cuda":
             return
@@ -2556,8 +2556,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self._should_run_flashinfer_autotune():
             self._flashinfer_autotune()
 
+        # Models may need their own warmup for model-specific kernels or JIT paths.
+        # Register those hooks on the model class so ModelRunner can keep this
+        # warmup entry point generic.
+        model_kernel_warmup = getattr(self.model, "kernel_warmup", None)
+        if model_kernel_warmup is not None:
+            model_kernel_warmup(self)
+
         # Pre-warm TurboQuant JIT kernels so they're compiled before CUDA graph capture
-        if hasattr(self, 'turboquant_bits'):
+        if hasattr(self, "turboquant_bits"):
             self._warmup_turboquant_kernels()
 
     def _pre_initialize_flashinfer_allreduce_workspace(self):
