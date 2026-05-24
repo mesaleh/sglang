@@ -233,6 +233,9 @@ class BaseRunner(ABC):
 
             pp_parallel_deep_gemm_warmup(self)
 
+        if hasattr(mr, "turboquant_bits"):
+            mr._warmup_turboquant_kernels()
+
     def _pre_initialize_flashinfer_allreduce_workspace(self):
         """Allocate flashinfer allreduce workspaces; must run before CG capture
         to keep broadcasts/barriers outside the capture context (else deadlock

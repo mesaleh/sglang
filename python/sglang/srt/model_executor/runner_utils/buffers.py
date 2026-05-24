@@ -106,6 +106,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
+        num_pp_proxy_aux_hidden_states: int = 0,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -142,6 +143,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
                         (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    )
+                for aux_index in range(num_pp_proxy_aux_hidden_states):
+                    pp_proxy_tensors[f"aux_hidden_states_{aux_index}"] = torch.zeros(
+                        (max_num_token, hidden_size), dtype=dtype
                     )
             else:
                 pp_proxy_tensors = None

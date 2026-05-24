@@ -46,9 +46,12 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MiniMaxSparseKVPool,
     MLATokenToKVPool,
+    MLATokenToKVPoolTurboQuant,
+    NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     MLATokenToKVPoolHost,
+    MLATokenToKVPoolHostTurboQuant,
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.radix_cache import (
@@ -96,6 +99,21 @@ class HiRadixCache(RadixCache):
         elif isinstance(self.kv_cache, MiniMaxSparseKVPool):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
+        elif isinstance(self.kv_cache, MLATokenToKVPoolTurboQuant):
+            # Packed TurboQuant-MLA layout: three separate sub-buffers on device
+            # (uint8 nope + bf16 scale + bf16 rope) instead of the uniform
+            # bf16 kv_buffer the parent host pool assumes. See
+            # OmniSec/Inference/Performance Optimization/Design - Hicache MLA
+            # packed-layout transfer.md for design rationale.
+            # MUST come before the generic MLATokenToKVPool branch (subclass).
+            self.token_to_kv_pool_host = MLATokenToKVPoolHostTurboQuant(
+                self.kv_cache,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = MLATokenToKVPoolHost(
                 self.kv_cache,

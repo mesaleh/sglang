@@ -23,6 +23,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdlib>
+
 #include "utils.h"
 
 using bf16_t = __nv_bfloat16;
@@ -624,8 +626,29 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 8>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
 
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 4>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 2>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 1>(
+    __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
 template void invokeFusedAGemm<__nv_bfloat16, 7168, 2112, 16>(
     __nv_bfloat16*, __nv_bfloat16 const*, __nv_bfloat16 const*, int num_tokens, cudaStream_t);
+
+int getForcedFusedAGemmTileN() {
+  static int forced_tile_n = [] {
+    char const* env = std::getenv("SGLANG_DSV3_FUSED_A_TILE_N");
+    if (env == nullptr || env[0] == '\0') {
+      return 0;
+    }
+    int const value = std::atoi(env);
+    return value == 1 || value == 2 || value == 4 || value == 8 || value == 16 ? value : 0;
+  }();
+  return forced_tile_n;
+}
 
 void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch::Tensor const& mat_b) {
   TORCH_CHECK(mat_a.dim() == 2 && mat_b.dim() == 2 && output.dim() == 2);
@@ -659,7 +682,29 @@ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a, torch:
 #endif
 
   auto stream = at::cuda::getCurrentCUDAStream(mat_a.get_device());
-  if (num_tokens <= 8) {
+  int const forced_tile_n = getForcedFusedAGemmTileN();
+  if (forced_tile_n == 1 && num_tokens <= 1) {
+    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 1>(
+        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
+        num_tokens,
+        stream);
+  } else if (forced_tile_n == 2 && num_tokens <= 2) {
+    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 2>(
+        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
+        num_tokens,
+        stream);
+  } else if (forced_tile_n == 4 && num_tokens <= 4) {
+    invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 4>(
+        reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()),
+        num_tokens,
+        stream);
+  } else if (num_tokens <= 8) {
     invokeFusedAGemm<__nv_bfloat16, kHdIn, kHdOut, 8>(
         reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),

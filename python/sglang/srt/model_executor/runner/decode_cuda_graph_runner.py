@@ -29,7 +29,7 @@ import contextlib
 import inspect
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Callable, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import tqdm
@@ -284,6 +284,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.is_encoder_decoder
             else 0
         )
+        num_pp_proxy_aux_hidden_states = self._num_pp_proxy_aux_hidden_states()
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -331,6 +332,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
+            num_pp_proxy_aux_hidden_states=num_pp_proxy_aux_hidden_states,
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -379,6 +381,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         for it and this is never reached there.
         """
         return self.buffers, self.max_bs
+
+    def _num_pp_proxy_aux_hidden_states(self) -> int:
+        if (
+            self.pp_size <= 1
+            or self.model_runner.pp_rank == 0
+            or self.model_runner.is_draft_worker
+        ):
+            return 0
+
+        language_model = getattr(
+            self.model_runner.model, "language_model", self.model_runner.model
+        )
+        model = getattr(language_model, "model", None)
+        layers_to_capture = getattr(model, "layers_to_capture", None)
+        start_layer = getattr(model, "start_layer", None)
+        if not layers_to_capture or start_layer is None:
+            return 0
+
+        return sum(1 for layer_id in layers_to_capture if layer_id < start_layer)
 
     def maybe_init_pdmux(self):
         if self.enable_pdmux:
@@ -1056,11 +1077,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                mm_input_embeds=(
+                    output.mm_input_embeds[: self.raw_num_token]
+                    if output.mm_input_embeds is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return PPProxyTensors(
+                {k: v[: self.raw_num_token] for k, v in output.tensors.items()}
+            )
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

@@ -150,6 +150,7 @@ def _forward_with_allreduce_fusion(
     post_residual_addition: Optional[torch.Tensor],
     weight: torch.Tensor,
     use_attn_tp_group: bool = True,
+    pre_allreduce_addition: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
@@ -185,6 +186,7 @@ def _forward_with_allreduce_fusion(
                     input_tensor=x,
                     residual=residual,
                     weight=weight,
+                    pre_allreduce_addition=pre_allreduce_addition,
                     eps=norm_module.variance_epsilon,
                     max_token_num=max(x.shape[0], 2048),
                     use_attn_tp_group=use_attn_tp_group,
@@ -583,10 +585,17 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
+        pre_allreduce_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
         return _forward_with_allreduce_fusion(
-            self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
+            self,
+            x,
+            residual,
+            post_residual_addition,
+            self.weight,
+            use_attn_tp_group,
+            pre_allreduce_addition,
         )
 
 
@@ -840,6 +849,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
         use_attn_tp_group: bool = True,
+        pre_allreduce_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
         return _forward_with_allreduce_fusion(
@@ -849,6 +859,7 @@ class GemmaRMSNorm(MultiPlatformOp):
             post_residual_addition,
             self.gemma_weight,
             use_attn_tp_group=True,
+            pre_allreduce_addition=pre_allreduce_addition,
         )
 
 

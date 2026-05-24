@@ -176,6 +176,8 @@ option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+option(SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_ARCHES "Enable CUDA 12.8+ SM100/SM120 gencodes by default" ON)
+option(SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_NVFP4 "Enable CUDA 12.8+ NVFP4 compile definitions by default" ON)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -204,7 +206,7 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" AND SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_ARCHES) OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
@@ -236,7 +238,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4" AND SGL_KERNEL_ENABLE_FA3)
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+if (("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" AND SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_NVFP4) OR SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
@@ -248,6 +250,7 @@ set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
+    "csrc/attention/turboquant_mla_staged_flashmla.cu"
     "csrc/attention/vertical_slash_index.cu"
     "csrc/common_extension.cc"
     "csrc/elementwise/activation.cu"

@@ -1,6 +1,42 @@
+from pathlib import Path
 from typing import Optional, Tuple
 
 import torch
+
+
+_TQ_STAGE_SIDECAR_LOADED = False
+
+
+def _has_tq_stage_op() -> bool:
+    try:
+        torch.ops.sgl_kernel.stage_tq_mla_pages_to_physical.default
+        return True
+    except (AttributeError, RuntimeError):
+        return False
+
+
+def _ensure_tq_stage_op_loaded() -> None:
+    global _TQ_STAGE_SIDECAR_LOADED
+    if _has_tq_stage_op():
+        return
+    if not _TQ_STAGE_SIDECAR_LOADED:
+        package_dir = Path(__file__).resolve().parent
+        candidates = [
+            package_dir / "omniva_tq_mla_stage_ops.so",
+            package_dir / "sm90" / "omniva_tq_mla_stage_ops.so",
+            package_dir / "sm100" / "omniva_tq_mla_stage_ops.so",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                torch.ops.load_library(str(candidate))
+                _TQ_STAGE_SIDECAR_LOADED = True
+                break
+    if not _has_tq_stage_op():
+        raise AttributeError(
+            "sgl_kernel.stage_tq_mla_pages_to_physical is unavailable. "
+            "Install an sgl-kernel build or Omniva sidecar extension that "
+            "provides the TurboQuant staged MLA op."
+        )
 
 
 def merge_state_v2(
@@ -110,4 +146,33 @@ def cutlass_mla_get_workspace_size(
     assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
     return torch.ops.sgl_kernel.cutlass_mla_get_workspace_size.default(
         max_seq_len, num_batches, sm_count, num_kv_splits
+    )
+
+
+def stage_tq_mla_pages_to_physical(
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    k_nope_packed: torch.Tensor,
+    k_scale: torch.Tensor,
+    k_rope: torch.Tensor,
+    k_centroids: torch.Tensor,
+    out_k_cache: torch.Tensor,
+    req_stride: int,
+    pages_per_req: int,
+    threads: int = 512,
+) -> None:
+    _ensure_tq_stage_op_loaded()
+    torch.ops.sgl_kernel.stage_tq_mla_pages_to_physical.default(
+        req_to_token,
+        req_pool_indices,
+        seq_lens,
+        k_nope_packed,
+        k_scale,
+        k_rope,
+        k_centroids,
+        out_k_cache,
+        req_stride,
+        pages_per_req,
+        threads,
     )
