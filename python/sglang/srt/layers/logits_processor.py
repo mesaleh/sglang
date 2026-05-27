@@ -19,6 +19,8 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -41,6 +43,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_hidden_size,
 )
 from sglang.srt.layers.triton_ops.softcap import softcap_inplace_logits as fused_softcap
+from sglang.srt.layers.lm_head_gemm import maybe_fused_lm_head_matmul
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     get_token_ids_logprobs_chunk,
@@ -87,6 +90,55 @@ def autotune_dummy_run_mode():
         yield
     finally:
         _in_autotune_dummy_run = False
+
+
+@triton.jit
+def _select_dflash_greedy_pair_gathered_ids_kernel(
+    gathered_pair,
+    out_tokens,
+    chunk_len: tl.constexpr,
+    tp_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < chunk_len
+    best_val = tl.full((BLOCK,), -float("inf"), tl.float32)
+    best_id = tl.zeros((BLOCK,), tl.int64)
+
+    for rank in tl.static_range(0, tp_size):
+        base = (rank * chunk_len + offsets) * 2
+        val = tl.load(gathered_pair + base, mask=mask, other=-float("inf"))
+        token_id = tl.load(gathered_pair + base + 1, mask=mask, other=0.0).to(
+            tl.int64
+        )
+        take = val > best_val
+        best_val = tl.where(take, val, best_val)
+        best_id = tl.where(take, token_id, best_id)
+
+    tl.store(out_tokens + offsets, best_id, mask=mask)
+
+
+def _select_dflash_greedy_pair_gathered_ids(
+    *,
+    gathered_pair: torch.Tensor,
+    out_tokens: torch.Tensor,
+    chunk_len: int,
+    tp_size: int,
+) -> bool:
+    if not gathered_pair.is_cuda or not out_tokens.is_cuda:
+        return False
+    if chunk_len <= 0 or tp_size <= 0:
+        return False
+
+    block = triton.next_power_of_2(int(chunk_len))
+    _select_dflash_greedy_pair_gathered_ids_kernel[(1,)](
+        gathered_pair,
+        out_tokens,
+        chunk_len=int(chunk_len),
+        tp_size=int(tp_size),
+        BLOCK=block,
+    )
+    return True
 
 
 @dataclasses.dataclass
@@ -988,7 +1040,7 @@ class LogitsProcessor(nn.Module):
         num_tokens = int(hs.shape[0])
 
         if num_org > 0:
-            base_logits = torch.matmul(hs, weight[:num_org].T)
+            base_logits = maybe_fused_lm_head_matmul(hs, weight[:num_org])
             local_max, local_arg = torch.max(base_logits, dim=-1)
         else:
             local_max = torch.full(
@@ -1024,6 +1076,26 @@ class LogitsProcessor(nn.Module):
 
         if tp_size == 1:
             return global_ids.to(torch.long)
+
+        if hs.is_cuda:
+            pair_needed = tp_size * num_tokens * 2
+            local_pair = torch.empty(
+                (num_tokens, 2), dtype=torch.float32, device=hs.device
+            )
+            local_pair[:, 0].copy_(local_max)
+            local_pair[:, 1].copy_(global_ids)
+            gathered_pair = torch.empty(
+                (pair_needed,), dtype=torch.float32, device=hs.device
+            )
+            tp_group.all_gather_into_tensor(gathered_pair, local_pair.reshape(-1))
+            out_tokens = torch.empty((num_tokens,), dtype=torch.long, device=hs.device)
+            if _select_dflash_greedy_pair_gathered_ids(
+                gathered_pair=gathered_pair,
+                out_tokens=out_tokens,
+                chunk_len=num_tokens,
+                tp_size=tp_size,
+            ):
+                return out_tokens
 
         gathered_max = torch.empty(
             (tp_size * num_tokens,), dtype=local_max.dtype, device=hs.device
