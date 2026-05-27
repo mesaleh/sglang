@@ -5,7 +5,7 @@ from enum import Enum, IntEnum, auto
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
-
+from sglang.srt.environ import envs
 from sglang.srt.speculative.spec_registry import (
     CustomSpecAlgo,
     ServerArgsValidator,
@@ -146,7 +146,11 @@ class SpeculativeAlgorithm(Enum):
         return None
 
     def supports_spec_v2(self) -> bool:
-        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+        return (
+            (self.is_eagle() and not self.is_frozen_kv_mtp())
+            or self.is_standalone()
+            or (self.is_dflash() and envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get())
+        )
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -169,9 +173,14 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             if enable_overlap:
-                raise ValueError(
-                    "DFLASH does not support overlap scheduling (spec v2)."
-                )
+                if not envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
+                    raise ValueError(
+                        "DFLASH spec-v2 overlap scheduling is disabled by default. "
+                        "Set SGLANG_ENABLE_DFLASH_SPEC_V2=1 to opt in."
+                    )
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+                return DFlashWorkerV2
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker

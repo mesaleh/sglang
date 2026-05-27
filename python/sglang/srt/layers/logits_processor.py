@@ -22,6 +22,7 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed import (
+    get_tp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
 )
@@ -138,6 +139,7 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    dflash_greedy_verify_argmax: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -201,10 +203,24 @@ class LogitsMetadata:
                 extend_token_ids_logprob
             ) = extend_logprob_pruned_lens_cpu = False
 
+        dflash_greedy_verify_argmax = (
+            envs.SGLANG_DFLASH_GREEDY_VERIFY_ARGMAX.get()
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_dflash()
+            and forward_batch.capture_hidden_mode is not None
+            and forward_batch.capture_hidden_mode.is_full()
+            and (
+                forward_batch.sampling_info is None
+                or forward_batch.sampling_info.is_all_greedy
+            )
+        )
+
         return cls(
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            dflash_greedy_verify_argmax=dflash_greedy_verify_argmax,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -367,6 +383,17 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if logits_metadata.dflash_greedy_verify_argmax:
+                target_predict = self._maybe_get_dflash_verify_argmax_token_ids(
+                    pruned_states, lm_head, logits_metadata
+                )
+                if target_predict is not None:
+                    return LogitsProcessorOutput(
+                        next_token_logits=target_predict,
+                        hidden_states=hidden_states_to_store,
+                        mm_input_embeds=logits_metadata.mm_input_embeds,
+                    )
+
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -918,6 +945,99 @@ class LogitsProcessor(nn.Module):
                     lm_head, hidden_states, embedding_bias
                 )
         return logits
+
+    def _maybe_get_dflash_verify_argmax_token_ids(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> Optional[torch.Tensor]:
+        """Return greedy target token ids for DFlash verify without full vocab gather."""
+        if (
+            self.do_tensor_parallel_all_gather_dp_attn
+            or self.use_attn_tp_group
+            or not hasattr(lm_head, "weight")
+            or not hasattr(lm_head, "shard_indices")
+        ):
+            return None
+
+        hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
+            hidden_states, logits_metadata
+        )
+        if hidden_states is not local_hidden_states:
+            return None
+        if hidden_states.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        shard = lm_head.shard_indices
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        hs = (
+            hidden_states
+            if hidden_states.dtype == weight_dtype
+            else hidden_states.to(weight_dtype)
+        )
+
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+        num_tokens = int(hs.shape[0])
+
+        if num_org > 0:
+            base_logits = torch.matmul(hs, weight[:num_org].T)
+            local_max, local_arg = torch.max(base_logits, dim=-1)
+        else:
+            local_max = torch.full(
+                (num_tokens,),
+                torch.finfo(weight_dtype).min,
+                dtype=weight_dtype,
+                device=hs.device,
+            )
+            local_arg = torch.zeros((num_tokens,), dtype=torch.int64, device=hs.device)
+
+        if num_added > 0:
+            added_slice_start = num_org_padded
+            added_slice_end = num_org_padded + num_added
+            added_logits = torch.matmul(hs, weight[added_slice_start:added_slice_end].T)
+            added_max, added_arg = torch.max(added_logits, dim=-1)
+            use_added = added_max > local_max
+            local_max = torch.where(use_added, added_max, local_max)
+            local_arg = torch.where(
+                use_added,
+                added_arg.to(local_arg.dtype) + num_org_padded,
+                local_arg,
+            )
+
+        if num_added == 0:
+            global_ids = local_arg + org_vocab_start
+        else:
+            is_base = local_arg < num_org
+            global_ids = torch.where(
+                is_base,
+                org_vocab_start + local_arg,
+                added_vocab_start + (local_arg - num_org_padded),
+            )
+
+        if tp_size == 1:
+            return global_ids.to(torch.long)
+
+        gathered_max = torch.empty(
+            (tp_size * num_tokens,), dtype=local_max.dtype, device=hs.device
+        )
+        gathered_ids = torch.empty(
+            (tp_size * num_tokens,), dtype=global_ids.dtype, device=hs.device
+        )
+        tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+        tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+        gathered_max = gathered_max.view(tp_size, num_tokens)
+        gathered_ids = gathered_ids.view(tp_size, num_tokens)
+
+        best_rank = torch.argmax(gathered_max, dim=0).view(1, num_tokens)
+        return torch.gather(gathered_ids, 0, best_rank).view(-1).to(torch.long)
 
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata

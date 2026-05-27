@@ -4,9 +4,12 @@ from copy import deepcopy
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.layers.lm_head_gemm import maybe_fused_lm_head_matmul
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import get_last_loc
@@ -37,6 +40,151 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+@triton.jit
+def _assign_compact_draft_req_to_token_kernel(
+    req_pool_indices,
+    target_req_to_token,
+    draft_req_to_token,
+    target_seq_lens,
+    draft_seq_lens,
+    target_pool_len: tl.constexpr,
+    draft_pool_len: tl.constexpr,
+    max_copy_len: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+
+    offsets = pid_blk * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    req_pool_idx = tl.load(req_pool_indices + pid_b)
+    target_seq_len = tl.load(target_seq_lens + pid_b).to(tl.int64)
+    draft_seq_len = tl.load(draft_seq_lens + pid_b).to(tl.int64)
+    start = target_seq_len - draft_seq_len
+
+    mask = offsets < draft_seq_len
+    values = tl.load(
+        target_req_to_token
+        + req_pool_idx * target_pool_len
+        + start
+        + offsets,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        draft_req_to_token + req_pool_idx * draft_pool_len + offsets,
+        values,
+        mask=(offsets < max_copy_len) & mask,
+    )
+
+
+def _assign_compact_draft_req_to_token_func(
+    *,
+    req_pool_indices: torch.Tensor,
+    target_req_to_token: torch.Tensor,
+    draft_req_to_token: torch.Tensor,
+    target_seq_lens: torch.Tensor,
+    draft_seq_lens: torch.Tensor,
+    max_copy_len: int,
+) -> bool:
+    if not is_cuda():
+        return False
+    if draft_seq_lens.numel() == 0:
+        return True
+
+    bs = int(draft_seq_lens.numel())
+    block_size = 256
+    max_copy_len = int(max_copy_len)
+    if max_copy_len <= 0:
+        return True
+
+    _assign_compact_draft_req_to_token_kernel[
+        (bs, triton.cdiv(max_copy_len, block_size))
+    ](
+        req_pool_indices,
+        target_req_to_token,
+        draft_req_to_token,
+        target_seq_lens,
+        draft_seq_lens,
+        target_req_to_token.shape[1],
+        draft_req_to_token.shape[1],
+        max_copy_len,
+        BLOCK_SIZE=block_size,
+    )
+    return True
+
+
+@triton.jit
+def _compute_compact_draft_lens_kernel(
+    seq_lens,
+    draft_seq_lens,
+    block_end,
+    window_size: tl.constexpr,
+    page_size: tl.constexpr,
+    draft_token_num: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    seq_len = tl.load(seq_lens + pid).to(tl.int64)
+    visible_len = tl.minimum(seq_len, window_size)
+    if page_size > 1:
+        visible_start = seq_len - visible_len
+        aligned_start = visible_start - (visible_start % page_size)
+        draft_len = seq_len - aligned_start
+    else:
+        draft_len = visible_len
+    draft_len_i32 = draft_len.to(tl.int32)
+    tl.store(draft_seq_lens + pid, draft_len_i32)
+    tl.store(block_end + pid, draft_len_i32 + draft_token_num)
+
+
+@triton.jit
+def _select_greedy_pair_gathered_ids_kernel(
+    gathered_pair,
+    out_tokens,
+    chunk_len: tl.constexpr,
+    tp_size: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < chunk_len
+    best_val = tl.full((BLOCK,), -float("inf"), tl.float32)
+    best_id = tl.zeros((BLOCK,), tl.int64)
+
+    for rank in tl.static_range(0, tp_size):
+        base = (rank * chunk_len + offsets) * 2
+        val = tl.load(gathered_pair + base, mask=mask, other=-float("inf"))
+        token_id = tl.load(gathered_pair + base + 1, mask=mask, other=0.0).to(
+            tl.int64
+        )
+        take = val > best_val
+        best_val = tl.where(take, val, best_val)
+        best_id = tl.where(take, token_id, best_id)
+
+    tl.store(out_tokens + offsets, best_id, mask=mask)
+
+
+def _select_greedy_pair_gathered_ids_func(
+    *,
+    gathered_pair: torch.Tensor,
+    out_tokens: torch.Tensor,
+    chunk_len: int,
+    tp_size: int,
+) -> bool:
+    if not is_cuda() or not gathered_pair.is_cuda or not out_tokens.is_cuda:
+        return False
+    if chunk_len <= 0 or tp_size <= 0:
+        return False
+
+    block = triton.next_power_of_2(int(chunk_len))
+    _select_greedy_pair_gathered_ids_kernel[(1,)](
+        gathered_pair,
+        out_tokens,
+        chunk_len=int(chunk_len),
+        tp_size=int(tp_size),
+        BLOCK=block,
+    )
+    return True
 
 
 def _get_fused_kv_materialize_helper():
@@ -81,6 +229,11 @@ class DFlashWorker:
             server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
+        self.max_compact_draft_seq_len = (
+            int(self.draft_window_size) + max(int(self.page_size) - 1, 0)
+            if self.draft_window_size is not None
+            else None
+        )
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -100,6 +253,14 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        if str(draft_server_args.kv_cache_dtype).startswith(("fp8_", "fp4_")):
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH draft runner resets kv_cache_dtype from %s to auto; "
+                    "the target runner keeps its configured KV dtype.",
+                    draft_server_args.kv_cache_dtype,
+                )
+            draft_server_args.kv_cache_dtype = "auto"
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4", "triton", "ascend")
         if draft_backend is None:
@@ -209,10 +370,21 @@ class DFlashWorker:
         self._draft_block_positions_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
         self._draft_block_tokens_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_prefix_lens_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_accept_len_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_commit_lens_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_bonus_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_new_seq_lens_buf: Optional[torch.Tensor] = None  # [cap_bs]
+        self._draft_out_tokens_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
         self._draft_block_spec_info = DFlashVerifyInput(
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
@@ -228,8 +400,12 @@ class DFlashWorker:
         self._draft_greedy_rank_index_buf: Optional[torch.Tensor] = None
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
+        self._draft_greedy_local_pair_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_gathered_pair_buf: Optional[torch.Tensor] = None
+        self._draft_greedy_pair_cap: int = 0
 
         self._use_fused_kv_materialize = is_cuda()
+        self._use_triton_prepare_block = is_cuda()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
@@ -331,14 +507,35 @@ class DFlashWorker:
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        self._draft_verify_out_cache_loc_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.int64, device=device
+        )
         self._draft_block_tokens_buf = torch.empty(
             (new_cap, block_size), dtype=torch.long, device=device
+        )
+        self._draft_prefix_lens_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device=device
         )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
+        self._draft_accept_len_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device=device
+        )
+        self._draft_commit_lens_buf = torch.empty(
+            (new_cap,), dtype=torch.int32, device=device
+        )
+        self._draft_bonus_buf = torch.empty(
+            (new_cap,), dtype=torch.int64, device=device
+        )
+        self._draft_new_seq_lens_buf = torch.empty(
+            (new_cap,), dtype=torch.int64, device=device
+        )
+        self._draft_out_tokens_buf = torch.empty(
+            (new_cap, block_size), dtype=torch.int64, device=device
+        )
         self._draft_seq_lens_cpu_buf = torch.empty(
-            (new_cap,), dtype=torch.int32, device="cpu"
+            (new_cap,), dtype=torch.int32, device="cpu", pin_memory=is_cuda()
         )
 
     def __getattr__(self, name):
@@ -350,6 +547,11 @@ class DFlashWorker:
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
+        pass
+
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+        # DFLASH does not currently have an adaptive controller, but spec-v2
+        # scheduler code calls this hook for every speculative worker.
         pass
 
     def _gather_req_to_token_masked(
@@ -439,6 +641,87 @@ class DFlashWorker:
         visible_start = seq_lens_i64 - visible_lens_i64
         aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
         return (seq_lens_i64 - aligned_start).to(torch.int32)
+
+    def _compute_compact_draft_seq_lens_cpu(
+        self, seq_lens_cpu: torch.Tensor
+    ) -> torch.Tensor:
+        assert self.draft_window_size is not None
+        seq_lens_i64 = seq_lens_cpu.to(dtype=torch.int64)
+        visible_lens = torch.clamp(seq_lens_i64, max=int(self.draft_window_size))
+        if self.page_size <= 1:
+            return visible_lens.to(torch.int32)
+
+        visible_start = seq_lens_i64 - visible_lens
+        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        return (seq_lens_i64 - aligned_start).to(torch.int32)
+
+    def _compute_compact_draft_seq_lens_out(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        draft_seq_lens: torch.Tensor,
+        block_end: torch.Tensor,
+    ) -> bool:
+        assert self.draft_window_size is not None
+        if not is_cuda() or not seq_lens.is_cuda or not draft_seq_lens.is_cuda:
+            return False
+        bs = int(seq_lens.numel())
+        if bs == 0:
+            return True
+        _compute_compact_draft_lens_kernel[(bs,)](
+            seq_lens,
+            draft_seq_lens,
+            block_end,
+            window_size=int(self.draft_window_size),
+            page_size=int(self.page_size),
+            draft_token_num=int(self.block_size),
+        )
+        return True
+
+    def _assign_compact_draft_req_to_token(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        target_req_to_token: torch.Tensor,
+        draft_req_to_token: torch.Tensor,
+        target_seq_lens: torch.Tensor,
+        draft_seq_lens: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Populate the draft-local sliding-window req_to_token view."""
+        assert self.max_compact_draft_seq_len is not None
+        if req_pool_indices.dtype != torch.int64:
+            req_pool_indices = req_pool_indices.to(torch.int64)
+        if target_seq_lens.dtype != torch.int32:
+            target_seq_lens = target_seq_lens.to(torch.int32)
+        if draft_seq_lens.dtype != torch.int32:
+            draft_seq_lens = draft_seq_lens.to(torch.int32)
+
+        if _assign_compact_draft_req_to_token_func(
+            req_pool_indices=req_pool_indices,
+            target_req_to_token=target_req_to_token,
+            draft_req_to_token=draft_req_to_token,
+            target_seq_lens=target_seq_lens,
+            draft_seq_lens=draft_seq_lens,
+            max_copy_len=int(self.max_compact_draft_seq_len),
+        ):
+            return
+
+        suffix_start = target_seq_lens.to(torch.int64) - draft_seq_lens.to(torch.int64)
+        suffix_cache_loc = self._gather_req_to_token_segments(
+            req_to_token=target_req_to_token,
+            req_pool_indices=req_pool_indices,
+            start=suffix_start,
+            lengths=draft_seq_lens,
+        )
+        assign_req_to_token_pool_func(
+            req_pool_indices,
+            draft_req_to_token,
+            torch.zeros_like(draft_seq_lens),
+            draft_seq_lens,
+            suffix_cache_loc,
+            batch_size,
+        )
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -767,7 +1050,8 @@ class DFlashWorker:
 
             # Base vocab logits.
             if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
+                base_weight = weight[:num_org]
+                base_logits = maybe_fused_lm_head_matmul(hs, base_weight)
                 local_max, local_arg = torch.max(base_logits, dim=-1)
             else:
                 local_max = torch.full(
@@ -814,9 +1098,38 @@ class DFlashWorker:
                 out_tokens[start:end] = global_ids.to(torch.long)
                 continue
 
-            # Gather per-rank maxima and associated global ids, then select the global max.
-            needed = tp_size * chunk_len
             chunk_cap = int(chunk_size)
+            pair_needed = tp_size * chunk_len * 2
+            if (
+                self._draft_greedy_pair_cap < pair_needed
+                or self._draft_greedy_local_pair_buf is None
+                or self._draft_greedy_gathered_pair_buf is None
+                or self._draft_greedy_local_pair_buf.device != hs.device
+            ):
+                pair_cap = tp_size * chunk_cap * 2
+                self._draft_greedy_local_pair_buf = torch.empty(
+                    (chunk_cap, 2), dtype=torch.float32, device=hs.device
+                )
+                self._draft_greedy_gathered_pair_buf = torch.empty(
+                    (pair_cap,), dtype=torch.float32, device=hs.device
+                )
+                self._draft_greedy_pair_cap = pair_cap
+
+            local_pair = self._draft_greedy_local_pair_buf[:chunk_len]
+            local_pair[:, 0].copy_(local_max)
+            local_pair[:, 1].copy_(global_ids)
+            gathered_pair = self._draft_greedy_gathered_pair_buf[:pair_needed]
+            tp_group.all_gather_into_tensor(gathered_pair, local_pair.reshape(-1))
+            if _select_greedy_pair_gathered_ids_func(
+                gathered_pair=gathered_pair,
+                out_tokens=out_tokens[start:end],
+                chunk_len=chunk_len,
+                tp_size=tp_size,
+            ):
+                continue
+
+            # Fallback: gather per-rank maxima and ids separately, then select the max.
+            needed = tp_size * chunk_len
             if (
                 self._draft_greedy_gather_cap < needed
                 or self._draft_greedy_gathered_max_buf is None
@@ -988,28 +1301,141 @@ class DFlashWorker:
 
         if self.use_compact_draft_cache:
             new_draft_seq_lens = self._compute_compact_draft_seq_lens(batch.seq_lens)
-            suffix_start = batch.seq_lens.to(torch.int64) - new_draft_seq_lens.to(
-                torch.int64
-            )
-            suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=target_req_to_token,
-                req_pool_indices=req_pool_indices,
-                start=suffix_start,
-                lengths=new_draft_seq_lens,
-            )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                draft_req_to_token,
-                torch.zeros_like(new_draft_seq_lens),
-                new_draft_seq_lens,
-                suffix_cache_loc,
-                bs,
+            self._assign_compact_draft_req_to_token(
+                req_pool_indices=batch.req_pool_indices,
+                target_req_to_token=target_req_to_token,
+                draft_req_to_token=draft_req_to_token,
+                target_seq_lens=batch.seq_lens,
+                draft_seq_lens=new_draft_seq_lens,
+                batch_size=bs,
             )
             draft_input.draft_seq_lens = new_draft_seq_lens
         else:
             draft_input.draft_seq_lens = batch.seq_lens.to(dtype=torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _append_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        cache_loc: torch.Tensor,
+        positions: torch.Tensor,
+        mask_valid: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Materialize target context features into the draft KV cache at explicit slots.
+
+        The spec-v2 overlap path already computes a dense cache-location block. Keep
+        the KV append dense as well so the hot path avoids variable-length boolean
+        indexing/packing before every draft-cache update.
+        """
+        if target_hidden is None:
+            raise RuntimeError("DFLASH missing target hidden context features.")
+        if target_hidden.numel() == 0:
+            return
+        if target_hidden.ndim != 2:
+            raise ValueError(
+                "DFLASH target_hidden must be 2D, "
+                f"got shape={tuple(target_hidden.shape)}."
+            )
+        if cache_loc.ndim != 1:
+            raise ValueError(
+                f"DFLASH cache_loc must be 1D, got shape={tuple(cache_loc.shape)}."
+            )
+        if positions.ndim != 1:
+            raise ValueError(
+                f"DFLASH positions must be 1D, got shape={tuple(positions.shape)}."
+            )
+
+        num_tokens = int(target_hidden.shape[0])
+        if int(cache_loc.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH cache_loc length mismatch: "
+                f"cache_loc={int(cache_loc.numel())}, target_hidden={num_tokens}."
+            )
+        if int(positions.numel()) != num_tokens:
+            raise ValueError(
+                "DFLASH positions length mismatch: "
+                f"positions={int(positions.numel())}, target_hidden={num_tokens}."
+            )
+
+        device = self.model_runner.device
+        if cache_loc.device != device:
+            cache_loc = cache_loc.to(device, non_blocking=True)
+        if positions.device != device:
+            positions = positions.to(device, non_blocking=True)
+        if target_hidden.device != device:
+            target_hidden = target_hidden.to(device, non_blocking=True)
+
+        if cache_loc.dtype != torch.int64:
+            cache_loc = cache_loc.to(torch.int64)
+        if positions.dtype != torch.int64:
+            positions = positions.to(torch.int64)
+
+        mask_3d: Optional[torch.Tensor] = None
+        if mask_valid is not None:
+            if mask_valid.ndim != 1:
+                raise ValueError(
+                    "DFLASH mask_valid must be 1D, "
+                    f"got shape={tuple(mask_valid.shape)}."
+                )
+            if int(mask_valid.numel()) != num_tokens:
+                raise ValueError(
+                    "DFLASH mask_valid length mismatch: "
+                    f"mask_valid={int(mask_valid.numel())}, target_hidden={num_tokens}."
+                )
+            if mask_valid.device != device:
+                mask_valid = mask_valid.to(device, non_blocking=True)
+            if mask_valid.dtype != torch.bool:
+                mask_valid = mask_valid.to(torch.bool)
+            mask_3d = mask_valid.view(-1, 1, 1)
+
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+
+            if mask_3d is None:
+                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                    try:
+                        self._append_target_hidden_fused(
+                            ctx_hidden=ctx_hidden,
+                            ctx_positions=positions,
+                            ctx_cache_loc=cache_loc,
+                        )
+                        return
+                    except Exception as e:
+                        logger.warning(
+                            "DFLASH fused KV append-by-loc failed; falling back to sequential path: %s",
+                            e,
+                        )
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
+
+                self._append_target_hidden_sequential(
+                    ctx_hidden=ctx_hidden,
+                    ctx_positions=positions,
+                    ctx_cache_loc=cache_loc,
+                )
+                return
+
+            for layer in self.draft_model.layers:
+                attn = layer.self_attn
+                k, v = attn.kv_proj_only(ctx_hidden)
+                k = attn.apply_k_norm(k)
+                k = attn.apply_k_rope(positions, k)
+                k = k.view(-1, attn.num_kv_heads, attn.head_dim)
+                v = v.view(-1, attn.num_kv_heads, attn.head_dim)
+
+                k = k.masked_fill(~mask_3d, 0)
+                v = v.masked_fill(~mask_3d, 0)
+
+                self.draft_model_runner.token_to_kv_pool.set_kv_buffer(
+                    attn.attn,
+                    cache_loc,
+                    k,
+                    v,
+                    attn.attn.k_scale,
+                    attn.attn.v_scale,
+                )
 
     def _append_target_hidden_sequential(
         self,

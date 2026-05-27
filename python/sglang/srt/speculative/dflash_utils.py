@@ -6,7 +6,10 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
@@ -99,6 +102,89 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+
+
+def apply_dflash_verify_logits_adjustments(
+    *,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    draft_token_num: int,
+) -> None:
+    """Apply sampling-time logit adjustments for DFlash verify in place."""
+    if sampling_info is None:
+        return
+    if next_token_logits.ndim != 2:
+        raise ValueError(
+            "next_token_logits must be 2D, "
+            f"got shape={tuple(next_token_logits.shape)}."
+        )
+    if draft_token_num <= 0:
+        raise ValueError(f"draft_token_num must be positive, got {draft_token_num}.")
+
+    bs = len(sampling_info)
+    if next_token_logits.shape[0] != bs * draft_token_num:
+        raise ValueError(
+            "next_token_logits row count mismatch for DFlash verify adjustments. "
+            f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
+        )
+
+    if sampling_info.has_custom_logit_processor:
+        apply_custom_logit_processor(
+            next_token_logits,
+            sampling_info,
+            num_tokens_in_batch=draft_token_num,
+        )
+
+    acc_linear_penalties = getattr(sampling_info, "acc_linear_penalties", None)
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    vocab_mask = getattr(sampling_info, "vocab_mask", None)
+    logit_bias = getattr(sampling_info, "logit_bias", None)
+
+    logits_3d: Optional[torch.Tensor] = None
+
+    def get_logits_3d() -> torch.Tensor:
+        nonlocal logits_3d
+        if logits_3d is None:
+            logits_3d = next_token_logits.reshape(bs, draft_token_num, -1)
+        return logits_3d
+
+    if (
+        penalizer is not None
+        and penalizer.is_required
+        and acc_linear_penalties is None
+    ) or vocab_mask is not None:
+        linear_penalty = torch.zeros(
+            (bs, next_token_logits.shape[1]),
+            dtype=torch.float32,
+            device=next_token_logits.device,
+        )
+        sampling_info.apply_logits_bias(linear_penalty)
+        get_logits_3d().add_(
+            linear_penalty[:, None, :].to(dtype=next_token_logits.dtype)
+        )
+        return
+
+    if acc_linear_penalties is not None:
+        if (
+            acc_linear_penalties.device != next_token_logits.device
+            or acc_linear_penalties.dtype != next_token_logits.dtype
+        ):
+            acc_linear_penalties = acc_linear_penalties.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(acc_linear_penalties[:, None, :])
+
+    if logit_bias is not None:
+        if (
+            logit_bias.device != next_token_logits.device
+            or logit_bias.dtype != next_token_logits.dtype
+        ):
+            logit_bias = logit_bias.to(
+                device=next_token_logits.device,
+                dtype=next_token_logits.dtype,
+            )
+        get_logits_3d().add_(logit_bias[:, None, :])
 
 
 def _get_or_create_chain_verify_buffers(
@@ -460,6 +546,125 @@ def compute_dflash_correct_drafts_and_bonus(
     return correct_len, bonus.to(torch.int64)
 
 
+def compute_dflash_accept_len_and_bonus(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return compute_dflash_correct_drafts_and_bonus(
+        candidates=candidates,
+        target_predict=target_predict,
+    )
+
+
+@triton.jit
+def _dflash_greedy_accept_output_kernel(
+    candidates,
+    target_predict,
+    accept_len,
+    bonus,
+    commit_lens,
+    out_tokens,
+    prefix_lens,
+    new_seq_lens,
+    draft_token_num: tl.constexpr,
+    HAS_NEW_SEQ: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    base = pid * draft_token_num
+
+    valid_match = offsets < (draft_token_num - 1)
+    cand_next = tl.load(candidates + base + offsets + 1, mask=valid_match, other=-1)
+    pred = tl.load(target_predict + base + offsets, mask=valid_match, other=-2)
+    mismatch_pos = tl.where(valid_match & (cand_next != pred), offsets, draft_token_num - 1)
+    correct_len = tl.min(mismatch_pos, axis=0)
+
+    bonus_token = tl.load(target_predict + base + correct_len)
+    tl.store(accept_len + pid, correct_len)
+    tl.store(commit_lens + pid, correct_len + 1)
+    tl.store(bonus + pid, bonus_token)
+    if HAS_NEW_SEQ:
+        prefix_len = tl.load(prefix_lens + pid)
+        tl.store(new_seq_lens + pid, prefix_len + correct_len + 1)
+
+    out_shifted = tl.load(
+        candidates + base + offsets + 1,
+        mask=offsets < (draft_token_num - 1),
+        other=0,
+    )
+    out = tl.where(offsets == correct_len, bonus_token, out_shifted)
+    tl.store(out_tokens + base + offsets, out, mask=offsets < draft_token_num)
+
+
+def compute_dflash_greedy_accept_output_inplace(
+    *,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    accept_len: torch.Tensor,
+    bonus: torch.Tensor,
+    commit_lens: torch.Tensor,
+    out_tokens: torch.Tensor,
+    prefix_lens: Optional[torch.Tensor] = None,
+    new_seq_lens: Optional[torch.Tensor] = None,
+) -> bool:
+    """Fused greedy DFlash accept/output path.
+
+    Returns False when tensors are not suitable for the fused CUDA path so callers
+    can fall back to the general PyTorch implementation.
+    """
+    if (
+        not is_cuda()
+        or not candidates.is_cuda
+        or not target_predict.is_cuda
+        or candidates.ndim != 2
+        or target_predict.shape != candidates.shape
+        or out_tokens.shape != candidates.shape
+    ):
+        return False
+
+    bs, draft_token_num = candidates.shape
+    if bs <= 0 or draft_token_num <= 0:
+        return False
+
+    if (
+        accept_len.numel() < bs
+        or bonus.numel() < bs
+        or commit_lens.numel() < bs
+        or accept_len.device != candidates.device
+        or bonus.device != candidates.device
+        or commit_lens.device != candidates.device
+        or out_tokens.device != candidates.device
+    ):
+        return False
+
+    has_new_seq = prefix_lens is not None and new_seq_lens is not None
+    if has_new_seq and (
+        prefix_lens.numel() < bs
+        or new_seq_lens.numel() < bs
+        or prefix_lens.device != candidates.device
+        or new_seq_lens.device != candidates.device
+    ):
+        return False
+
+    block = triton.next_power_of_2(int(draft_token_num))
+    _dflash_greedy_accept_output_kernel[(bs,)](
+        candidates,
+        target_predict,
+        accept_len,
+        bonus,
+        commit_lens,
+        out_tokens,
+        prefix_lens if has_new_seq else accept_len,
+        new_seq_lens if has_new_seq else commit_lens,
+        draft_token_num=int(draft_token_num),
+        HAS_NEW_SEQ=has_new_seq,
+        BLOCK=block,
+    )
+    return True
+
+
 def compute_dflash_sampling_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
@@ -638,7 +843,6 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     bonus = predicts[accept_pos].to(torch.int64)
     return correct_len, bonus
 
-
 def validate_dflash_request(req: Req) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
@@ -655,3 +859,19 @@ def validate_dflash_request(req: Req) -> Optional[str]:
         )
 
     return None
+
+
+def compute_dflash_sampling_accept_len_and_bonus(
+    *,
+    candidates: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    sampling_info: Any,
+    max_top_k: Optional[int] = None,
+    uniform_top_k_value: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del max_top_k, uniform_top_k_value
+    return compute_dflash_sampling_correct_drafts_and_bonus(
+        candidates=candidates,
+        next_token_logits=next_token_logits,
+        sampling_info=sampling_info,
+    )

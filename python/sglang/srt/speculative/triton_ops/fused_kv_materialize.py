@@ -269,19 +269,7 @@ class FusedKVMaterializeHelper:
                 f"positions={positions.numel()}, total_ctx={total_ctx}."
             )
 
-        max_position = int(positions.max().item())
-        ensure_cos_sin_cache_length = getattr(
-            self.rotary_emb, "_ensure_cos_sin_cache_length", None
-        )
-        if callable(ensure_cos_sin_cache_length):
-            ensure_cos_sin_cache_length(max_position)
-
         cos_sin_cache = self.rotary_emb.cos_sin_cache
-        if max_position >= int(cos_sin_cache.shape[0]):
-            raise RuntimeError(
-                "RoPE cos/sin cache is too short for fused KV materialization: "
-                f"max_position={max_position}, cache_len={int(cos_sin_cache.shape[0])}."
-            )
         if cos_sin_cache.device != ctx_hidden.device:
             cos_sin_cache = cos_sin_cache.to(ctx_hidden.device)
 
