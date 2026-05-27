@@ -333,7 +333,13 @@ class DFlashVerifyInput(SpecInput):
         device = logits_output.next_token_logits.device
 
         sampling_info = batch.sampling_info
-        if sampling_info is not None:
+        next_token_logits = logits_output.next_token_logits
+        has_argmax_token_ids = (
+            next_token_logits is not None
+            and next_token_logits.ndim == 1
+            and next_token_logits.dtype in (torch.int32, torch.int64, torch.long)
+        )
+        if sampling_info is not None and not has_argmax_token_ids:
             if len(sampling_info) != bs:
                 raise RuntimeError(
                     "DFLASH verify sampling_info size mismatch: "
@@ -343,7 +349,7 @@ class DFlashVerifyInput(SpecInput):
             # Keep speculative verify semantics consistent with normal sampling path.
             if sampling_info.has_custom_logit_processor:
                 apply_custom_logit_processor(
-                    logits_output.next_token_logits,
+                    next_token_logits,
                     sampling_info,
                     num_tokens_in_batch=self.draft_token_num,
                 )
@@ -353,12 +359,12 @@ class DFlashVerifyInput(SpecInput):
                 or sampling_info.logit_bias is not None
             ):
                 linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
+                    (bs, next_token_logits.shape[1]),
                     dtype=torch.float32,
                     device=device,
                 )
                 sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
+                next_token_logits.add_(
                     torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
                 )
 
@@ -366,17 +372,21 @@ class DFlashVerifyInput(SpecInput):
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
+            and not has_argmax_token_ids
             and is_dflash_sampling_verify_available()
         ):
             correct_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
             )
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, self.draft_token_num
-            )
+            if has_argmax_token_ids:
+                target_predict = next_token_logits.view(bs, self.draft_token_num)
+            else:
+                target_predict = torch.argmax(next_token_logits, dim=-1).view(
+                    bs, self.draft_token_num
+                )
             correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
                 candidates=candidates,
                 target_predict=target_predict,

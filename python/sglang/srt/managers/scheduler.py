@@ -991,7 +991,9 @@ class Scheduler(
             return None, None
 
         if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
+            if self.spec_algorithm.is_dflash():
+                draft_runner = self.draft_worker.draft_model_runner
+            elif self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner

@@ -3715,10 +3715,23 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-            )
+            if (
+                not envs.SGLANG_ENABLE_SPEC_V2.get()
+                or not envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get()
+            ):
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled for DFLASH speculative decoding. "
+                    "Set SGLANG_ENABLE_DFLASH_SPEC_V2=1 with SGLANG_ENABLE_SPEC_V2=1 to opt into spec v2."
+                )
+            elif self.disable_overlap_schedule:
+                logger.warning(
+                    "DFLASH spec v1 is used because overlap scheduling is disabled."
+                )
+            else:
+                logger.warning(
+                    "DFLASH spec v2 overlap scheduling is enabled."
+                )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
