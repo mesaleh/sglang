@@ -8,6 +8,7 @@ COPY python/sglang/srt/server_args.py python/sglang/srt/server_args.py
 COPY python/sglang/srt/layers/lm_head_gemm.py python/sglang/srt/layers/lm_head_gemm.py
 COPY python/sglang/srt/layers/logits_processor.py python/sglang/srt/layers/logits_processor.py
 COPY python/sglang/srt/managers/scheduler.py python/sglang/srt/managers/scheduler.py
+COPY python/sglang/srt/models/deepseek_v2.py python/sglang/srt/models/deepseek_v2.py
 COPY python/sglang/srt/models/dflash.py python/sglang/srt/models/dflash.py
 COPY python/sglang/srt/speculative/spec_info.py python/sglang/srt/speculative/spec_info.py
 COPY python/sglang/srt/speculative/dflash_info.py python/sglang/srt/speculative/dflash_info.py
@@ -24,6 +25,7 @@ RUN python3 -m py_compile \
     python/sglang/srt/layers/lm_head_gemm.py \
     python/sglang/srt/layers/logits_processor.py \
     python/sglang/srt/managers/scheduler.py \
+    python/sglang/srt/models/deepseek_v2.py \
     python/sglang/srt/models/dflash.py \
     python/sglang/srt/speculative/spec_info.py \
     python/sglang/srt/speculative/dflash_info.py \
