@@ -289,6 +289,8 @@ class DFlashDraftModel(nn.Module):
             self.num_context_features * hidden_size, hidden_size, bias=False
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        self._project_target_hidden_buf: Optional[torch.Tensor] = None
+        self._project_target_hidden_cap: int = 0
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
@@ -304,6 +306,37 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
+        if (
+            target_hidden.is_cuda
+            and self.fc.bias is None
+            and target_hidden.dtype == self.fc.weight.dtype
+            and int(target_hidden.shape[0]) <= 128
+        ):
+            num_tokens = int(target_hidden.shape[0])
+            hidden_size = int(self.config.hidden_size)
+            if (
+                self._project_target_hidden_buf is None
+                or self._project_target_hidden_cap < num_tokens
+                or self._project_target_hidden_buf.device != target_hidden.device
+                or self._project_target_hidden_buf.dtype != target_hidden.dtype
+            ):
+                new_cap = max(
+                    num_tokens,
+                    self._project_target_hidden_cap * 2
+                    if self._project_target_hidden_cap > 0
+                    else num_tokens,
+                )
+                self._project_target_hidden_buf = torch.empty(
+                    (new_cap, hidden_size),
+                    device=target_hidden.device,
+                    dtype=target_hidden.dtype,
+                )
+                self._project_target_hidden_cap = int(new_cap)
+
+            projected = self._project_target_hidden_buf[:num_tokens]
+            torch.mm(target_hidden, self.fc.weight.t(), out=projected)
+            return self.hidden_norm(projected)
+
         return self.hidden_norm(self.fc(target_hidden))
 
     @torch.no_grad()
