@@ -28,6 +28,7 @@ from sglang.srt.speculative.eagle_info_v2 import assign_extend_cache_locs_func
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.speculative.triton_ops.dflash_prepare_block import (
+    _prepare_dflash_compact_draft_block_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
 
@@ -309,8 +310,39 @@ class DFlashWorkerV2(DFlashWorker):
             prefix_lens = model_worker_batch.seq_lens
             positions_2d = self._draft_block_positions_buf[:bs]
             verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+            compact_block_prepared = False
 
-            if self._use_triton_prepare_block:
+            if (
+                self.use_compact_draft_cache
+                and self._use_triton_prepare_block
+                and self.max_compact_draft_seq_len is not None
+            ):
+                try:
+                    _prepare_dflash_compact_draft_block_unchecked(
+                        verified_id=draft_input.verified_id.view(-1),
+                        prefix_lens=prefix_lens.view(-1),
+                        req_pool_indices=model_worker_batch.req_pool_indices.view(-1),
+                        target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                        block_ids_out=block_ids,
+                        positions_out=positions_2d,
+                        cache_loc_out=verify_out_cache_loc_2d,
+                        draft_seq_lens_out=self._draft_prefix_lens_buf[:bs],
+                        block_end_out=self._draft_block_end_buf[:bs],
+                        window_size=int(self.draft_window_size),
+                        page_size=int(self.page_size),
+                        max_compact_len=int(self.max_compact_draft_seq_len),
+                        mask_token_id=int(self._mask_token_id),
+                    )
+                    compact_block_prepared = True
+                except Exception as e:
+                    self._use_triton_prepare_block = False
+                    logger.warning(
+                        "DFLASH Triton compact prepare_block failed; falling back to eager path: %s",
+                        e,
+                    )
+
+            if not compact_block_prepared and self._use_triton_prepare_block:
                 try:
                     _prepare_dflash_draft_block_unchecked(
                         verified_id=draft_input.verified_id.view(-1),
@@ -362,24 +394,27 @@ class DFlashWorkerV2(DFlashWorker):
                 # Rebuild the draft-local sliding-window view from committed target state.
                 draft_prefix_lens = self._draft_prefix_lens_buf[:bs]
                 block_end = self._draft_block_end_buf[:bs]
-                if (
-                    draft_input.draft_seq_lens is not None
-                    and int(draft_input.draft_seq_lens.numel()) >= bs
-                ):
-                    draft_prefix_lens = draft_input.draft_seq_lens[:bs]
-                    torch.add(draft_prefix_lens, int(self.block_size), out=block_end)
-                else:
-                    if not self._compute_compact_draft_seq_lens_out(
-                        seq_lens=prefix_lens,
-                        draft_seq_lens=draft_prefix_lens,
-                        block_end=block_end,
+                if not compact_block_prepared:
+                    if (
+                        draft_input.draft_seq_lens is not None
+                        and int(draft_input.draft_seq_lens.numel()) >= bs
                     ):
-                        draft_prefix_lens.copy_(
-                            self._compute_compact_draft_seq_lens(prefix_lens)
-                        )
+                        draft_prefix_lens = draft_input.draft_seq_lens[:bs]
                         torch.add(
                             draft_prefix_lens, int(self.block_size), out=block_end
                         )
+                    else:
+                        if not self._compute_compact_draft_seq_lens_out(
+                            seq_lens=prefix_lens,
+                            draft_seq_lens=draft_prefix_lens,
+                            block_end=block_end,
+                        ):
+                            draft_prefix_lens.copy_(
+                                self._compute_compact_draft_seq_lens(prefix_lens)
+                            )
+                            torch.add(
+                                draft_prefix_lens, int(self.block_size), out=block_end
+                            )
 
                 if (
                     draft_input.draft_seq_lens_cpu is not None
@@ -399,23 +434,24 @@ class DFlashWorkerV2(DFlashWorker):
                         draft_prefix_lens.to(device="cpu", dtype=torch.int32)
                     )
 
-                self._assign_compact_draft_req_to_token(
-                    req_pool_indices=model_worker_batch.req_pool_indices,
-                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
-                    target_seq_lens=prefix_lens,
-                    draft_seq_lens=draft_prefix_lens,
-                    batch_size=bs,
-                )
+                if not compact_block_prepared:
+                    self._assign_compact_draft_req_to_token(
+                        req_pool_indices=model_worker_batch.req_pool_indices,
+                        target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                        target_seq_lens=prefix_lens,
+                        draft_seq_lens=draft_prefix_lens,
+                        batch_size=bs,
+                    )
 
-                assign_req_to_token_pool_func(
-                    model_worker_batch.req_pool_indices,
-                    self.draft_model_runner.req_to_token_pool.req_to_token,
-                    draft_prefix_lens,
-                    block_end,
-                    verify_out_cache_loc,
-                    bs,
-                )
+                    assign_req_to_token_pool_func(
+                        model_worker_batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        draft_prefix_lens,
+                        block_end,
+                        verify_out_cache_loc,
+                        bs,
+                    )
                 draft_seq_lens = draft_prefix_lens
             else:
                 # Non-windowed path uses the shared overallocated mapping directly.
