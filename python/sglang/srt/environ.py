@@ -372,6 +372,9 @@ class Envs:
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
 
+    # DFlash research gates.
+    SGLANG_DFLASH_REPLICATE_TARGET_EMBEDDING = EnvBool(False)
+
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)

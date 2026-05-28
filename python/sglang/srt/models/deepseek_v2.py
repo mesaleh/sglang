@@ -2145,10 +2145,23 @@ class DeepseekV2Model(nn.Module):
             self.cp_size = None
 
         if self.pp_group.is_first_rank:
+            replicate_target_embedding = (
+                envs.SGLANG_DFLASH_REPLICATE_TARGET_EMBEDDING.get()
+                and not is_dp_attention_enabled()
+            )
+            if replicate_target_embedding:
+                log_info_on_rank0(
+                    logger,
+                    "SGLANG_DFLASH_REPLICATE_TARGET_EMBEDDING is enabled; "
+                    "input embeddings are replicated across TP ranks.",
+                )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                use_attn_tp_group=is_dp_attention_enabled(),
+                enable_tp=not replicate_target_embedding,
+                use_attn_tp_group=(
+                    is_dp_attention_enabled() and not replicate_target_embedding
+                ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
