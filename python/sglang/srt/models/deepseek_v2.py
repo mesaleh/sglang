@@ -78,6 +78,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
+    is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -2312,10 +2313,23 @@ class DeepseekV2Model(nn.Module):
             self.cp_size = None
 
         if self.pp_group.is_first_rank:
+            replicate_target_embedding = (
+                envs.SGLANG_DFLASH_REPLICATE_TARGET_EMBEDDING.get()
+                and not is_dp_attention_enabled()
+            )
+            embedding_tp_kwargs = get_embedding_tp_kwargs()
+            if replicate_target_embedding:
+                log_info_on_rank0(
+                    logger,
+                    "SGLANG_DFLASH_REPLICATE_TARGET_EMBEDDING is enabled; "
+                    "input embeddings are replicated across TP ranks.",
+                )
+                embedding_tp_kwargs["enable_tp"] = False
+                embedding_tp_kwargs["use_attn_tp_group"] = False
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
-                **get_embedding_tp_kwargs(),
+                **embedding_tp_kwargs,
             )
         else:
             self.embed_tokens = PPMissingLayer()
