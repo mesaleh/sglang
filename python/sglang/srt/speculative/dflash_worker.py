@@ -184,6 +184,57 @@ def _select_greedy_pair_gathered_ids_func(
     return True
 
 
+@triton.jit
+def _pack_greedy_pair_kernel(
+    local_max,
+    global_ids,
+    local_pair,
+    chunk_len: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.arange(0, BLOCK)
+    mask = offsets < chunk_len
+    pair_offsets = offsets * 2
+
+    max_val = tl.load(local_max + offsets, mask=mask, other=-float("inf")).to(
+        tl.float32
+    )
+    token_id = tl.load(global_ids + offsets, mask=mask, other=0).to(tl.float32)
+
+    tl.store(local_pair + pair_offsets, max_val, mask=mask)
+    tl.store(local_pair + pair_offsets + 1, token_id, mask=mask)
+
+
+def _pack_greedy_pair_func(
+    *,
+    local_max: torch.Tensor,
+    global_ids: torch.Tensor,
+    local_pair: torch.Tensor,
+    chunk_len: int,
+) -> bool:
+    if (
+        not is_cuda()
+        or not local_max.is_cuda
+        or not global_ids.is_cuda
+        or not local_pair.is_cuda
+    ):
+        return False
+    if chunk_len <= 0:
+        return False
+    if local_pair.dtype != torch.float32 or not local_pair.is_contiguous():
+        return False
+
+    block = triton.next_power_of_2(int(chunk_len))
+    _pack_greedy_pair_kernel[(1,)](
+        local_max,
+        global_ids,
+        local_pair,
+        chunk_len=int(chunk_len),
+        BLOCK=block,
+    )
+    return True
+
+
 def _get_fused_kv_materialize_helper():
     global _FusedKVMaterializeHelper
     if _FusedKVMaterializeHelper is None:
@@ -1117,8 +1168,14 @@ class DFlashWorker:
                 self._draft_greedy_pair_cap = pair_cap
 
             local_pair = self._draft_greedy_local_pair_buf[:chunk_len]
-            local_pair[:, 0].copy_(local_max)
-            local_pair[:, 1].copy_(global_ids)
+            if not _pack_greedy_pair_func(
+                local_max=local_max,
+                global_ids=global_ids,
+                local_pair=local_pair,
+                chunk_len=chunk_len,
+            ):
+                local_pair[:, 0].copy_(local_max)
+                local_pair[:, 1].copy_(global_ids)
             gathered_pair = self._draft_greedy_gathered_pair_buf[:pair_needed]
             tp_group.all_gather_into_tensor(gathered_pair, local_pair.reshape(-1))
             if _select_greedy_pair_gathered_ids_func(
