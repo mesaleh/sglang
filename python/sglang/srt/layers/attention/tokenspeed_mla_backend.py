@@ -89,6 +89,8 @@ def _get_tokenspeed_workspace(
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
+    supports_custom_decode_mask: bool = True
+
     def __init__(
         self,
         model_runner: "ModelRunner",
@@ -279,6 +281,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: "RadixAttention",
+        custom_mask: Optional[torch.Tensor] = None,
+        custom_mask_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
@@ -300,6 +304,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
+            custom_mask=custom_mask,
+            cmask_off=custom_mask_offsets,
             enable_pdl=is_arch_support_pdl(),
         )
 

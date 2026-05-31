@@ -2087,9 +2087,59 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
+        self._mla_tiled_move_enabled = (
+            _is_cuda and envs.SGLANG_MLA_TILED_MOVE_KV_CACHE.get()
+        )
+        if self._mla_tiled_move_enabled:
+            stride_bytes_by_layer = [
+                int(np.prod(x.shape[1:]) * x.dtype.itemsize) for x in self.kv_buffer
+            ]
+            self.data_strides = torch.tensor(
+                stride_bytes_by_layer, device=self.device
+            )
+            self._init_mla_kv_copy_and_warmup(stride_bytes_by_layer[0])
+        else:
+            self.data_strides = None
+            self._kv_copy_config = None
         if not use_dsa:
             # DSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
+
+    def _init_mla_kv_copy_and_warmup(self, stride_bytes: int):
+        # Mirror the MHA copy tiling policy for MLA's single packed KV buffer.
+        if stride_bytes >= 8192:
+            bytes_per_tile = 512
+            num_warps = 8
+            chunk_upper = 128
+        elif stride_bytes >= 4096:
+            bytes_per_tile = 256
+            num_warps = 4
+            chunk_upper = 256
+        else:
+            bytes_per_tile = 128
+            num_warps = 4
+            chunk_upper = 256
+
+        self._kv_copy_config = {
+            "bytes_per_tile": bytes_per_tile,
+            "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
+            "num_warps": num_warps,
+            "num_locs_upper": chunk_upper,
+        }
+
+        dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
+        grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
+        copy_all_layer_kv_cache_tiled[grid](
+            self.data_ptrs,
+            self.data_strides,
+            dummy_loc,
+            dummy_loc,
+            1,
+            chunk_upper,
+            BYTES_PER_TILE=self._kv_copy_config["bytes_per_tile"],
+            num_warps=self._kv_copy_config["num_warps"],
+            num_stages=2,
+        )
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -2289,6 +2339,28 @@ class MLATokenToKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if tgt_loc.numel() == 0:
             return
+
+        if self._mla_tiled_move_enabled and not envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():
+            cfg = self._kv_copy_config
+            cap = int(cfg.get("num_locs_upper", 256))
+            grid = (self.data_ptrs.numel(), cfg["byte_tiles"])
+            tgt_loc_flat = tgt_loc.view(-1)
+            src_loc_flat = src_loc.view(-1)
+            num_locs = tgt_loc_flat.numel()
+
+            if num_locs <= cap:
+                copy_all_layer_kv_cache_tiled[grid](
+                    self.data_ptrs,
+                    self.data_strides,
+                    tgt_loc_flat,
+                    src_loc_flat,
+                    num_locs,
+                    next_power_of_2(num_locs),
+                    BYTES_PER_TILE=cfg["bytes_per_tile"],
+                    num_warps=cfg["num_warps"],
+                    num_stages=2,
+                )
+                return
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()

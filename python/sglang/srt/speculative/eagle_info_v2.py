@@ -120,7 +120,6 @@ def duplicate_prefix_tail_to_draft_branches(
     if src_slots.numel() > 0:
         token_to_kv_pool.move_kv_cache(tgt_slots, src_slots)
 
-
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
@@ -231,6 +230,7 @@ class EagleDraftInputV2Mixin:
     ):
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
+            page_size = draft_model_runner.page_size
 
             # Assign cache locations (draft-write targets).
             page_size = batch.token_to_kv_pool_allocator.page_size

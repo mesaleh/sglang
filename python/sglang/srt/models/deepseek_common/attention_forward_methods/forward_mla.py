@@ -771,7 +771,13 @@ class DeepseekMLAForwardMixin:
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            and get_attn_backend().data_type == torch.float8_e4m3fn
+            # Omniva: the active forward_batch.attn_backend can differ from the main
+            # backend when a separate speculative_draft_attention_backend is used
+            # (e.g. flashinfer draft + tokenspeed_mla verify for MLA tree drafting).
+            # Backends without a `data_type` attr (flashinfer) don't do trtllm fused
+            # rope, so fall back to explicit rope for them instead of crashing.
+            and getattr(forward_batch.attn_backend, "data_type", None)
+            == torch.float8_e4m3fn
         )
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
