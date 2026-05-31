@@ -3772,10 +3772,16 @@ class ServerArgs:
                 )
 
             spec_v1_reason = None
+            allow_kimi_mla_tree_spec_v2 = (
+                os.environ.get("SGLANG_KIMI_MLA_TREE_SPEC_V2", "0") == "1"
+                and os.environ.get("SGLANG_KIMI_MLA_TREE", "0") == "1"
+                and self.attention_backend == "tokenspeed_mla"
+            )
             if (
                 self.speculative_eagle_topk is not None
                 and self.speculative_eagle_topk > 1
                 and not self.disable_overlap_schedule
+                and not allow_kimi_mla_tree_spec_v2
             ):
                 self.disable_overlap_schedule = True
                 spec_v1_reason = "spec v2 currently only supports topk = 1"
@@ -3860,13 +3866,41 @@ class ServerArgs:
                 )
                 self.speculative_num_draft_tokens = self.speculative_num_steps + 1
 
+            if self.speculative_eagle_topk > 1:
+                max_tree_draft_tokens = (
+                    1
+                    + self.speculative_eagle_topk
+                    + (self.speculative_num_steps - 1)
+                    * self.speculative_eagle_topk
+                    * self.speculative_eagle_topk
+                )
+                if self.speculative_num_draft_tokens > max_tree_draft_tokens:
+                    raise ValueError(
+                        "Invalid EAGLE tree speculative shape: "
+                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens} "
+                        "requires selecting "
+                        f"{self.speculative_num_draft_tokens - 1} draft tokens, "
+                        "but "
+                        f"speculative_eagle_topk={self.speculative_eagle_topk} "
+                        f"and speculative_num_steps={self.speculative_num_steps} "
+                        f"only produce {max_tree_draft_tokens - 1} draft candidates."
+                    )
+
+            _tree_backends = ["flashinfer", "fa3"]
+            if (
+                os.environ.get("SGLANG_KIMI_MLA_TREE", "0") == "1"
+                and self.attention_backend == "tokenspeed_mla"
+            ):
+                # Omniva: tokenspeed_mla decode has tree-mask (ancestor) support gated
+                # by SGLANG_KIMI_MLA_TREE; allow topk>1 + page>1 for EAGLE tree drafting.
+                _tree_backends = _tree_backends + ["tokenspeed_mla"]
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend not in ["flashinfer", "fa3"]
+                and self.attention_backend not in _tree_backends
             ):
                 raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend (or 'tokenspeed_mla' with SGLANG_KIMI_MLA_TREE=1)."
                 )
 
         if self.speculative_algorithm == "NGRAM":

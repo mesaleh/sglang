@@ -84,6 +84,72 @@ def assign_draft_cache_locs_page_size_1(
         tl.store(out_cache_ptr + copy_offset, data, mask=mask)
 
 
+@triton.jit
+def assign_draft_cache_locs_paged_topk(
+    req_pool_indices,
+    req_to_token,
+    seq_lens,
+    num_new_pages_per_topk,
+    out_cache_loc,
+    source_cache_loc,
+    target_cache_loc,
+    last_page_lens_cumsum,
+    duplicate_cache_len: tl.constexpr,
+    pool_len: tl.constexpr,
+    topk: tl.constexpr,
+    speculative_num_steps: tl.constexpr,
+    page_size: tl.constexpr,
+    iter_upper: tl.constexpr,
+):
+    pid = tl.program_id(axis=0)
+    prefix_len = tl.load(seq_lens + pid)
+    last_page_len = prefix_len % page_size
+    prefix_base = prefix_len // page_size * page_size
+    token_pool = req_to_token + tl.load(req_pool_indices + pid) * pool_len
+    num_new_pages_per_topk_ = tl.load(num_new_pages_per_topk + pid)
+
+    if duplicate_cache_len > 0:
+        offsets = tl.arange(0, page_size)
+        page_mask = offsets < last_page_len
+        src_indices = tl.load(token_pool + prefix_base + offsets, mask=page_mask)
+        last_page_lens_cumsum_ = tl.load(last_page_lens_cumsum + pid)
+        for topk_id in range(1, topk):
+            dup_off = (
+                (topk - 1) * (last_page_lens_cumsum_ - last_page_len)
+                + (topk_id - 1) * last_page_len
+                + offsets
+            )
+            tgt_indices = tl.load(
+                token_pool
+                + prefix_base
+                + topk_id * num_new_pages_per_topk_ * page_size
+                + offsets,
+                mask=page_mask,
+            )
+            tl.store(source_cache_loc + dup_off, src_indices, mask=page_mask)
+            tl.store(target_cache_loc + dup_off, tgt_indices, mask=page_mask)
+
+    iter_offset = tl.arange(0, iter_upper)
+    for topk_id in range(topk):
+        step_mask = iter_offset < speculative_num_steps
+        indices = tl.load(
+            token_pool
+            + prefix_base
+            + topk_id * num_new_pages_per_topk_ * page_size
+            + last_page_len
+            + iter_offset,
+            mask=step_mask,
+        )
+        tl.store(
+            out_cache_loc
+            + pid * topk * speculative_num_steps
+            + topk_id * speculative_num_steps
+            + iter_offset,
+            indices,
+            mask=step_mask,
+        )
+
+
 @dataclass
 class EagleDraftInputV2Mixin:
     def prepare_for_decode(self: EagleDraftInput, batch: ScheduleBatch):
@@ -185,6 +251,7 @@ class EagleDraftInputV2Mixin:
     ):
         if not batch.forward_mode.is_idle():
             bs = len(batch.seq_lens)
+            page_size = draft_model_runner.page_size
 
             # Assign cache locations
             batch.out_cache_loc = torch.empty(
@@ -192,16 +259,55 @@ class EagleDraftInputV2Mixin:
                 dtype=torch.int64,
                 device=batch.input_ids.device,
             )
-            # FIXME(lsyin): align with the default code path
-            assign_draft_cache_locs_page_size_1[(bs,)](
-                batch.req_pool_indices,
-                req_to_token_pool.req_to_token,
-                batch.seq_lens,
-                batch.out_cache_loc,
-                req_to_token_pool.req_to_token.shape[1],
-                topk,
-                num_steps,
-            )
+            if page_size == 1 or topk == 1:
+                assign_draft_cache_locs_page_size_1[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    batch.out_cache_loc,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                )
+            else:
+                last_page_lens = batch.seq_lens % page_size
+                last_page_lens_cpu = batch.seq_lens_cpu.to(
+                    device="cpu", non_blocking=False
+                ) % page_size
+                num_new_pages_per_topk = (
+                    last_page_lens + num_steps + page_size - 1
+                ) // page_size
+                last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+                duplicate_cache_len = int(last_page_lens_cpu.sum().item()) * (
+                    topk - 1
+                )
+                device = batch.input_ids.device
+                source_cache_loc = torch.empty(
+                    (duplicate_cache_len,), dtype=torch.int32, device=device
+                )
+                target_cache_loc = torch.empty(
+                    (duplicate_cache_len,), dtype=torch.int32, device=device
+                )
+                assign_draft_cache_locs_paged_topk[(bs,)](
+                    batch.req_pool_indices,
+                    req_to_token_pool.req_to_token,
+                    batch.seq_lens,
+                    num_new_pages_per_topk,
+                    batch.out_cache_loc,
+                    source_cache_loc,
+                    target_cache_loc,
+                    last_page_lens_cumsum,
+                    duplicate_cache_len,
+                    req_to_token_pool.req_to_token.shape[1],
+                    topk,
+                    num_steps,
+                    page_size,
+                    next_power_of_2(num_steps),
+                )
+                if duplicate_cache_len > 0:
+                    draft_model_runner.token_to_kv_pool.move_kv_cache(
+                        target_cache_loc, source_cache_loc
+                    )
 
         # Get a forward batch
         self.num_tokens_per_req = topk
@@ -226,14 +332,49 @@ class EagleDraftInputV2Mixin:
         cuda_graph_runner: Any,
     ):
         seq_lens_cpu_ = batch.seq_lens_cpu
-        extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
+        bs = len(batch.seq_lens)
+        num_extend_tokens_per_req = (
+            min(num_draft_tokens, self.num_tokens_per_req)
+            if self.num_tokens_per_req > 0
+            else num_draft_tokens
+        )
+        extend_num_tokens = bs * num_extend_tokens_per_req
+
+        if num_extend_tokens_per_req != num_draft_tokens:
+            # Tree verify can select only the compact accepted path
+            # (drafts + bonus). Tail tree nodes are valid padding here and do
+            # not belong in draft-extend graph inputs.
+            predict = (
+                predict.view(bs, num_draft_tokens)[:, :num_extend_tokens_per_req]
+                .contiguous()
+                .view(-1)
+            )
+            if self.hidden_states is not None:
+                hidden_shape = self.hidden_states.shape[1:]
+                self.hidden_states = (
+                    self.hidden_states.view(bs, num_draft_tokens, *hidden_shape)[
+                        :, :num_extend_tokens_per_req
+                    ]
+                    .contiguous()
+                    .view(extend_num_tokens, *hidden_shape)
+                )
+            if batch.out_cache_loc is not None:
+                batch.out_cache_loc = (
+                    batch.out_cache_loc.view(bs, num_draft_tokens)[
+                        :, :num_extend_tokens_per_req
+                    ]
+                    .contiguous()
+                    .view(-1)
+                )
 
         batch.spec_info = self
         batch.input_ids = predict
-        batch.seq_lens = batch.seq_lens + num_draft_tokens
-        batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
+        batch.seq_lens = batch.seq_lens + num_extend_tokens_per_req
+        batch.seq_lens_cpu = batch.seq_lens_cpu + num_extend_tokens_per_req
         batch.seq_lens_sum += extend_num_tokens
-        batch.extend_seq_lens = [num_draft_tokens for _ in range(len(batch.seq_lens))]
+        batch.extend_seq_lens = [
+            num_extend_tokens_per_req for _ in range(len(batch.seq_lens))
+        ]
         batch.extend_prefix_lens = seq_lens_cpu_.tolist()
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (

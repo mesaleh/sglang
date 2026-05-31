@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
 
+import os
+
 import torch
 
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
@@ -358,7 +360,14 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.cuda_graph_qo_indptr = self.q_indptr_decode.clone()
         self.cuda_graph_kv_indptr = self.kv_indptr.clone()
         self.cuda_graph_kv_lens = torch.ones(
-            (max_bs,), dtype=torch.int32, device=self.device
+            # Omniva MLA tree (topk>1): the draft frontier has max_num_tokens
+            # (=max_bs*topk) query tokens, each a separate decode query needing its
+            # own kv_len entry. Size by the frontier, not max_bs, so the topk>1 draft
+            # graph's kv_len_arr=cuda_graph_kv_lens[:num_tokens] stays in-bounds.
+            # (max_num_tokens>=max_bs for all callers, so this never shrinks it.)
+            (max(max_bs, max_num_tokens),),
+            dtype=torch.int32,
+            device=self.device,
         )
 
         # For fast decode plan in graph replaying
@@ -509,6 +518,15 @@ class FlashInferMLAAttnBackend(AttentionBackend):
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # MLA backends build target-verify metadata from the finalized
+        # EagleVerifyInput during replay_prepare/init_forward_metadata. They do
+        # not expose separate tree-mask or position buffers that need a
+        # post-draft refresh for overlap-plan-stream mode.
+        pass
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
@@ -707,10 +725,10 @@ class FlashInferMLAIndicesUpdaterDecode:
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
-        q_indptr = q_indptr[: bs + 1]
         kv_lens = paged_kernel_lens.to(torch.int32)
         sm_scale = self.scaling
         if spec_info is None:
+            q_indptr = q_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(paged_kernel_lens, dim=0)
             kv_indptr = kv_indptr[: bs + 1]
             kv_indices = (
@@ -729,6 +747,18 @@ class FlashInferMLAIndicesUpdaterDecode:
             )
         else:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
+            # Omniva MLA tree (topk>1): the draft frontier is len(kv_indptr)-1 query
+            # tokens (bs*topk), each a separate decode query attending to its own
+            # candidate path. q_indptr and kv_len_arr must span the frontier, not
+            # num_seqs. During CUDA-graph capture the caller passes num_seqs-length
+            # req_pool_indices/seq_lens, so derive both from the frontier-sized
+            # kv_indptr the multi-step draft backend already built. On the eager path
+            # req_pool_indices is already frontier-length, so num_q == bs and kv_lens
+            # is left untouched (preserving the validated eager behavior).
+            num_q = kv_indptr.shape[0] - 1
+            q_indptr = q_indptr[: num_q + 1]
+            if kv_lens.shape[0] != num_q:
+                kv_lens = (kv_indptr[1:] - kv_indptr[:-1]).to(torch.int32)
 
         if not init_metadata_replay:
             wrapper.plan(
@@ -909,7 +939,7 @@ class FlashInferMLAMultiStepDraftBackend:
     ):
         from sglang.srt.speculative.spec_utils import generate_draft_decode_kv_indices
 
-        if topk > 1:
+        if topk > 1 and os.environ.get("SGLANG_KIMI_MLA_TREE", "0") != "1":
             raise ValueError(
                 "Currently Flashinfer MLA only supports topk=1 for speculative decoding"
             )
@@ -977,12 +1007,17 @@ class FlashInferMLAMultiStepDraftBackend:
 
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
+        # The topk>1 tokenspeed MLA draft path consumes these per-candidate
+        # logical prefix lengths when translating token-level draft paths back to
+        # page-sized block tables.
+        forward_batch.spec_info.positions = forward_batch.positions
 
         for i in range(self.speculative_num_steps - 1):
             forward_batch.spec_info.kv_indptr = self.kv_indptr[i, : bs + 1]
             forward_batch.spec_info.kv_indices = kv_indices_buffer[i][
                 : seq_lens_sum * self.topk + bs * (i + 1)
             ]
+            forward_batch.spec_info.draft_step = i + 1
             call_fn(i, forward_batch)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):

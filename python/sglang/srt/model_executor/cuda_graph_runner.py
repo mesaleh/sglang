@@ -733,6 +733,27 @@ class CudaGraphRunner:
             ),
             num_pp_proxy_aux_hidden_states=num_pp_proxy_aux_hidden_states,
         )
+        # Omniva MLA tree (topk>1): the EAGLE verify reads buffers.custom_mask as the
+        # FULL [dt x K] tree mask, but create() sizes it with seq_len_fill_value
+        # (=1 for tokenspeed_mla) — far too small (only dt*(1+dt)). Resize it to fit
+        # the real max verify mask (sum_b seq_b*dt + dt^2*bs, with sum_b seq_b <=
+        # max_total_num_tokens) so replay_prepare's per-step copy fits and the
+        # captured tokenspeed tree verify reads the correct mask. ~2 MB; tree only.
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            and (self.model_runner.server_args.speculative_eagle_topk or 1) > 1
+        ):
+            max_total = int(
+                getattr(self.model_runner, "max_total_num_tokens", 0)
+                or getattr(self.model_runner.server_args, "max_total_tokens", 0)
+                or 0
+            )
+            if max_total > 0:
+                self.buffers.custom_mask = torch.ones(
+                    (max_total + self.max_num_token) * self.num_tokens_per_bs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
         self.buffers.share_buffers()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
@@ -1310,6 +1331,23 @@ class CudaGraphRunner:
                 spec_info=forward_batch.spec_info,
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
+            forward_batch.spec_info.custom_mask = buffers.custom_mask
+        elif (
+            forward_batch.spec_info is not None
+            and self.model_runner.spec_algorithm.is_eagle()
+            and getattr(forward_batch.spec_info, "topk", 1) > 1
+            and getattr(forward_batch.spec_info, "custom_mask", None) is not None
+        ):
+            # Omniva MLA tree (topk>1): the captured EAGLE verify graph reads
+            # buffers.custom_mask, but populate_from_forward_batch never refills it
+            # (no prior path used a real custom_mask on the tokenspeed verify — EAGLE
+            # chain and DFlash-on-tokenspeed are causal). Left stale it keeps its
+            # all-ones alloc value (= attend-everything) → the tree verify attends to
+            # non-ancestor/future draft tokens → wrong logits → degraded output. Copy
+            # this step's real tree mask into the persistent buffer (host-side, each
+            # replay) so the captured graph reads fresh values.
+            cm = forward_batch.spec_info.custom_mask
+            buffers.custom_mask[: cm.numel()].copy_(cm)
             forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
         if self.enable_pdmux:

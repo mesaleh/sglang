@@ -94,6 +94,57 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
+def _compact_tree_accept_outputs(
+    predict: torch.Tensor,
+    hidden_states: Optional[torch.Tensor],
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    draft_token_num: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Make tree topk accepted tokens prefix-shaped for spec-v2 consumers.
+
+    Spec-v2 output processing and draft-extend use `accept_lens` as a prefix
+    length within each request's fixed `draft_token_num` block. Tree verification
+    instead returns accepted node positions through `accept_index`, and those
+    positions can be non-contiguous. Compact the accepted path into the prefix
+    while leaving the unused tail as valid-but-ignored padding.
+    """
+
+    bs = accept_index.shape[0]
+    width = accept_index.shape[1]
+    # build_tree_kernel_efficient stores accept_index as global offsets into the
+    # flattened [bs * draft_token_num] predict/hidden blocks. Convert each row
+    # back to local offsets before gathering from its per-request view.
+    row_offsets = (
+        torch.arange(bs, dtype=torch.long, device=accept_index.device).unsqueeze(1)
+        * draft_token_num
+    )
+    safe_index = (accept_index.to(torch.long) - row_offsets).clamp(
+        min=0, max=draft_token_num - 1
+    )
+
+    predict_2d = predict.reshape(bs, draft_token_num)
+    compact_predict = predict_2d.clone()
+    compact_predict[:, :width] = torch.gather(predict_2d, 1, safe_index)
+
+    compact_hidden_states = hidden_states
+    if hidden_states is not None:
+        hidden_shape = hidden_states.shape[1:]
+        hidden_2d = hidden_states.reshape(bs, draft_token_num, *hidden_shape)
+        compact_hidden = hidden_2d.clone()
+        gather_index = safe_index.reshape(
+            bs, width, *([1] * len(hidden_shape))
+        ).expand(bs, width, *hidden_shape)
+        compact_hidden[:, :width] = torch.gather(hidden_2d, 1, gather_index)
+        compact_hidden_states = compact_hidden.reshape_as(hidden_states)
+
+    last_index = (accept_lens.to(torch.long) - 1).clamp_min(0).reshape(bs, 1)
+    bonus_tokens = torch.gather(compact_predict, 1, last_index).squeeze(1).to(
+        torch.int32
+    )
+    return compact_predict.flatten(), compact_hidden_states, bonus_tokens
+
+
 class EagleDraftWorker(BaseDraftWorker):
     def __init__(
         self,
@@ -573,9 +624,12 @@ class EagleDraftWorker(BaseDraftWorker):
             num_tokens_per_req=self.speculative_num_steps + 1,
             num_tokens_for_logprob_per_req=self.speculative_num_steps + 1,
         )
+        draft_extend_tokens_per_req = min(
+            self.speculative_num_draft_tokens, draft_input.num_tokens_per_req
+        )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
-            * self.speculative_num_draft_tokens
+            * draft_extend_tokens_per_req
             + batch_result.accept_lens
             - 1
         )
@@ -1074,6 +1128,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
+        if not batch.forward_mode.is_idle() and verify_input.topk > 1:
+            self.move_accepted_tokens_to_target_kvcache(
+                batch, accept_index, accept_lens - 1
+            )
+
         # Update mamba state for hybrid GDN models after verification
         if (
             self.target_worker.model_runner.hybrid_gdn_config is not None
@@ -1087,14 +1146,15 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            accept_tokens = predict[accept_index]
             bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-            fill_bonus_tokens[(bs,)](
-                accept_tokens,
-                accept_lens,
-                bonus_tokens,
-                self.speculative_num_draft_tokens,
-            )
+            if verify_input.topk == 1:
+                accept_tokens = predict[accept_index]
+                fill_bonus_tokens[(bs,)](
+                    accept_tokens,
+                    accept_lens,
+                    bonus_tokens,
+                    self.speculative_num_draft_tokens,
+                )
         else:
             bonus_tokens = torch.empty((0,), device=self.device, dtype=torch.int32)
 
@@ -1103,7 +1163,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 batch, logits_output, predict, accept_index, self.speculative_num_steps
             )
 
+        next_token_ids = predict
         # Construct the next draft input
+        if not batch.forward_mode.is_idle() and verify_input.topk > 1:
+            (
+                next_token_ids,
+                logits_output.hidden_states,
+                bonus_tokens,
+            ) = _compact_tree_accept_outputs(
+                predict,
+                logits_output.hidden_states,
+                accept_index,
+                accept_lens,
+                self.speculative_num_draft_tokens,
+            )
+
         next_draft_input = EagleDraftInput(
             bonus_tokens=bonus_tokens,
             new_seq_lens=new_seq_lens,
@@ -1112,7 +1186,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=predict,
+            next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
             speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             next_draft_input=next_draft_input,
@@ -1197,18 +1271,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index: The index of the accepted tokens (incl. bonus).
             num_correct_drafts: Per-req count of correct drafts (excludes bonus);
                 seq_lens is advanced by ``num_correct_drafts + 1`` to cover the bonus slot.
+                ``accept_index`` contains global offsets into ``batch.out_cache_loc``.
         """
         bs = len(batch.seq_lens)
-        size = bs * self.speculative_num_draft_tokens
+        size = accept_index.numel()
 
-        tgt_cache_loc = torch.zeros(
-            size,
-            dtype=torch.int64,
-            device=self.device,
-        )
-        accepted_out_cache_loc = torch.zeros(
-            size, dtype=torch.int64, device=self.device
-        )
+        # Invalid tail entries are copied from and to the same valid KV slot,
+        # making the fixed-size move harmless without a GPU->CPU accept-count sync.
+        safe_loc = batch.out_cache_loc[:1].expand(size)
+        tgt_cache_loc = safe_loc.clone()
+        accepted_out_cache_loc = safe_loc.clone()
         assign_extend_cache_locs[(bs,)](
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,

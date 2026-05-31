@@ -998,6 +998,10 @@ class EAGLEWorker(TpModelWorker):
             if self.speculative_algorithm.is_standalone()
             else CaptureHiddenMode.FULL
         )
+        # Omniva MLA tree-mask: the tokenspeed_mla verify kernel reads SGLang's
+        # tree attention mask (custom_mask=tree_mask, below) directly — no separate
+        # per-step ancestor build (that did a host-side CPU sync, breaking CUDA-graph
+        # capture). custom_mask already encodes the tree ancestry for topk>1.
         return EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,

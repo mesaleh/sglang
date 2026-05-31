@@ -232,6 +232,8 @@ def get_alloc_len_per_decode(server_args: Optional[ServerArgs] = None) -> int:
     if page_size == 1 or spec_topk == 1:
         return max(spec_steps * spec_topk, spec_tokens)
     else:
-        raise NotImplementedError(
-            "get_alloc_len_per_decode not implemented for page_size > 1 and spec_topk > 1"
-        )
+        # EAGLE tree topk on paged KV duplicates the last partial page for each
+        # topk branch. Reserve for the worst prefix alignment so spec-v2 can
+        # pre-allocate enough slots before the draft worker lays out branch pages.
+        max_pages_per_topk = (page_size - 1 + spec_steps + page_size - 1) // page_size
+        return max(spec_tokens, page_size * spec_topk * max_pages_per_topk)
