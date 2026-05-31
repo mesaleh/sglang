@@ -63,6 +63,223 @@ DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
+@triton.jit
+def pad_draft_extend_query_kernel(
+    q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
+    padded_q_ptr,  # Output padded query tensor [batch_size, max_seq_len, num_heads, head_dim]
+    seq_lens_q_ptr,  # Sequence lengths for each sequence [batch_size]
+    cumsum_ptr,  # Cumulative sum of sequence lengths [batch_size + 1]
+    batch_size,
+    max_seq_len,
+    num_heads,
+    head_dim,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for padding draft extended query tensor with parallelized head and dim processing."""
+    # Use 3D program IDs: (batch_seq, head_block, dim_block)
+    batch_seq_pid = tl.program_id(0)
+    head_pid = tl.program_id(1)
+    dim_pid = tl.program_id(2)
+
+    batch_id = batch_seq_pid // max_seq_len
+    seq_pos = batch_seq_pid % max_seq_len
+
+    if batch_id >= batch_size:
+        return
+
+    # Load sequence length for this batch
+    seq_len = tl.load(seq_lens_q_ptr + batch_id)
+
+    if seq_pos >= seq_len:
+        return
+
+    # Load cumulative sum to get start position in input tensor
+    input_start = tl.load(cumsum_ptr + batch_id)
+    input_pos = input_start + seq_pos
+
+    # Calculate head and dim block ranges
+    head_start = head_pid * BLOCK_SIZE
+    head_end = tl.minimum(head_start + BLOCK_SIZE, num_heads)
+    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
+
+    dim_start = dim_pid * BLOCK_SIZE
+    dim_end = tl.minimum(dim_start + BLOCK_SIZE, head_dim)
+    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
+
+    # Calculate input offset
+    input_offset = (
+        input_pos * num_heads * head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
+
+    # Load data
+    data = tl.load(
+        q_ptr + input_offset,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+
+    # Calculate output offset
+    output_offset = (
+        batch_id * max_seq_len * num_heads * head_dim
+        + seq_pos * num_heads * head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
+
+    # Store data
+    tl.store(
+        padded_q_ptr + output_offset,
+        data,
+        mask=head_mask[:, None] & dim_mask[None, :],
+    )
+
+
+@triton.jit
+def unpad_draft_extend_output_kernel(
+    raw_out_ptr,  # Input raw output tensor (batch_size, token_per_batch, tp_q_head_num, v_head_dim)
+    output_ptr,  # Output tensor (-1, tp_q_head_num, v_head_dim)
+    num_accept_tokens_ptr,  # Accept lengths for each sequence [batch_size]
+    cumsum_ptr,  # Cumulative sum of accept lengths [batch_size + 1]
+    batch_size,
+    token_per_batch,
+    tp_q_head_num,
+    v_head_dim,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Triton kernel for unpadding draft extended output tensor with parallelized head and dim processing."""
+    batch_seq_pid = tl.program_id(0)
+    head_pid = tl.program_id(1)
+    dim_pid = tl.program_id(2)
+
+    batch_id = batch_seq_pid // token_per_batch
+    seq_pos = batch_seq_pid % token_per_batch
+
+    if batch_id >= batch_size:
+        return
+
+    # Load accept length for this batch
+    accept_len = tl.load(num_accept_tokens_ptr + batch_id)
+
+    if seq_pos >= accept_len:
+        return
+
+    # Load cumulative sum to get start position in output tensor
+    output_start = tl.load(cumsum_ptr + batch_id)
+    output_pos = output_start + seq_pos
+
+    # Calculate head and dim block ranges
+    head_start = head_pid * BLOCK_SIZE
+    head_end = tl.minimum(head_start + BLOCK_SIZE, tp_q_head_num)
+    head_mask = tl.arange(0, BLOCK_SIZE) < (head_end - head_start)
+
+    dim_start = dim_pid * BLOCK_SIZE
+    dim_end = tl.minimum(dim_start + BLOCK_SIZE, v_head_dim)
+    dim_mask = tl.arange(0, BLOCK_SIZE) < (dim_end - dim_start)
+
+    # Calculate input offset: (batch_id, seq_pos, head_id, dim_id)
+    input_offset = (
+        batch_id * token_per_batch * tp_q_head_num * v_head_dim
+        + seq_pos * tp_q_head_num * v_head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
+
+    # Load data
+    data = tl.load(
+        raw_out_ptr + input_offset,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+
+    output_offset = (
+        output_pos * tp_q_head_num * v_head_dim
+        + (head_start + tl.arange(0, BLOCK_SIZE))[:, None] * v_head_dim
+        + (dim_start + tl.arange(0, BLOCK_SIZE))[None, :]
+    )
+
+    # Store data
+    tl.store(
+        output_ptr + output_offset,
+        data,
+        mask=head_mask[:, None] & dim_mask[None, :],
+    )
+
+
+@triton.jit
+def build_draft_frontier_page_table_kernel(
+    req_to_token_ptr,
+    req_pool_indices_ptr,
+    prefix_lens_ptr,
+    kv_indptr_ptr,
+    block_tables_ptr,
+    seq_lens_out_ptr,
+    req_to_token_stride: tl.constexpr,
+    block_table_stride: tl.constexpr,
+    page_size: tl.constexpr,
+    topk: tl.constexpr,
+    speculative_num_steps: tl.constexpr,
+    page_table_width: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+):
+    cand_id = tl.program_id(0)
+    page_block_id = tl.program_id(1)
+
+    req_id = cand_id // topk
+    topk_id = cand_id - req_id * topk
+    req_pool_id = tl.load(req_pool_indices_ptr + req_id)
+    token_pool = req_to_token_ptr + req_pool_id * req_to_token_stride
+
+    prefix_len = tl.load(prefix_lens_ptr + cand_id).to(tl.int64)
+    kv_start = tl.load(kv_indptr_ptr + cand_id).to(tl.int64)
+    kv_end = tl.load(kv_indptr_ptr + cand_id + 1).to(tl.int64)
+    token_len = kv_end - kv_start
+    draft_len = token_len - prefix_len
+
+    full_prefix_pages = prefix_len // page_size
+    last_page_len = prefix_len - full_prefix_pages * page_size
+    branch_pages = tl.cdiv(last_page_len + draft_len, page_size)
+
+    num_new_pages_per_topk = tl.cdiv(
+        last_page_len + speculative_num_steps, page_size
+    )
+    prefix_base = full_prefix_pages * page_size
+    branch_base = prefix_base + topk_id * num_new_pages_per_topk * page_size
+
+    slots = page_block_id * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
+    in_width = slots < page_table_width
+    table_ptr = block_tables_ptr + cand_id * block_table_stride + slots
+
+    page_ids = tl.full((BLOCK_PAGES,), -1, tl.int32)
+    prefix_mask = slots < full_prefix_pages
+    branch_slot = slots - full_prefix_pages
+    branch_mask = (branch_slot >= 0) & (branch_slot < branch_pages)
+
+    prefix_token_pos = slots * page_size
+    prefix_token_ids = tl.load(
+        token_pool + prefix_token_pos,
+        mask=in_width & prefix_mask,
+        other=0,
+    )
+    prefix_page_ids = (prefix_token_ids // page_size).to(tl.int32)
+
+    branch_token_pos = branch_base + branch_slot * page_size
+    branch_token_ids = tl.load(
+        token_pool + branch_token_pos,
+        mask=in_width & branch_mask,
+        other=0,
+    )
+    branch_page_ids = (branch_token_ids // page_size).to(tl.int32)
+
+    page_ids = tl.where(prefix_mask, prefix_page_ids, page_ids)
+    page_ids = tl.where(branch_mask, branch_page_ids, page_ids)
+    tl.store(table_ptr, page_ids, mask=in_width)
+
+    if page_block_id == 0:
+        tl.store(seq_lens_out_ptr + cand_id, token_len.to(tl.int32))
+
+
 def _quantize_fp8_qkv(q, k, v, layer):
     q = q.to(torch.float8_e4m3fn)
 
@@ -122,6 +339,10 @@ class TRTLLMMLADecodeMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None
     seq_lens_q: Optional[torch.Tensor] = None
     seq_lens_k: Optional[torch.Tensor] = None
+    custom_mask: Optional[torch.Tensor] = None
+    custom_mask_offsets: Optional[torch.Tensor] = None
+    batch_size: Optional[int] = None
+    is_draft_frontier: bool = False
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -130,6 +351,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # trtllm-gen kernels rebuild metadata from preallocated buffers and never
     # read seq_lens_cpu / seq_lens_sum; opt out of the D2H sync.
     needs_cpu_seq_lens: bool = False
+    supports_custom_decode_mask: bool = False
 
     def __init__(
         self,
@@ -205,6 +427,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
+        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_topk = model_runner.server_args.speculative_eagle_topk
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -282,9 +506,31 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
+        # Draft tree frontiers flatten to bs*topk query rows. Allocate enough rows
+        # for either regular decode/verify (max_bs) or draft frontier decode
+        # (max_num_tokens = max_bs*topk in the EAGLE draft graph runner).
+        max_decode_rows = max(max_bs, max_num_tokens)
         self.decode_cuda_graph_kv_indices = torch.full(
-            (max_bs, max_blocks_per_seq), -1, dtype=torch.int32, device=self.device
+            (max_decode_rows, max_blocks_per_seq),
+            -1,
+            dtype=torch.int32,
+            device=self.device,
         )
+        self.decode_cuda_graph_seq_lens_k = torch.zeros(
+            (max_decode_rows,), dtype=torch.int32, device=self.device
+        )
+        if self.supports_custom_decode_mask:
+            self.decode_cuda_graph_custom_mask = torch.zeros(
+                (max_decode_rows * max_blocks_per_seq * self.page_size,),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            self.decode_cuda_graph_custom_mask_offsets = torch.zeros(
+                (max_decode_rows,), dtype=torch.int32, device=self.device
+            )
+        else:
+            self.decode_cuda_graph_custom_mask = None
+            self.decode_cuda_graph_custom_mask_offsets = None
         num_tokens_per_bs = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
@@ -331,6 +577,124 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def get_verify_buffers_to_fill_after_draft(self):
         return [self.cuda_graph_custom_mask, None]
 
+    @staticmethod
+    def _is_draft_frontier_spec(
+        forward_mode: ForwardMode,
+        spec_info: Optional["SpecInput"],
+        request_bs: int,
+    ) -> bool:
+        if not forward_mode.is_decode_or_idle() or spec_info is None:
+            return False
+        kv_indptr = getattr(spec_info, "kv_indptr", None)
+        kv_indices = getattr(spec_info, "kv_indices", None)
+        return (
+            kv_indptr is not None
+            and kv_indices is not None
+            and (kv_indptr.shape[0] - 1) > request_bs
+        )
+
+    def _build_draft_frontier_page_metadata(
+        self,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
+        req_pool_indices: torch.Tensor,
+        device: torch.device,
+        *,
+        block_kv_indices_buf: Optional[torch.Tensor] = None,
+        seq_lens_k_buf: Optional[torch.Tensor] = None,
+        custom_mask_buf: Optional[torch.Tensor] = None,
+        custom_mask_offsets_buf: Optional[torch.Tensor] = None,
+        page_table_width: Optional[int] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Translate token-level EAGLE draft paths into page metadata.
+
+        The EAGLE topk draft backend encodes each candidate as an ordered list of
+        physical token slots. FlashInfer consumes that with page_size=1. The
+        tokenspeed MLA kernel needs page-sized TMA tiles. For page-size > 1 EAGLE
+        already duplicates the last partial page per topk branch; use that branch
+        page in place of the original partial page so the logical sequence remains
+        contiguous and the decode can stay on the fast causal path without a
+        whole-history custom mask.
+        """
+
+        del kv_indices, custom_mask_buf, custom_mask_offsets_buf
+        num_cand = kv_indptr.shape[0] - 1
+        if prefix_lens is None or prefix_lens.numel() < num_cand:
+            raise RuntimeError(
+                "EAGLE draft frontier page metadata requires per-candidate "
+                f"prefix positions; got {None if prefix_lens is None else prefix_lens.shape}, "
+                f"need at least {num_cand}."
+            )
+        if page_table_width is None:
+            page_table_width = self._calc_padded_blocks(self.max_context_len)
+
+        topk = int(self.speculative_topk or 1)
+        if topk <= 1 or num_cand % topk != 0:
+            raise RuntimeError(
+                "EAGLE draft frontier page metadata expected candidates to be "
+                f"a positive multiple of topk; got num_cand={num_cand}, topk={topk}."
+            )
+        request_bs = num_cand // topk
+        if req_pool_indices.numel() < request_bs:
+            raise RuntimeError(
+                "EAGLE draft frontier req_pool_indices too small: "
+                f"need {request_bs}, got {req_pool_indices.numel()}."
+            )
+
+        if block_kv_indices_buf is None:
+            block_kv_indices = torch.empty(
+                (num_cand, page_table_width), dtype=torch.int32, device=device
+            )
+        else:
+            if (
+                num_cand > block_kv_indices_buf.shape[0]
+                or page_table_width > block_kv_indices_buf.shape[1]
+            ):
+                raise RuntimeError(
+                    "EAGLE draft frontier block table buffer too small: "
+                    f"need ({num_cand}, {page_table_width}), "
+                    f"got {tuple(block_kv_indices_buf.shape)}"
+                )
+            block_kv_indices = block_kv_indices_buf[:num_cand, :page_table_width]
+
+        if seq_lens_k_buf is None:
+            seq_lens_k = torch.empty((num_cand,), dtype=torch.int32, device=device)
+        else:
+            if num_cand > seq_lens_k_buf.shape[0]:
+                raise RuntimeError(
+                    "EAGLE draft frontier seq_lens buffer too small: "
+                    f"need {num_cand}, got {seq_lens_k_buf.shape[0]}"
+                )
+            seq_lens_k = seq_lens_k_buf[:num_cand]
+
+        block_pages = 128
+        build_draft_frontier_page_table_kernel[
+            (num_cand, triton.cdiv(page_table_width, block_pages))
+        ](
+            self.req_to_token,
+            req_pool_indices[:request_bs],
+            prefix_lens[:num_cand],
+            kv_indptr,
+            block_kv_indices,
+            seq_lens_k,
+            self.req_to_token.stride(0),
+            block_kv_indices.stride(0),
+            self.page_size,
+            topk,
+            int(self.speculative_num_steps),
+            page_table_width,
+            BLOCK_PAGES=block_pages,
+        )
+
+        return (
+            block_kv_indices,
+            seq_lens_k,
+            None,
+            None,
+            self.max_context_len,
+        )
+
     def _init_cuda_graph_metadata(
         self,
         bs: int,
@@ -338,6 +702,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         forward_mode: ForwardMode,
         seq_lens: torch.Tensor,
         device: torch.device,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        spec_info: Optional["SpecInput"] = None,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
         metadata = TRTLLMMLADecodeMetadata()
@@ -360,11 +726,53 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
+        if self._is_draft_frontier_spec(forward_mode, spec_info, bs):
+            if req_pool_indices is None:
+                raise RuntimeError(
+                    "EAGLE draft frontier metadata capture requires req_pool_indices."
+                )
+            if not self.supports_custom_decode_mask:
+                raise RuntimeError(
+                    "EAGLE topk>1 MLA draft frontier requires a decode backend "
+                    "with custom-mask support."
+                )
+            max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+            (
+                block_kv_indices,
+                seq_lens_k,
+                custom_mask,
+                custom_mask_offsets,
+                max_seq_len_k,
+            ) = self._build_draft_frontier_page_metadata(
+                spec_info.kv_indptr,
+                spec_info.kv_indices,
+                getattr(spec_info, "positions", None),
+                req_pool_indices,
+                device,
+                block_kv_indices_buf=self.decode_cuda_graph_kv_indices,
+                seq_lens_k_buf=self.decode_cuda_graph_seq_lens_k,
+                custom_mask_buf=self.decode_cuda_graph_custom_mask,
+                custom_mask_offsets_buf=self.decode_cuda_graph_custom_mask_offsets,
+                page_table_width=max_blocks_per_seq,
+            )
+            metadata.block_kv_indices = block_kv_indices
+            metadata.seq_lens_k = seq_lens_k
+            metadata.custom_mask = custom_mask
+            metadata.custom_mask_offsets = custom_mask_offsets
+            metadata.max_seq_len_k = max_seq_len_k
+            metadata.batch_size = spec_info.kv_indptr.shape[0] - 1
+            metadata.is_draft_frontier = True
+
+            self.decode_cuda_graph_metadata[bs] = metadata
+            self.forward_decode_metadata = metadata
+            return
+
         # Capture with full width so future longer sequences are safe during replay.
         max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = self.max_context_len
+        metadata.batch_size = bs
 
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_decode_metadata = metadata
@@ -375,6 +783,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
+        spec_info: Optional["SpecInput"] = None,
     ):
         """Shared decode / target-verify / draft-extend capture+replay body.
 
@@ -392,6 +801,27 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.sum_seq_lens_q = num_tokens_per_bs * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
+
+        if self._is_draft_frontier_spec(forward_mode, spec_info, bs):
+            if not self.supports_custom_decode_mask:
+                raise RuntimeError(
+                    "EAGLE topk>1 MLA draft frontier requires a decode backend "
+                    "with custom-mask support."
+                )
+            max_seq_len_k = self._build_draft_frontier_page_metadata(
+                spec_info.kv_indptr,
+                spec_info.kv_indices,
+                getattr(spec_info, "positions", None),
+                req_pool_indices,
+                seq_lens.device,
+                block_kv_indices_buf=metadata.block_kv_indices,
+                seq_lens_k_buf=metadata.seq_lens_k,
+                custom_mask_buf=metadata.custom_mask,
+                custom_mask_offsets_buf=metadata.custom_mask_offsets,
+                page_table_width=metadata.block_kv_indices.shape[1],
+            )[-1]
+            metadata.max_seq_len_k = max_seq_len_k
+            return
 
         # Update block indices for new sequences.
         create_flashmla_kv_indices_triton[
@@ -451,12 +881,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 forward_mode,
                 forward_batch.seq_lens,
                 forward_batch.seq_lens.device,
+                req_pool_indices=forward_batch.req_pool_indices,
+                spec_info=forward_batch.spec_info,
             )
             self._apply_cuda_graph_metadata(
                 bs=bs,
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
                 forward_mode=forward_mode,
+                spec_info=forward_batch.spec_info,
             )
         else:
             self._apply_cuda_graph_metadata(
@@ -464,6 +897,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 req_pool_indices=forward_batch.req_pool_indices,
                 seq_lens=forward_batch.seq_lens,
                 forward_mode=forward_mode,
+                spec_info=forward_batch.spec_info,
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -544,17 +978,44 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 self.forward_decode_metadata.seq_lens_q = forward_batch.extend_seq_lens
                 self.forward_decode_metadata.seq_lens_k = seq_lens.to(torch.int32)
 
-            max_seqlen_pad = self._calc_padded_blocks(max_seq)
-            block_kv_indices = self._create_block_kv_indices(
-                bs,
-                max_seqlen_pad,
-                forward_batch.req_pool_indices,
-                seq_lens,
-                seq_lens.device,
-            )
+            spec = forward_batch.spec_info
+            if self._is_draft_frontier_spec(forward_batch.forward_mode, spec, bs):
+                if not self.supports_custom_decode_mask:
+                    raise RuntimeError(
+                        "EAGLE topk>1 MLA draft frontier requires a decode backend "
+                        "with custom-mask support."
+                    )
+                (
+                    block_kv_indices,
+                    seq_lens_k,
+                    custom_mask,
+                    custom_mask_offsets,
+                    frontier_max_seq_k,
+                ) = self._build_draft_frontier_page_metadata(
+                    spec.kv_indptr,
+                    spec.kv_indices,
+                    getattr(spec, "positions", None),
+                    forward_batch.req_pool_indices,
+                    seq_lens.device,
+                )
+                bs = spec.kv_indptr.shape[0] - 1
+                self.forward_decode_metadata.seq_lens_k = seq_lens_k
+                self.forward_decode_metadata.custom_mask = custom_mask
+                self.forward_decode_metadata.custom_mask_offsets = custom_mask_offsets
+                self.forward_decode_metadata.is_draft_frontier = True
+            else:
+                max_seqlen_pad = self._calc_padded_blocks(max_seq)
+                block_kv_indices = self._create_block_kv_indices(
+                    bs,
+                    max_seqlen_pad,
+                    forward_batch.req_pool_indices,
+                    seq_lens,
+                    seq_lens.device,
+                )
+                frontier_max_seq_k = int(max_seq)
 
             self.forward_decode_metadata.block_kv_indices = block_kv_indices
-            self.forward_decode_metadata.max_seq_len_k = int(max_seq)
+            self.forward_decode_metadata.max_seq_len_k = frontier_max_seq_k
             self.forward_decode_metadata.batch_size = bs
 
             forward_batch.decode_trtllm_mla_metadata = self.forward_decode_metadata
@@ -621,8 +1082,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        custom_mask: Optional[torch.Tensor] = None,
+        custom_mask_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Hook for subclasses to swap the decode/spec-verify kernel."""
+        """Hook for subclasses to swap the decode/spec-verify kernel.
+
+        ``custom_mask`` (Omniva MLA tree-spec; SGLang's flattened tree attention mask)
+        is accepted for signature parity with the tokenspeed_mla override; the
+        TRT-LLM-gen decode kernel has no tree-mask support, so it is ignored here
+        (tree drafting runs only on tokenspeed_mla).
+        """
 
         # Scale computation for TRTLLM MLA kernel BMM1 operation:
         # The final BMM1 scale is computed as: q_scale * k_scale * softmax_scale
@@ -762,6 +1231,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if query.dim() == 3:
             query = query.unsqueeze(1)
 
+        # Omniva MLA tree (topk>1): the draft frontier is flattened to bs*topk
+        # candidates. Its source KV path is token-level, but metadata translates it
+        # to page-size block tables plus a per-candidate mask so the kernel can stay
+        # on the supported paged MLA path.
+        draft_frontier = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.positions is not None
+            and forward_batch.positions.shape[0] == query.shape[0]
+            and query.shape[0] != forward_batch.seq_lens.shape[0]
+        )
+
         # Prepare KV cache inline
         k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
@@ -781,13 +1261,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.init_forward_metadata(forward_batch)
             metadata = forward_batch.decode_trtllm_mla_metadata
 
+        # Draft frontier metadata carries per-candidate page-rounded KV lengths.
+        # Regular decode keeps the request-level seq_lens.
+        decode_seq_lens = forward_batch.seq_lens
+        if draft_frontier:
+            decode_seq_lens = metadata.seq_lens_k
+            if decode_seq_lens is None:
+                raise RuntimeError(
+                    "EAGLE draft frontier decode is missing per-candidate "
+                    "page-rounded seq_lens metadata."
+                )
         raw_out = self._run_decode_kernel(
             query=query,
             kv_cache=kv_cache,
             block_tables=metadata.block_kv_indices,
-            seq_lens=forward_batch.seq_lens,
+            seq_lens=decode_seq_lens,
             max_seq_len=metadata.max_seq_len_k,
             layer=layer,
+            custom_mask=getattr(metadata, "custom_mask", None),
+            custom_mask_offsets=getattr(metadata, "custom_mask_offsets", None),
         )
 
         # Reshape output directly without slicing
@@ -948,6 +1440,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             assert kv_cache.dtype == self.data_type
 
+            # Omniva MLA tree-spec: pass SGLang's tree attention mask to the verify
+            # kernel only for tree drafting (topk>1). For topk=1 the tree is a chain
+            # (== causal), so we leave custom_mask=None to keep the fast causal path.
+            # The tokenspeed_mla override consumes it; the TRT-LLM-gen base ignores it.
+            cmask = (
+                getattr(forward_batch.spec_info, "custom_mask", None)
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and getattr(forward_batch.spec_info, "topk", 1) > 1
+                )
+                else None
+            )
             raw_out = self._run_decode_kernel(
                 query=q,
                 kv_cache=kv_cache,
@@ -955,6 +1459,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 seq_lens=metadata.seq_lens_k,
                 max_seq_len=max_seq_len,
                 layer=layer,
+                custom_mask=cmask,
             )
 
             if needs_unpad:
@@ -1079,6 +1584,20 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
             )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self.topk > 1 and getattr(
+            self.attn_backends[0], "supports_custom_decode_mask", False
+        ):
+            kv_indices = torch.zeros(
+                (self.speculative_num_steps, 1),
+                dtype=torch.int32,
+                device=forward_batch.seq_lens.device,
+            )
+
+            def call_fn(i, _forward_batch):
+                self.attn_backends[i].init_forward_metadata(_forward_batch)
+
+            return self.common_template(forward_batch, kv_indices, call_fn)
+
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata(forward_batch)
 
@@ -1088,6 +1607,18 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         in_capture: bool = False,
     ):
         from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
+
+        if self.topk > 1 and getattr(
+            self.attn_backends[0], "supports_custom_decode_mask", False
+        ):
+            def call_fn(i, _forward_batch):
+                self.attn_backends[i].init_forward_metadata_out_graph(
+                    _forward_batch, in_capture=in_capture
+                )
+
+            return self.common_template(
+                forward_batch, self.cuda_graph_kv_indices, call_fn
+            )
 
         if in_capture:
             return super().init_forward_metadata_out_graph(
@@ -1100,3 +1631,35 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         )
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends[i].init_forward_metadata_out_graph(inner_fb)
+
+    def common_template(
+        self,
+        forward_batch: ForwardBatch,
+        kv_indices_buffer: torch.Tensor,
+        call_fn,
+    ):
+        if self.topk <= 1 or not getattr(
+            self.attn_backends[0], "supports_custom_decode_mask", False
+        ):
+            return super().common_template(forward_batch, kv_indices_buffer, call_fn)
+
+        num_seqs = forward_batch.batch_size
+        num_cand = self.topk * num_seqs
+
+        assert forward_batch.spec_info is not None
+        assert forward_batch.spec_info.is_draft_input()
+        forward_batch.spec_info.positions = forward_batch.positions
+
+        # The tokenspeed page-table path does not read the full token-level
+        # kv_indices buffer. Keep only the tiny frontier indptr that carries each
+        # candidate's token length; the page-table kernel derives pages directly
+        # from req_to_token and the branch layout.
+        base_lens = forward_batch.seq_lens.to(torch.int32).repeat_interleave(self.topk)
+        for i in range(self.speculative_num_steps - 1):
+            kv_indptr = self.kv_indptr[i, : num_cand + 1]
+            kv_indptr[:1].zero_()
+            torch.cumsum(base_lens + (i + 1), dim=0, out=kv_indptr[1:])
+            forward_batch.spec_info.kv_indptr = kv_indptr
+            forward_batch.spec_info.kv_indices = kv_indices_buffer[i, :1]
+            forward_batch.spec_info.draft_step = i + 1
+            call_fn(i, forward_batch)

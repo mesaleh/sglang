@@ -334,6 +334,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_topk_size=self.model_runner.get_pp_proxy_topk_size(),
             num_pp_proxy_aux_hidden_states=num_pp_proxy_aux_hidden_states,
         )
+        # EAGLE tree verification uses a full custom mask that can be much larger
+        # than the default decode buffer when topk > 1.
+        if (
+            self.model_runner.spec_algorithm.is_eagle()
+            and (self.model_runner.server_args.speculative_eagle_topk or 1) > 1
+        ):
+            max_total = int(
+                getattr(self.model_runner, "max_total_num_tokens", 0)
+                or getattr(self.model_runner.server_args, "max_total_tokens", 0)
+                or 0
+            )
+            if max_total > 0:
+                self.buffers.custom_mask = torch.ones(
+                    (max_total + self.max_num_token) * self.num_tokens_per_bs,
+                    dtype=torch.bool,
+                    device=self.device,
+                )
+
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
@@ -996,6 +1014,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
             forward_batch.spec_info.custom_mask = buffers.custom_mask
+        elif (
+            forward_batch.spec_info is not None
+            and self.model_runner.spec_algorithm.is_eagle()
+            and getattr(forward_batch.spec_info, "topk", 1) > 1
+            and getattr(forward_batch.spec_info, "custom_mask", None) is not None
+        ):
+            # Omniva MLA tree (topk>1): the captured EAGLE verify graph reads
+            # buffers.custom_mask, but populate_from_forward_batch never refills it
+            # (no prior path used a real custom_mask on the tokenspeed verify — EAGLE
+            # chain and DFlash-on-tokenspeed are causal). Left stale it keeps its
+            # all-ones alloc value (= attend-everything) → the tree verify attends to
+            # non-ancestor/future draft tokens → wrong logits → degraded output. Copy
+            # this step's real tree mask into the persistent buffer (host-side, each
+            # replay) so the captured graph reads fresh values.
+            cm = forward_batch.spec_info.custom_mask
+            buffers.custom_mask[: cm.numel()].copy_(cm)
+            forward_batch.spec_info.custom_mask = buffers.custom_mask
+        # Attention backend
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
