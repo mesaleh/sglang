@@ -2,6 +2,9 @@ import unittest
 
 import torch
 
+from sglang.srt.layers.attention.tokenspeed_workspace import (
+    tokenspeed_workspace_bytes,
+)
 from sglang.srt.speculative.eagle_worker_v2 import _compact_tree_accept_outputs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -63,6 +66,28 @@ class TestCompactTreeAcceptOutputs(unittest.TestCase):
             ],
         )
         self.assertEqual(bonus_tokens.tolist(), [4, 15])
+
+
+class TestTokenspeedWorkspaceSizing(unittest.TestCase):
+    def test_small_head_q_chunk_tree_rows_scale_with_raw_q_len(self):
+        num_sms = 120
+        num_heads = 16
+        kv_lora_rank = 512
+        q8 = tokenspeed_workspace_bytes(num_sms, num_heads, kv_lora_rank, 8)
+
+        self.assertEqual(q8, num_sms * 128 * (kv_lora_rank + 1) * 4)
+        self.assertEqual(
+            tokenspeed_workspace_bytes(num_sms, num_heads, kv_lora_rank, 16),
+            2 * q8,
+        )
+        self.assertEqual(
+            tokenspeed_workspace_bytes(num_sms, num_heads, kv_lora_rank, 24),
+            3 * q8,
+        )
+        self.assertEqual(
+            tokenspeed_workspace_bytes(num_sms, num_heads, kv_lora_rank, 32),
+            4 * q8,
+        )
 
 
 if __name__ == "__main__":
