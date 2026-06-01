@@ -34,6 +34,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.layers.attention.tokenspeed_workspace import (
+    tokenspeed_workspace_bytes,
+)
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -50,24 +53,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-
-# Workspace upper bound for tokenspeed_mla_decode:
-#   num_sms * num_heads * max_q_len * (kv_lora_rank + 1) * sizeof(float32)
-# MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom.
-_TOKENSPEED_MAX_Q_LEN = 8
-
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int
+    device: torch.device, num_heads: int, kv_lora_rank: int, q_len: int
 ) -> torch.Tensor:
-    needed = (
-        tokenspeed_mla.get_num_sm(device)
-        * num_heads
-        * _TOKENSPEED_MAX_Q_LEN
-        * (kv_lora_rank + 1)
-        * 4
+    needed = tokenspeed_workspace_bytes(
+        tokenspeed_mla.get_num_sm(device), num_heads, kv_lora_rank, q_len
     )
     existing = _g_tokenspeed_workspace.get(device)
     if existing is None or existing.numel() < needed:
@@ -144,13 +137,20 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
 
-    def _ensure_workspace(self, device: torch.device) -> torch.Tensor:
+    def _ensure_workspace(self, device: torch.device, q_len: int) -> torch.Tensor:
         if (
             self._tokenspeed_workspace is None
             or self._tokenspeed_workspace.device != device
+            or self._tokenspeed_workspace.numel()
+            < tokenspeed_workspace_bytes(
+                tokenspeed_mla.get_num_sm(device),
+                self.num_q_heads,
+                self.kv_lora_rank,
+                q_len,
+            )
         ):
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                device, self.num_q_heads, self.kv_lora_rank
+                device, self.num_q_heads, self.kv_lora_rank, q_len
             )
         return self._tokenspeed_workspace
 
@@ -177,7 +177,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         return tokenspeed_mla.tokenspeed_mla_decode(
             query=query,
             kv_cache=kv_cache,
-            workspace_buffer=self._ensure_workspace(query.device),
+            workspace_buffer=self._ensure_workspace(query.device, query.shape[1]),
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             block_tables=block_tables,

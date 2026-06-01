@@ -10,6 +10,7 @@ WORKDIR /sgl-workspace/sglang
 COPY python/sglang/srt/environ.py python/sglang/srt/environ.py
 COPY python/sglang/srt/layers/attention/flashinfer_mla_backend.py python/sglang/srt/layers/attention/flashinfer_mla_backend.py
 COPY python/sglang/srt/layers/attention/tokenspeed_mla_backend.py python/sglang/srt/layers/attention/tokenspeed_mla_backend.py
+COPY python/sglang/srt/layers/attention/tokenspeed_workspace.py python/sglang/srt/layers/attention/tokenspeed_workspace.py
 COPY python/sglang/srt/layers/attention/trtllm_mla_backend.py python/sglang/srt/layers/attention/trtllm_mla_backend.py
 COPY python/sglang/srt/managers/utils.py python/sglang/srt/managers/utils.py
 COPY python/sglang/srt/mem_cache/memory_pool.py python/sglang/srt/mem_cache/memory_pool.py
@@ -27,6 +28,7 @@ RUN if [ "${SKIP_PY_COMPILE}" != "1" ]; then \
         python/sglang/srt/environ.py \
         python/sglang/srt/layers/attention/flashinfer_mla_backend.py \
         python/sglang/srt/layers/attention/tokenspeed_mla_backend.py \
+        python/sglang/srt/layers/attention/tokenspeed_workspace.py \
         python/sglang/srt/layers/attention/trtllm_mla_backend.py \
         python/sglang/srt/managers/utils.py \
         python/sglang/srt/mem_cache/memory_pool.py \
