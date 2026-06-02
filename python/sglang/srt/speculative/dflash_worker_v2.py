@@ -1,3 +1,4 @@
+import copy
 import logging
 import math
 from typing import List, Optional
@@ -5,6 +6,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -132,8 +134,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
+        draft_server_args = server_args
+        if server_args.pp_size > 1 and envs.SGLANG_OMNIVA_DFLASH_PP2.get():
+            draft_server_args = copy.deepcopy(server_args)
+            draft_server_args.pp_size = 1
+
         self._draft_worker = TpModelWorker(
-            server_args=server_args,
+            server_args=draft_server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
@@ -150,6 +157,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # Keep the same alias that other spec-v2 workers expose.
         self._draft_worker.draft_runner = self.draft_model_runner
         self.draft_model = self.draft_model_runner.model
+        self._validate_pp_target_components()
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -241,6 +249,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _validate_pp_target_components(self) -> None:
+        if self.server_args.pp_size <= 1 or not envs.SGLANG_OMNIVA_DFLASH_PP2.get():
+            return
+
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+        lm_head = getattr(target_model, "lm_head", None)
+        missing = []
+        if not callable(embed_module) or not hasattr(embed_module, "weight"):
+            missing.append("target input embedding")
+        if (
+            lm_head is None
+            or not hasattr(lm_head, "weight")
+            or not hasattr(lm_head, "shard_indices")
+        ):
+            missing.append("target vocab-parallel lm_head")
+        if missing:
+            raise RuntimeError(
+                "Experimental DFLASH PP2 requires local target components on every "
+                f"PP stage, but this rank is missing: {', '.join(missing)}."
+            )
 
     @property
     def target_worker(self) -> TpModelWorker:

@@ -695,6 +695,7 @@ class Envs:
     SGLANG_ROPE_CACHE_ALIGN = EnvInt(128)
 
     # Overlap Spec V2
+    SGLANG_OMNIVA_DFLASH_PP2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_GREEDY_VERIFY_ARGMAX = EnvBool(False)
 
