@@ -70,6 +70,23 @@ logger = logging.getLogger(__name__)
 NVFP4_CKPT_FP8_ATTN_QUANT_MODULES = ["q_b_proj"]
 
 
+def _omniva_dflash_pp2_enabled(pp_group: GroupCoordinator) -> bool:
+    if not envs.SGLANG_OMNIVA_DFLASH_PP2.get():
+        return False
+
+    from sglang.srt.server_args import get_global_server_args
+
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return False
+
+    return (
+        getattr(server_args, "speculative_algorithm", None) == "DFLASH"
+        and getattr(pp_group, "world_size", 1) == 2
+    )
+
+
 def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     if getattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, False):
         return tensor.clone().detach()
@@ -150,6 +167,8 @@ class DeepseekV2WeightLoaderMixin:
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
+        omniva_dflash_pp2 = _omniva_dflash_pp2_enabled(self.pp_group)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
@@ -268,10 +287,20 @@ class DeepseekV2WeightLoaderMixin:
                         if name.endswith(".bias") and name not in params_dict:
                             continue
                         # Skip loading embed_tokens if not first rank in pipeline parallelism
-                        if ".embed_tokens." in name and not self.pp_group.is_first_rank:
+                        if (
+                            ".embed_tokens." in name
+                            and not self.pp_group.is_first_rank
+                            and not omniva_dflash_pp2
+                        ):
                             continue
-                        # Skip loading norm if not last rank in pipeline parallelism
-                        if ".norm." in name and not self.pp_group.is_last_rank:
+                        # Skip loading target final norm on non-last PP ranks. The gated
+                        # DFlash PP2 NextN draft is local/non-PP, so it still needs its
+                        # shared_head.norm loaded on every target PP stage.
+                        if (
+                            ".norm." in name
+                            and not self.pp_group.is_last_rank
+                            and not (is_nextn and omniva_dflash_pp2)
+                        ):
                             continue
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
