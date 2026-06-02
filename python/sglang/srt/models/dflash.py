@@ -38,6 +38,33 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
 
+# Gate (default off): route the DFlash draft model's per-layer TP all-reduces onto the
+# MNNVL Fabric AR fusion path (the same one the target uses), instead of plain NCCL.
+# On 2-node TP, the draft's o_proj/down_proj RowParallel all-reduces are otherwise a
+# separate cross-node NCCL collective (~3% of the c1 decode cycle in profiling). When on,
+# we skip the in-linear reduce and fuse the all-reduce into the following RMSNorm on Fabric.
+import os as _os  # noqa: E402
+
+_DRAFT_FABRIC_AR = _os.environ.get("SGLANG_DFLASH_DRAFT_FABRIC_AR", "0") == "1"
+
+
+def _draft_reduce_norm(norm, x, residual):
+    """Reduce a PARTIAL (unreduced) RowParallel output, then add+RMSNorm.
+
+    Only called when ``_DRAFT_FABRIC_AR`` skipped the in-linear all-reduce, so ``x`` is a
+    partial sum that MUST be reduced here. Prefer the Fabric AR fusion when applicable;
+    otherwise fall back to an explicit NCCL all-reduce + standard add+norm. This keeps the
+    output correct regardless of whether the flashinfer fusion path is taken.
+    """
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+    from sglang.srt.layers.communicator import apply_flashinfer_allreduce_fusion
+
+    if residual is not None and apply_flashinfer_allreduce_fusion(int(x.shape[0])):
+        return norm.forward_with_allreduce_fusion(x, residual)
+    if get_tensor_model_parallel_world_size() > 1:
+        x = tensor_model_parallel_all_reduce(x)
+    return norm(x, residual)
+
 
 class DFlashAttention(nn.Module):
     def __init__(self, config, layer_id: int) -> None:
@@ -89,6 +116,7 @@ class DFlashAttention(nn.Module):
             hidden_size,
             bias=attention_bias,
             prefix="o_proj",
+            reduce_results=not _DRAFT_FABRIC_AR,
         )
 
         # Per-head Q/K RMSNorm, matching HF Qwen3.
@@ -219,6 +247,7 @@ class DFlashMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix="down_proj" if not prefix else f"{prefix}.down_proj",
+            reduce_results=not _DRAFT_FABRIC_AR,
         )
         hidden_act = getattr(config, "hidden_act", "silu")
         if hidden_act != "silu":
@@ -260,8 +289,14 @@ class DFlashDecoderLayer(nn.Module):
 
         # Pre-norm attention with fused residual+norm when possible (Qwen3-style).
         if residual is None:
+            # First layer: input (target-feature projection) is already full/reduced.
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        elif _DRAFT_FABRIC_AR:
+            # Incoming hidden is the previous layer's unreduced down_proj output.
+            hidden_states, residual = _draft_reduce_norm(
+                self.input_layernorm, hidden_states, residual
+            )
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
@@ -270,7 +305,13 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
+        if _DRAFT_FABRIC_AR:
+            # attn_out is the unreduced o_proj output -> reduce (Fabric) + add + norm.
+            hidden_states, residual = _draft_reduce_norm(
+                self.post_attention_layernorm, attn_out, residual
+            )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(attn_out, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -391,6 +432,9 @@ class DFlashDraftModel(nn.Module):
         if hidden_states.numel() != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
+            elif _DRAFT_FABRIC_AR:
+                # Last layer's down_proj output is unreduced -> reduce (Fabric) + add + norm.
+                hidden_states, _ = _draft_reduce_norm(self.norm, hidden_states, residual)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
