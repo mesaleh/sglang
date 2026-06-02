@@ -8,6 +8,7 @@ import triton
 import triton.language as tl
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.lm_head_gemm import maybe_fused_lm_head_matmul
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -17,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
 )
 from sglang.srt.server_args import (
     ServerArgs,
@@ -353,6 +355,12 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        if server_args.pp_size > 1 and envs.SGLANG_OMNIVA_DFLASH_PP2.get():
+            # The target model is PP2, but the DFlash auxiliary model is a local
+            # draft worker on each stage. DFlashModel does not expose a PP
+            # forward signature, so keep the draft runner non-PP while it reuses
+            # the target TP groups and KV allocator.
+            draft_server_args.pp_size = 1
         saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -372,6 +380,7 @@ class DFlashWorker:
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+        self._validate_pp_target_components()
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -599,6 +608,41 @@ class DFlashWorker:
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
         pass
+
+    def _validate_pp_target_components(self) -> None:
+        if (
+            self.server_args.pp_size <= 1
+            or not envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+        ):
+            return
+
+        target_model = self.target_worker.model_runner.model
+        embed_module = target_model.get_input_embeddings()
+        lm_head = getattr(target_model, "lm_head", None)
+
+        missing = []
+        if not callable(embed_module) or not hasattr(embed_module, "weight"):
+            missing.append("target input embedding")
+        if (
+            lm_head is None
+            or not hasattr(lm_head, "weight")
+            or not hasattr(lm_head, "shard_indices")
+        ):
+            missing.append("target vocab-parallel lm_head")
+
+        if missing:
+            raise RuntimeError(
+                "Experimental DFLASH PP2 requires local target components on every PP stage, "
+                f"but this rank is missing: {', '.join(missing)}."
+            )
+
+        if self.tp_rank == 0:
+            logger.info(
+                "Experimental DFLASH PP2 target components are available locally. "
+                "pp_size=%s, block_size=%s",
+                self.server_args.pp_size,
+                getattr(self, "block_size", "unknown"),
+            )
 
     def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
         # DFLASH does not currently have an adaptive controller, but spec-v2
@@ -1597,6 +1641,15 @@ class DFlashWorker:
     def forward_batch_generation(
         self, batch: ScheduleBatch, **kwargs
     ) -> GenerationBatchResult:
+        if (
+            self.server_args.pp_size > 1
+            and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+            and isinstance(batch, ScheduleBatch)
+        ):
+            return self.forward_batch_generation_pp(
+                batch, kwargs.get("pp_proxy_tensors")
+            )
+
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
@@ -1723,3 +1776,155 @@ class DFlashWorker:
             num_correct_drafts_per_req_cpu=num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
+
+    def forward_batch_generation_pp(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> GenerationBatchResult:
+        """Run the local PP stage for spec-v1 DFlash.
+
+        Every PP stage prepares the same DFlash verify batch locally, the target
+        model runs through the PP ring, and process_pp_batch_result() consumes
+        the final-stage logits and hidden states on each stage.
+        """
+        if getattr(batch, "return_logprob", False):
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
+            )
+
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            return self.target_worker.forward_batch_generation(
+                model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+
+        draft_input = batch.spec_info
+        if not isinstance(draft_input, DFlashDraftInput):
+            raise RuntimeError(
+                "DFLASH PP decode requires DFlashDraftInput state on the running batch. "
+                "This usually means the request did not complete the prefill stage."
+            )
+
+        self._prepare_for_speculative_decoding(batch, draft_input)
+
+        model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.forward_mode.is_target_verify()
+        verify_input = model_worker_batch.spec_info
+        assert isinstance(verify_input, DFlashVerifyInput)
+
+        need_mamba_verify_commit = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        batch.pp_dflash_seq_lens_pre_verify = (
+            batch.seq_lens.clone() if need_mamba_verify_commit else None
+        )
+
+        return self.target_worker.forward_batch_generation(
+            model_worker_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            is_verify=True,
+        )
+
+    def process_pp_batch_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_target_verify():
+            return self.process_pp_verify_result(batch, result)
+
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            return self.process_pp_extend_result(batch, result)
+
+        return result
+
+    def process_pp_extend_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        logits_output, next_token_ids = result.logits_output, result.next_token_ids
+        if logits_output is None or next_token_ids is None:
+            raise RuntimeError(
+                "PP DFLASH extend requires target hidden states and next_token_ids from the last pipeline stage."
+            )
+        if logits_output.hidden_states is None:
+            raise RuntimeError(
+                "PP DFLASH requires target aux hidden capture for prefill, but got None."
+            )
+
+        device = next_token_ids.device
+
+        def _to_int32_device_tensor(x, *, device=device):
+            if isinstance(x, torch.Tensor):
+                if x.device != device:
+                    x = x.to(device, non_blocking=True)
+                return x if x.dtype == torch.int32 else x.to(torch.int32)
+            return torch.tensor(x, dtype=torch.int32, device=device)
+
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "PP DFLASH expected ScheduleBatch.extend_lens and prefix_lens in extend mode."
+            )
+
+        extend_seq_lens = _to_int32_device_tensor(batch.extend_lens)
+        draft_input = DFlashDraftInput(
+            bonus_tokens=next_token_ids.to(torch.int64),
+            target_hidden=logits_output.hidden_states,
+            ctx_lens=extend_seq_lens,
+            draft_seq_lens=(
+                torch.zeros_like(extend_seq_lens)
+                if self.use_compact_draft_cache
+                else _to_int32_device_tensor(batch.prefix_lens)
+            ),
+        )
+        self._append_target_hidden_to_draft_kv(batch, draft_input)
+        batch.spec_info = draft_input
+        return result
+
+    def process_pp_verify_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        if result.logits_output is None:
+            raise RuntimeError(
+                "PP DFLASH verify requires logits from the last pipeline stage."
+            )
+
+        verify_input = batch.spec_info
+        if not isinstance(verify_input, DFlashVerifyInput):
+            raise RuntimeError(
+                "PP DFLASH verify expected DFlashVerifyInput on ScheduleBatch.spec_info."
+            )
+
+        seq_lens_pre_verify = getattr(batch, "pp_dflash_seq_lens_pre_verify", None)
+        (
+            new_bonus_tokens,
+            commit_lens,
+            next_target_hidden,
+            num_correct_drafts_per_req_cpu,
+        ) = verify_input.verify(
+            batch=batch,
+            logits_output=result.logits_output,
+            page_size=self.page_size,
+        )
+
+        if seq_lens_pre_verify is not None:
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
+            )
+
+        draft_input = DFlashDraftInput(
+            bonus_tokens=new_bonus_tokens,
+            target_hidden=next_target_hidden,
+            ctx_lens=commit_lens,
+            draft_seq_lens=batch.seq_lens.to(dtype=torch.int32),
+        )
+        self._append_target_hidden_to_draft_kv(batch, draft_input)
+        batch.spec_info = draft_input
+        batch.forward_mode = ForwardMode.DECODE
+
+        result.next_token_ids = new_bonus_tokens
+        result.num_correct_drafts = sum(num_correct_drafts_per_req_cpu)
+        result.num_correct_drafts_per_req_cpu = num_correct_drafts_per_req_cpu
+        return result

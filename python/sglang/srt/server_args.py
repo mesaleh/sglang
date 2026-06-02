@@ -3665,10 +3665,18 @@ class ServerArgs:
         immediate_output_forward = os.getenv(
             "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD", "0"
         ).lower() in ("1", "true", "yes", "on")
+        is_supported_algorithm = self.speculative_algorithm in (
+            "EAGLE",
+            "EAGLE3",
+            "STANDALONE",
+        ) or (
+            self.speculative_algorithm == "DFLASH"
+            and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+        )
         return (
             self.pp_size == 2
             and self.disable_overlap_schedule
-            and self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE")
+            and is_supported_algorithm
             and not self.enable_multi_layer_eagle
             and immediate_output_forward
         )
@@ -3916,9 +3924,18 @@ class ServerArgs:
                     "Currently DFLASH speculative decoding does not support dp attention."
                 )
 
-            if self.pp_size != 1:
+            dflash_pp2_enabled = (
+                self.pp_size == 2
+                and self.disable_overlap_schedule
+                and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+                and self._supports_pipeline_parallel_speculative_decoding()
+            )
+            if self.pp_size != 1 and not dflash_pp2_enabled:
                 raise ValueError(
-                    "Currently DFLASH speculative decoding only supports pp_size == 1."
+                    "Currently DFLASH speculative decoding only supports pp_size == 1. "
+                    "Set SGLANG_OMNIVA_DFLASH_PP2=1 with pp_size=2 and "
+                    "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD=1 to use the "
+                    "experimental Omniva DFLASH PP2 path."
                 )
 
             if self.speculative_draft_model_path is None:
@@ -7862,11 +7879,11 @@ class ServerArgs:
             if self.speculative_algorithm is not None:
                 assert self._supports_pipeline_parallel_speculative_decoding(), (
                     "Pipeline parallel speculative decoding is currently supported "
-                    "only for pp_size=2 with EAGLE, EAGLE3, or STANDALONE in "
+                    "only for pp_size=2 with EAGLE, EAGLE3, STANDALONE, or "
+                    "experimental DFLASH with SGLANG_OMNIVA_DFLASH_PP2=1 in "
                     "non-overlap spec v1 mode and "
                     "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD=1. Multi-layer "
-                    "EAGLE, NGRAM, DFLASH, Frozen-KV MTP, and pp_size>2 are not "
-                    "supported."
+                    "EAGLE, NGRAM, Frozen-KV MTP, and pp_size>2 are not supported."
                 )
 
         assert not (

@@ -742,7 +742,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.pp_size == 2
             and not self.is_draft_worker
             and self.spec_algorithm
-            in (SpeculativeAlgorithm.EAGLE, SpeculativeAlgorithm.EAGLE3)
+            in (
+                SpeculativeAlgorithm.EAGLE,
+                SpeculativeAlgorithm.EAGLE3,
+                SpeculativeAlgorithm.DFLASH,
+            )
             and self.server_args.speculative_draft_model_path is not None
             and self.server_args.disable_overlap_schedule
             and not self.server_args.enable_multi_layer_eagle

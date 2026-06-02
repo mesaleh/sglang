@@ -2312,7 +2312,14 @@ class DeepseekV2Model(nn.Module):
         else:
             self.cp_size = None
 
-        if self.pp_group.is_first_rank:
+        server_args = get_global_server_args()
+        omniva_dflash_pp2 = (
+            envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+            and getattr(server_args, "speculative_algorithm", None) == "DFLASH"
+            and getattr(server_args, "pp_size", 1) == 2
+        )
+
+        if self.pp_group.is_first_rank or omniva_dflash_pp2:
             replicate_target_embedding = (
                 envs.SGLANG_DFLASH_REPLICATE_TARGET_EMBEDDING.get()
                 and not is_dp_attention_enabled()
@@ -2639,8 +2646,14 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
+        server_args = get_global_server_args()
+        omniva_dflash_pp2 = (
+            envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+            and getattr(server_args, "speculative_algorithm", None) == "DFLASH"
+            and getattr(server_args, "pp_size", 1) == 2
+        )
 
-        if self.pp_group.is_last_rank:
+        if self.pp_group.is_last_rank or omniva_dflash_pp2:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:
@@ -2848,7 +2861,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 self.model.layers_to_capture = list(layer_ids)
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
+        server_args = get_global_server_args()
+        omniva_dflash_pp2 = (
+            envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+            and getattr(server_args, "speculative_algorithm", None) == "DFLASH"
+            and getattr(server_args, "pp_size", 1) == 2
+        )
+        if not self.pp_group.is_last_rank and not omniva_dflash_pp2:
             return
 
         if layer_ids is None:

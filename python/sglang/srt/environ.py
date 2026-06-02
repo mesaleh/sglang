@@ -638,6 +638,7 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(True)
     SGLANG_ENABLE_DFLASH_SPEC_V2 = EnvBool(False)
+    SGLANG_OMNIVA_DFLASH_PP2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_GREEDY_VERIFY_ARGMAX = EnvBool(False)
 
