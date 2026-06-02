@@ -51,16 +51,34 @@ _DRAFT_FABRIC_AR = _os.environ.get("SGLANG_DFLASH_DRAFT_FABRIC_AR", "0") == "1"
 def _draft_reduce_norm(norm, x, residual):
     """Reduce a PARTIAL (unreduced) RowParallel output, then add+RMSNorm.
 
-    Only called when ``_DRAFT_FABRIC_AR`` skipped the in-linear all-reduce, so ``x`` is a
-    partial sum that MUST be reduced here. Prefer the Fabric AR fusion when applicable;
-    otherwise fall back to an explicit NCCL all-reduce + standard add+norm. This keeps the
-    output correct regardless of whether the flashinfer fusion path is taken.
+    Called only when ``_DRAFT_FABRIC_AR`` skipped the in-linear all-reduce, so ``x`` is a
+    TP-partial sum that MUST be reduced exactly once here. We call the flashinfer fused
+    all-reduce+residual+RMSNorm (Fabric) DIRECTLY and check whether it actually ran: it
+    returns ``(None, _)`` when it declines (fusion unavailable / unsupported shape / workspace
+    mismatch). We do NOT use ``RMSNorm.forward_with_allreduce_fusion`` here because its internal
+    fallback would normalize the unreduced partial *without* an all-reduce. On any decline we
+    FAIL CLOSED to an explicit ``tensor_model_parallel_all_reduce`` + standard add+norm, so the
+    partial is always reduced exactly once and never normalized unreduced. ``residual`` is
+    always set at every call site (the residual-is-None first-layer/final-norm paths branch
+    away before calling this).
     """
     from sglang.srt.distributed import tensor_model_parallel_all_reduce
     from sglang.srt.layers.communicator import apply_flashinfer_allreduce_fusion
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        flashinfer_allreduce_residual_rmsnorm,
+    )
 
     if residual is not None and apply_flashinfer_allreduce_fusion(int(x.shape[0])):
-        return norm.forward_with_allreduce_fusion(x, residual)
+        out, new_residual = flashinfer_allreduce_residual_rmsnorm(
+            input_tensor=x,
+            residual=residual,
+            weight=norm.weight,
+            eps=norm.variance_epsilon,
+            use_attn_tp_group=True,
+        )
+        if out is not None:
+            return out, new_residual  # Fabric fused AR actually ran.
+    # Fusion not applicable or declined -> reduce the partial explicitly, then standard add+norm.
     if get_tensor_model_parallel_world_size() > 1:
         x = tensor_model_parallel_all_reduce(x)
     return norm(x, residual)
