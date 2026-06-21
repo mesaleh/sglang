@@ -456,6 +456,53 @@ class DecodeInputBuffers(ForwardInputBuffers):
             self.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
 
 
+def _allocate_decode_buffers(
+    *,
+    device: torch.device,
+    max_bs: int,
+    max_num_token: int,
+    hidden_size: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    dp_size: int,
+    pp_size: int,
+    is_encoder_decoder: bool,
+    require_mlp_tp_gather: bool,
+    seq_len_fill_value: int,
+    encoder_len_fill_value: int,
+    num_tokens_per_bs: int,
+    cache_loc_dtype: torch.dtype,
+    enable_mamba_track: bool,
+    ne_token_table: Optional[torch.Tensor] = None,
+    is_hybrid_swa: bool = False,
+    hc_hidden_size: Optional[int] = None,
+    num_pp_proxy_aux_hidden_states: int = 0,
+) -> DecodeInputBuffers:
+    """Allocate decode buffers shared by graph replay and eager warmup paths."""
+
+    return DecodeInputBuffers.create(
+        device=device,
+        max_bs=max_bs,
+        max_num_token=max_num_token,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        dtype=dtype,
+        dp_size=dp_size,
+        pp_size=pp_size,
+        is_encoder_decoder=is_encoder_decoder,
+        require_mlp_tp_gather=require_mlp_tp_gather,
+        seq_len_fill_value=seq_len_fill_value,
+        encoder_len_fill_value=encoder_len_fill_value,
+        num_tokens_per_bs=num_tokens_per_bs,
+        cache_loc_dtype=cache_loc_dtype,
+        enable_mamba_track=enable_mamba_track,
+        ne_token_table=ne_token_table,
+        is_hybrid_swa=is_hybrid_swa,
+        hc_hidden_size=hc_hidden_size,
+        num_pp_proxy_aux_hidden_states=num_pp_proxy_aux_hidden_states,
+    )
+
+
 # Detect whether the current forward pass is in capture mode
 is_capture_mode = False
 # When capturing dual MoE backends, tracks which variant is being captured.
@@ -782,6 +829,7 @@ class CudaGraphRunner:
             ne_token_table=(
                 model_runner.token_table if self.use_ngram_embedding else None
             ),
+            is_hybrid_swa=getattr(model_runner, "is_hybrid_swa", False),
             hc_hidden_size=getattr(
                 self.model_runner.model_config, "hc_hidden_size", None
             ),
