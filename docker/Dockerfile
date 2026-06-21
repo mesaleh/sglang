@@ -649,6 +649,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
+# Some transitive dependencies are satisfied from Ubuntu's system Python in the
+# framework stage, but the runtime image only copies /usr/local site-packages.
+# Install them explicitly so server import paths stay reproducible.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --ignore-installed -c /sgl-workspace/constraints.txt \
+    distro \
+    cryptography \
+    PyJWT \
+    pyparsing
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
