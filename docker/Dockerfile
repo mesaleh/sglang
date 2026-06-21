@@ -601,6 +601,7 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_LOCAL_SGL_KERNEL=0
 
 WORKDIR /sgl-workspace
 
@@ -615,6 +616,19 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
+
+# Install local sgl-kernel when the promoted image needs source-provenance for
+# Omniva kernel changes. The default remains the upstream prebuilt wheel path.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$INSTALL_LOCAL_SGL_KERNEL" = "1" ]; then \
+        cd /sgl-workspace/sglang/sgl-kernel \
+        && rm -rf /tmp/sgl_kernel_wheels \
+        && python3 -m pip wheel --no-build-isolation --no-deps -w /tmp/sgl_kernel_wheels . \
+        && python3 -m pip install --force-reinstall --no-deps /tmp/sgl_kernel_wheels/sglang_kernel-*.whl \
+        && mkdir -p /sgl-workspace/local_wheels \
+        && cp /tmp/sgl_kernel_wheels/sglang_kernel-*.whl /sgl-workspace/local_wheels/ \
+        && rm -rf /tmp/sgl_kernel_wheels; \
+    fi
 
 # Editable install (fast - dependencies already installed via constraints)
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
@@ -666,16 +680,19 @@ WORKDIR /sgl-workspace/sglang
 ARG SGLANG_BUILD_COMMIT=unknown
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ARG INSTALL_LOCAL_SGL_KERNEL=0
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev} \
+    SGLANG_LOCAL_SGL_KERNEL=${INSTALL_LOCAL_SGL_KERNEL}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
+      ai.sglang.local_sgl_kernel="${INSTALL_LOCAL_SGL_KERNEL}"
 
 ########################################################
 ########## Runtime Image ##############################
@@ -819,16 +836,19 @@ WORKDIR /sgl-workspace/sglang
 ARG SGLANG_BUILD_COMMIT=unknown
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ARG INSTALL_LOCAL_SGL_KERNEL=0
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev} \
+    SGLANG_LOCAL_SGL_KERNEL=${INSTALL_LOCAL_SGL_KERNEL}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
+      ai.sglang.local_sgl_kernel="${INSTALL_LOCAL_SGL_KERNEL}"
 
 # Default command
 CMD ["/bin/bash"]
