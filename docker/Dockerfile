@@ -602,6 +602,8 @@ ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG INSTALL_LOCAL_SGL_KERNEL=0
+ARG LOCAL_SGL_KERNEL_BUILD_PARALLEL_LEVEL=8
+ARG LOCAL_SGL_KERNEL_COMPILE_THREADS=8
 
 WORKDIR /sgl-workspace
 
@@ -623,7 +625,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     if [ "$INSTALL_LOCAL_SGL_KERNEL" = "1" ]; then \
         cd /sgl-workspace/sglang/sgl-kernel \
         && rm -rf /tmp/sgl_kernel_wheels \
-        && python3 -m pip wheel --no-build-isolation --no-deps -w /tmp/sgl_kernel_wheels . \
+        && CMAKE_BUILD_PARALLEL_LEVEL="${LOCAL_SGL_KERNEL_BUILD_PARALLEL_LEVEL}" \
+            python3 -m pip wheel \
+                --config-settings=cmake.define.SGL_KERNEL_COMPILE_THREADS="${LOCAL_SGL_KERNEL_COMPILE_THREADS}" \
+                --no-build-isolation --no-deps -w /tmp/sgl_kernel_wheels . \
         && python3 -m pip install --force-reinstall --no-deps /tmp/sgl_kernel_wheels/sglang_kernel-*.whl \
         && mkdir -p /sgl-workspace/local_wheels \
         && cp /tmp/sgl_kernel_wheels/sglang_kernel-*.whl /sgl-workspace/local_wheels/ \
