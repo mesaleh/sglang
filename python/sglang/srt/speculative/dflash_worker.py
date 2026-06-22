@@ -644,7 +644,9 @@ class DFlashWorker:
                 getattr(self, "block_size", "unknown"),
             )
 
-    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int]) -> None:
+    def on_verify_complete_cpu(
+        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+    ) -> None:
         # DFLASH does not currently have an adaptive controller, but spec-v2
         # scheduler code calls this hook for every speculative worker.
         pass
