@@ -104,6 +104,13 @@ string(REPLACE
 file(WRITE "${repo-mscclpp_SOURCE_DIR}/CMakeLists.txt" "${_mscclpp_cmakelists}")
 unset(_mscclpp_cmakelists)
 
+# MSCCL++ adds clang-format/black check targets to ALL. Those are source-tree
+# hygiene checks for the dependency, not part of the runtime wheel, and they
+# can fail in cross-architecture Docker builds when a host-arch formatter is
+# present in the image.
+file(WRITE "${repo-mscclpp_SOURCE_DIR}/cmake/AddFormatTargets.cmake"
+    "add_custom_target(check-format)\nadd_custom_target(format)\n")
+
 # ccache option
 option(ENABLE_CCACHE "Whether to use ccache" ON)
 find_program(CCACHE_FOUND ccache)
