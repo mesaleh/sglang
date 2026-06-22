@@ -807,7 +807,7 @@ class FlashInferAttnBackend(AttentionBackend):
             get_mha_turboquant_config,
         )
 
-        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        tq_config = get_mha_turboquant_config(self.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -985,13 +985,13 @@ class FlashInferAttnBackend(AttentionBackend):
             get_mha_turboquant_config,
         )
 
-        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        tq_config = get_mha_turboquant_config(self.token_to_kv_pool)
         q_input = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
         if tq_config is not None:
             q_input = tq_config.rotate_query(q_input)
         o = decode_wrapper.forward(
             q_input,
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            self.token_to_kv_pool.get_kv_buffer(layer.layer_id),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
             # Must use _float to avoid device-to-host copy that breaks cuda graph capture.

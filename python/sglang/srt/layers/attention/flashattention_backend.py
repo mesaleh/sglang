@@ -869,7 +869,7 @@ class FlashAttentionBackend(AttentionBackend):
             get_mha_turboquant_config,
         )
 
-        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        tq_config = get_mha_turboquant_config(self.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -938,7 +938,7 @@ class FlashAttentionBackend(AttentionBackend):
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
-            key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            key_cache, value_cache = self.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
             )
 
@@ -1370,7 +1370,7 @@ class FlashAttentionBackend(AttentionBackend):
             get_mha_turboquant_config,
         )
 
-        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        tq_config = get_mha_turboquant_config(self.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim)

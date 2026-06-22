@@ -1215,7 +1215,7 @@ class TritonAttnBackend(AttentionBackend):
         _kv_from_pool = False  # Track if K/V came from dequant buffer (already rotspace)
         if k is None and v is None:
             _kv_from_pool = True
-            pool = forward_batch.token_to_kv_pool
+            pool = self.token_to_kv_pool
             cache_loc = forward_batch.out_cache_loc
             if isinstance(pool, SWAKVPool) and pool.layers_mapping[layer.layer_id][1]:
                 cache_loc = pool.translate_loc_from_full_to_swa(cache_loc)
@@ -1293,7 +1293,7 @@ class TritonAttnBackend(AttentionBackend):
             get_mha_turboquant_config,
         )
 
-        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        tq_config = get_mha_turboquant_config(self.token_to_kv_pool)
         if tq_config is not None:
             if (
                 not _kv_from_pool
@@ -1361,7 +1361,7 @@ class TritonAttnBackend(AttentionBackend):
             v_descale = 1.0
 
         # Get prefix KV buffers
-        pool = forward_batch.token_to_kv_pool
+        pool = self.token_to_kv_pool
         if (tq_config is not None
             and tq_config.k_bit_width in (2, 4)
             and tq_config.v_bit_width in (2, 4)
@@ -1678,7 +1678,7 @@ class TritonAttnBackend(AttentionBackend):
             get_mha_turboquant_config,
         )
 
-        tq_config = get_mha_turboquant_config(forward_batch.token_to_kv_pool)
+        tq_config = get_mha_turboquant_config(self.token_to_kv_pool)
         if tq_config is not None:
             q = tq_config.rotate_query(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1696,7 +1696,7 @@ class TritonAttnBackend(AttentionBackend):
             # Models that go through SWA — e.g. GptOssForCausalLM — need this
             # indirection; the plain list-index fails because SWAKVPool has
             # no top-level k_buffer attribute, only sub-pools do.
-            pool = forward_batch.token_to_kv_pool
+            pool = self.token_to_kv_pool
             if hasattr(pool, "get_tq_k_buffer"):
                 k_buf = pool.get_tq_k_buffer(layer.layer_id)
                 v_buf = pool.get_tq_v_buffer(layer.layer_id)
@@ -1734,8 +1734,8 @@ class TritonAttnBackend(AttentionBackend):
         else:
             self.decode_attention_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 kv_indptr,
                 kv_indices,

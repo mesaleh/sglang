@@ -1218,9 +1218,7 @@ class TurboQuantMLABackend(FlashMLABackend):
             assert v is not None
             if save_kv_cache:
                 with _tq_mla_nvtx_range("omniva.tq_mla.decode.save_kv_cache"):
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v
-                    )
+                    self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
 
         from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
             tq_mla_decode_attention_fwd,
