@@ -237,16 +237,26 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    if envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
+    if not envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for DFLASH speculative decoding. "
+            "Set SGLANG_ENABLE_DFLASH_SPEC_V2=1 to opt into DFLASH spec v2."
+        )
+    elif not envs.SGLANG_ENABLE_SPEC_V2.get():
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Non-overlap (synchronous) DFLASH spec v2 is used because "
+            "SGLANG_ENABLE_SPEC_V2=False."
+        )
+    elif server_args.disable_overlap_schedule:
         logger.warning(
             "Non-overlap (synchronous) DFLASH spec v2 is used; overlap scheduling "
             "is disabled for DFLASH speculative decoding."
         )
     else:
         logger.warning(
-            "Overlap scheduler is disabled for DFLASH speculative decoding. "
-            "Set SGLANG_ENABLE_DFLASH_SPEC_V2=1 to opt into DFLASH spec v2."
+            "DFLASH spec v2 overlap scheduling is enabled."
         )
 
     if server_args.enable_mixed_chunk:
