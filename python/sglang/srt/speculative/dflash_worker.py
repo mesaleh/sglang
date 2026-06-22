@@ -10,7 +10,7 @@ import triton.language as tl
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.lm_head_gemm import maybe_fused_lm_head_matmul
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.common import get_last_loc
@@ -1794,10 +1794,9 @@ class DFlashWorker:
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            model_worker_batch = batch.get_model_worker_batch()
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            batch.capture_hidden_mode = CaptureHiddenMode.FULL
             return self.target_worker.forward_batch_generation(
-                model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+                batch, pp_proxy_tensors=pp_proxy_tensors
             )
 
         draft_input = batch.spec_info
@@ -1809,9 +1808,8 @@ class DFlashWorker:
 
         self._prepare_for_speculative_decoding(batch, draft_input)
 
-        model_worker_batch = batch.get_model_worker_batch()
-        assert model_worker_batch.forward_mode.is_target_verify()
-        verify_input = model_worker_batch.spec_info
+        assert batch.forward_mode.is_target_verify()
+        verify_input = batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
 
         need_mamba_verify_commit = hasattr(
@@ -1823,7 +1821,7 @@ class DFlashWorker:
         )
 
         return self.target_worker.forward_batch_generation(
-            model_worker_batch,
+            batch,
             pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
         )

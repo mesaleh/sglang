@@ -4,7 +4,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.managers.schedule_batch import ModelWorkerBatch
+from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -83,10 +83,8 @@ class DFlashWorkerV2(DFlashWorker):
             target_worker=target_worker,
         )
 
-    def _validate_phase1_sampling_support(
-        self, model_worker_batch: ModelWorkerBatch
-    ) -> None:
-        sampling_info = model_worker_batch.sampling_info
+    def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
+        sampling_info = batch.sampling_info
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
@@ -165,7 +163,7 @@ class DFlashWorkerV2(DFlashWorker):
 
     def forward_batch_generation(
         self,
-        model_worker_batch: ModelWorkerBatch,
+        model_worker_batch: ScheduleBatch,
         **kwargs,
     ) -> GenerationBatchResult:
         if getattr(model_worker_batch, "return_logprob", False):
@@ -196,11 +194,11 @@ class DFlashWorkerV2(DFlashWorker):
                 )
 
             if (
-                model_worker_batch.extend_seq_lens is None
-                or model_worker_batch.extend_prefix_lens is None
+                model_worker_batch.extend_lens is None
+                or model_worker_batch.prefix_lens is None
             ):
                 raise RuntimeError(
-                    "DFLASH expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, "
+                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
                     "but got None."
                 )
 
@@ -208,10 +206,10 @@ class DFlashWorkerV2(DFlashWorker):
             # for radix cache safety (the scheduler may update radix after prefill returns).
             device = next_token_ids.device
             ctx_lens = torch.tensor(
-                model_worker_batch.extend_seq_lens, dtype=torch.int32, device=device
+                model_worker_batch.extend_lens, dtype=torch.int32, device=device
             )
             draft_seq_lens = torch.tensor(
-                model_worker_batch.extend_prefix_lens, dtype=torch.int32, device=device
+                model_worker_batch.prefix_lens, dtype=torch.int32, device=device
             )
 
             if model_worker_batch.out_cache_loc is None:
@@ -222,7 +220,7 @@ class DFlashWorkerV2(DFlashWorker):
                 self.model_runner.server_args.attention_backend,
                 draft_seq_lens,
                 ctx_lens,
-                int(sum(model_worker_batch.extend_seq_lens)),
+                int(sum(model_worker_batch.extend_lens)),
             )
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
