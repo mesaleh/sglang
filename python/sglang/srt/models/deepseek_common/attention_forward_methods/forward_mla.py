@@ -771,12 +771,14 @@ class DeepseekMLAForwardMixin:
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
             )
-            # Omniva: the active forward_batch.attn_backend can differ from the main
-            # backend when a separate speculative_draft_attention_backend is used
-            # (e.g. flashinfer draft + tokenspeed_mla verify for MLA tree drafting).
-            # Backends without a `data_type` attr (flashinfer) don't do trtllm fused
-            # rope, so fall back to explicit rope for them instead of crashing.
-            and getattr(forward_batch.attn_backend, "data_type", None)
+            # Omniva: older batches may carry a per-call backend when a separate
+            # speculative_draft_attention_backend is used. Newer upstream stores
+            # the active backend in the forward context instead.
+            and getattr(
+                getattr(forward_batch, "attn_backend", get_attn_backend()),
+                "data_type",
+                None,
+            )
             == torch.float8_e4m3fn
         )
 
