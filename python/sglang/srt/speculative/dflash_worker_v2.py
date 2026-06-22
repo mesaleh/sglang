@@ -13,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     compute_position,
 )
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -474,9 +475,6 @@ class DFlashWorkerV2(DFlashWorker):
             seq_lens_sum=int(seq_lens_cpu.sum().item()),
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
-            req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-            token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-            attn_backend=self.draft_model_runner.attn_backend,
             input_embeds=input_embeds,
             spec_algorithm=SpeculativeAlgorithm.DFLASH,
             spec_info=self._draft_block_spec_info,
@@ -484,7 +482,12 @@ class DFlashWorkerV2(DFlashWorker):
         )
 
         with _profile_range("dflash_v2.draft_forward"):
-            with torch.inference_mode():
+            with (
+                torch.inference_mode(),
+                forward_context(
+                    ForwardContext(attn_backend=self.draft_model_runner.attn_backend)
+                ),
+            ):
                 draft_logits_output = self.draft_model_runner.forward(
                     forward_batch
                 ).logits_output
