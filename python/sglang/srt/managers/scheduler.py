@@ -975,7 +975,7 @@ class Scheduler(
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
-            pp_size=self.pp_size,
+            pp_size=self.ps.pp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
@@ -3358,7 +3358,7 @@ class Scheduler(
             else:
                 resolve_forward_inputs(batch, self.future_map)
                 kwargs = {}
-                if self.spec_algorithm.is_none() or self.pp_size > 1:
+                if self.spec_algorithm.is_none() or self.ps.pp_size > 1:
                     kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
