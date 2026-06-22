@@ -420,7 +420,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
+    && current_nofile="$(ulimit -n)" \
+    && if [ "$current_nofile" -lt 65536 ]; then \
+           ulimit -n 65536 || { echo "ERROR: nofile limit is ${current_nofile}, below 65536, and could not be raised"; exit 1; }; \
+       fi \
+    && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
