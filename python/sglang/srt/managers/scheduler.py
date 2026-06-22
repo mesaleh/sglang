@@ -1091,10 +1091,12 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             return None, None
 
+        if self.spec_algorithm.is_dflash():
+            draft_runner = self.draft_worker.draft_model_runner
+            return draft_runner.token_to_kv_pool, draft_runner.model_config
+
         if self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.spec_algorithm.is_dflash():
-                draft_runner = self.draft_worker.draft_model_runner
-            elif self.server_args.enable_multi_layer_eagle:
+            if self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner

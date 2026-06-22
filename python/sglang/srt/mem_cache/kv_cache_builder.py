@@ -54,8 +54,12 @@ def get_draft_kv_pool(
     if draft_worker is None or spec_algorithm.is_ngram():
         return None, None
 
-    # V2 (EAGLE family) nests the runner under `.draft_worker`; DFLASH /
-    # FROZEN_KV_MTP expose `.model_runner` directly.
+    if spec_algorithm.is_dflash():
+        draft_runner = draft_worker.draft_model_runner
+        return draft_runner.token_to_kv_pool, draft_runner.model_config
+
+    # V2 (EAGLE family) nests the runner under `.draft_worker`; legacy workers
+    # expose `.model_runner` directly.
     if spec_algorithm.supports_spec_v2():
         if server_args.enable_multi_layer_eagle:
             draft_runner = draft_worker.draft_worker.draft_runner_list[0]
