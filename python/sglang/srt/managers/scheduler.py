@@ -3333,7 +3333,7 @@ class Scheduler(
             else:
                 resolve_forward_inputs(batch, self.future_map)
                 kwargs = {}
-                if self.spec_algorithm.is_none() or self.pp_size > 1:
+                if self.spec_algorithm.is_none() or self.ps.pp_size > 1:
                     kwargs["pp_proxy_tensors"] = pp_proxy_tensors
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
