@@ -238,9 +238,16 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
         )
 
     server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-    )
+    if envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
+        logger.warning(
+            "Non-overlap (synchronous) DFLASH spec v2 is used; overlap scheduling "
+            "is disabled for DFLASH speculative decoding."
+        )
+    else:
+        logger.warning(
+            "Overlap scheduler is disabled for DFLASH speculative decoding. "
+            "Set SGLANG_ENABLE_DFLASH_SPEC_V2=1 to opt into DFLASH spec v2."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
