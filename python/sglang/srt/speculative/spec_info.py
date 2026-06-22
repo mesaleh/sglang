@@ -172,15 +172,17 @@ class SpeculativeAlgorithm(Enum):
         enable_overlap = not server_args.disable_overlap_schedule
 
         if self.is_dflash():
+            if envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+                return DFlashWorkerV2
+
             if enable_overlap:
                 if not envs.SGLANG_ENABLE_DFLASH_SPEC_V2.get():
                     raise ValueError(
                         "DFLASH spec-v2 overlap scheduling is disabled by default. "
                         "Set SGLANG_ENABLE_DFLASH_SPEC_V2=1 to opt in."
                     )
-                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
-
-                return DFlashWorkerV2
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
