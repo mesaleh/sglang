@@ -207,6 +207,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
     encoder_lens: Optional[torch.Tensor]
     pp_proxy_tensors: Optional[Dict[str, torch.Tensor]]
     ngram_embedding_info: Optional["NgramEmbeddingInfo"]
+    rids_int: Optional[torch.Tensor]
+    bootstrap_room_ids_int: Optional[torch.Tensor]
 
     @classmethod
     def create(
@@ -308,6 +310,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if ne_token_table is not None
                 else None
             )
+            rids_int = (
+                torch.zeros((max_bs,), dtype=torch.int64)
+                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+                else None
+            )
+            bootstrap_room_ids_int = (
+                torch.full((max_bs,), -1, dtype=torch.int64)
+                if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get()
+                else None
+            )
 
         # Keep seq_lens_cpu as a true CPU tensor, like the old implementation.
         seq_lens_cpu = torch.full(
@@ -337,6 +349,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
             pp_proxy_tensors=pp_proxy_tensors,
             ngram_embedding_info=ngram_embedding_info,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
 
     def populate_from_forward_batch(
@@ -366,6 +380,10 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
                 self.mamba_track_mask.fill_(False)
+            if self.rids_int is not None:
+                self.rids_int.zero_()
+            if self.bootstrap_room_ids_int is not None:
+                self.bootstrap_room_ids_int.fill_(-1)
 
         # Build batched copy lists for all GPU tensors.
         dsts = [
@@ -408,6 +426,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
         if self.encoder_lens is not None and forward_batch.encoder_lens is not None:
             dsts.append(self.encoder_lens[:raw_bs])
             srcs.append(forward_batch.encoder_lens)
+
+        if self.rids_int is not None and forward_batch.rids_int is not None:
+            dsts.append(self.rids_int[:raw_bs])
+            srcs.append(forward_batch.rids_int)
+        if (
+            self.bootstrap_room_ids_int is not None
+            and forward_batch.bootstrap_room_ids_int is not None
+        ):
+            dsts.append(self.bootstrap_room_ids_int[:raw_bs])
+            srcs.append(forward_batch.bootstrap_room_ids_int)
 
         if forward_batch.mrope_positions is not None:
             dsts.append(self.mrope_positions[:, :raw_num_token])
