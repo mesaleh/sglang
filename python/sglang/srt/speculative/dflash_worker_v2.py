@@ -167,6 +167,7 @@ class DFlashWorkerV2(DFlashWorker):
         model_worker_batch: ScheduleBatch,
         **kwargs,
     ) -> GenerationBatchResult:
+        on_publish = kwargs.pop("on_publish", None)
         if getattr(model_worker_batch, "return_logprob", False):
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."
@@ -231,6 +232,10 @@ class DFlashWorkerV2(DFlashWorker):
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
+
+            batch_output.new_seq_lens = model_worker_batch.seq_lens
+            if on_publish is not None:
+                on_publish(batch_output.new_seq_lens)
 
             batch_output.next_draft_input = self._make_next_draft_input_prefill(
                 verified_id=next_token_ids,
@@ -635,6 +640,11 @@ class DFlashWorkerV2(DFlashWorker):
                     commit_lens=commit_lens,
                 )
 
+            if new_seq_lens is None:
+                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            if on_publish is not None:
+                on_publish(new_seq_lens)
+
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -657,8 +667,6 @@ class DFlashWorkerV2(DFlashWorker):
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
 
-            if new_seq_lens is None:
-                new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
             next_draft_seq_lens = None
             next_draft_seq_lens_cpu = None
             next_draft_seq_lens_cpu_ready = None
