@@ -2463,6 +2463,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def is_spec_v2(self):
         # Whether the V2 worker/schema is used. Independent of overlap: the
         # non-overlap path also drives the V2 worker, just synchronously.
+        # DFLASH still uses its V1 worker when overlap is disabled.
+        if self.spec_algorithm.is_dflash():
+            return self.enable_overlap and self.spec_algorithm.supports_spec_v2()
         return self.spec_algorithm.supports_spec_v2()
 
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
