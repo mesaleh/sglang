@@ -1,4 +1,5 @@
 import contextlib
+import inspect
 import logging
 import platform
 from typing import Optional, Tuple
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 _flashinfer_comm = None
 _TorchDistBackend = None
 _flashinfer_allreduce_unavailable = False
+_flashinfer_create_workspace_supports_group = False
+_flashinfer_create_workspace_supports_comm_backend = False
+_flashinfer_allreduce_supports_trigger_completion = False
+_flashinfer_allreduce_supports_pre_allreduce_add = False
 _posix_transport_override_logged = False
 
 
@@ -106,6 +111,20 @@ if is_flashinfer_available():
             comm, "create_allreduce_fusion_workspace"
         ):
             _flashinfer_comm = comm
+            workspace_params = inspect.signature(
+                comm.create_allreduce_fusion_workspace
+            ).parameters
+            allreduce_params = inspect.signature(comm.allreduce_fusion).parameters
+            _flashinfer_create_workspace_supports_group = "group" in workspace_params
+            _flashinfer_create_workspace_supports_comm_backend = (
+                "comm_backend" in workspace_params
+            )
+            _flashinfer_allreduce_supports_trigger_completion = (
+                "trigger_completion_at_end" in allreduce_params
+            )
+            _flashinfer_allreduce_supports_pre_allreduce_add = (
+                "pre_allreduce_add" in allreduce_params
+            )
         else:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -384,14 +403,19 @@ class FlashInferWorkspaceManager:
                 dtype=dtype,
                 force_oneshot_support=bool(use_oneshot),
             )
-            if device_group is not None:
-                # Pin the symmetric-memory rendezvous to the actual
-                # subgroup. Without this, flashinfer >=0.6.10 falls back
-                # to WORLD and TP/EP/CP subgroup peers get addressed
-                # incorrectly (kernel hangs in cuda-graph warmup).
+            create_workspace = _flashinfer_comm.create_allreduce_fusion_workspace
+            if (
+                _flashinfer_create_workspace_supports_group
+                and device_group is not None
+            ):
+                # Pin the symmetric-memory rendezvous to the actual subgroup.
+                # Without this, flashinfer >=0.6.10 falls back to WORLD and
+                # TP/EP/CP subgroup peers get addressed incorrectly. Older
+                # FlashInfer releases only support comm_backend.
                 kwargs["group"] = device_group
             if (
                 _TorchDistBackend is not None
+                and _flashinfer_create_workspace_supports_comm_backend
                 and device_group is not None
                 and cpu_group is not None
             ):
@@ -399,9 +423,7 @@ class FlashInferWorkspaceManager:
                     device_group=device_group, cpu_group=cpu_group
                 )
             with _flashinfer_posix_fd_transport_override_if_needed():
-                self.workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
-                    **kwargs
-                )
+                self.workspace = create_workspace(**kwargs)
         except Exception as e:
             _flashinfer_allreduce_unavailable = True
             logger.warning(
@@ -423,7 +445,8 @@ class FlashInferWorkspaceManager:
         backend = getattr(self.workspace, "backend", "unknown")
         logger.info(
             f"FlashInfer workspace initialized for rank {rank}, "
-            f"world_size {world_size}, backend {backend}"
+            f"world_size {world_size}, backend {backend}, "
+            f"max_token_num {max_token_num}, hidden_dim {hidden_dim}"
         )
 
     def is_buffer_size_sufficient(
@@ -666,6 +689,16 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
         return None, None
 
+    if (
+        pre_allreduce_addition is not None
+        and not _flashinfer_allreduce_supports_pre_allreduce_add
+    ):
+        logger.debug(
+            "FlashInfer allreduce_fusion does not support pre_allreduce_add, "
+            "skipping allreduce fusion"
+        )
+        return None, None
+
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
@@ -681,23 +714,23 @@ def flashinfer_allreduce_residual_rmsnorm(
     norm_out = torch.empty_like(input_tensor)
 
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    kwargs = {
-        "input": input_tensor,
-        "workspace": workspace_manager.workspace,
-        "pattern": _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
-        "launch_with_pdl": True,
-        "trigger_completion_at_end": trigger_completion_at_end,
-        "residual_out": residual_out,
-        "norm_out": norm_out,
-        "residual_in": residual,
-        "rms_gamma": weight,
-        "rms_eps": eps,
-        "use_oneshot": use_oneshot,
-        "fp32_acc": fp32_acc,
-    }
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        norm_out=norm_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        use_oneshot=use_oneshot,
+        fp32_acc=fp32_acc,
+    )
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = trigger_completion_at_end
     if pre_allreduce_addition is not None:
         kwargs["pre_allreduce_add"] = pre_allreduce_addition
-
     _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out

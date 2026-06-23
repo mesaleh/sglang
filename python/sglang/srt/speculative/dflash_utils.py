@@ -11,6 +11,7 @@ import triton.language as tl
 
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -841,6 +842,23 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
     return correct_len, bonus
+
+def validate_dflash_request(req: Req) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None
 
 
 def compute_dflash_sampling_accept_len_and_bonus(

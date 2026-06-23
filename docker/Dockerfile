@@ -10,17 +10,17 @@ ARG HOPPER_SBO=0
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.2.post2
+ARG SGL_KERNEL_VERSION=0.4.3
 ARG SGL_VERSION
-ARG SGL_DEEP_GEMM_VERSION=0.1.0
+ARG SGL_DEEP_GEMM_VERSION=0.1.2
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
 ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.11.post1
-ARG MOONCAKE_VERSION=0.3.10.post2
+ARG FLASHINFER_VERSION=0.6.12
+ARG MOONCAKE_VERSION=0.3.11.post1
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -243,7 +243,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               torch torchvision torchaudio --force-reinstall; \
+               "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" "numpy<2.4" --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
@@ -420,7 +420,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && export PATH="/root/.cargo/bin:${PATH}" \
     && python3 -m pip install maturin \
     && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
+    && current_nofile="$(ulimit -n)" \
+    && if [ "$current_nofile" -lt 65536 ]; then \
+           ulimit -n 65536 || { echo "ERROR: nofile limit is ${current_nofile}, below 65536, and could not be raised"; exit 1; }; \
+       fi \
+    && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
     && cd /build/sgl-model-gateway \
     && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
     && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
@@ -548,20 +552,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # the `nixl` import path) but unconditionally requires nixl-cu12, so we install
 # it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
 # to avoid shipping wrong-CUDA libs on cu13 images.
-# The upstream flash-mla packages are required for running deepseek-v4 models
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
-    cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
-    && cd flash-mla && git submodule update --init --recursive \
-    && pip install --no-build-isolation -v . ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
-    cd /sgl-workspace && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla \
-    && ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda \
-    && cd flash-mla && git submodule update --init --recursive \
-    && pip install --no-build-isolation -v . ; \
 fi
 
 # Add yank script
@@ -609,6 +605,9 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG INSTALL_LOCAL_SGL_KERNEL=0
+ARG LOCAL_SGL_KERNEL_BUILD_PARALLEL_LEVEL=8
+ARG LOCAL_SGL_KERNEL_COMPILE_THREADS=8
 
 WORKDIR /sgl-workspace
 
@@ -623,6 +622,22 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
         git clone --depth=1 --branch v${SGL_VERSION} https://github.com/sgl-project/sglang.git /sgl-workspace/sglang; \
     fi \
     && rm -rf /tmp/local_src
+
+# Install local sgl-kernel when the promoted image needs source-provenance for
+# Omniva kernel changes. The default remains the upstream prebuilt wheel path.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$INSTALL_LOCAL_SGL_KERNEL" = "1" ]; then \
+        cd /sgl-workspace/sglang/sgl-kernel \
+        && rm -rf /tmp/sgl_kernel_wheels \
+        && CMAKE_BUILD_PARALLEL_LEVEL="${LOCAL_SGL_KERNEL_BUILD_PARALLEL_LEVEL}" \
+            python3 -m pip wheel \
+                --config-settings=cmake.define.SGL_KERNEL_COMPILE_THREADS="${LOCAL_SGL_KERNEL_COMPILE_THREADS}" \
+                --no-build-isolation --no-deps -w /tmp/sgl_kernel_wheels . \
+        && python3 -m pip install --force-reinstall --no-deps /tmp/sgl_kernel_wheels/sglang_kernel-*.whl \
+        && mkdir -p /sgl-workspace/local_wheels \
+        && cp /tmp/sgl_kernel_wheels/sglang_kernel-*.whl /sgl-workspace/local_wheels/ \
+        && rm -rf /tmp/sgl_kernel_wheels; \
+    fi
 
 # Editable install (fast - dependencies already installed via constraints)
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
@@ -657,6 +672,16 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --force-reinstall /tmp/gateway_wheels/*.whl \
     && rm -rf /tmp/gateway_wheels
 
+# Some transitive dependencies are satisfied from Ubuntu's system Python in the
+# framework stage, but the runtime image only copies /usr/local site-packages.
+# Install them explicitly so server import paths stay reproducible.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --ignore-installed -c /sgl-workspace/constraints.txt \
+    distro \
+    cryptography \
+    PyJWT \
+    pyparsing
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
@@ -664,16 +689,19 @@ WORKDIR /sgl-workspace/sglang
 ARG SGLANG_BUILD_COMMIT=unknown
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ARG INSTALL_LOCAL_SGL_KERNEL=0
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev} \
+    SGLANG_LOCAL_SGL_KERNEL=${INSTALL_LOCAL_SGL_KERNEL}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
+      ai.sglang.local_sgl_kernel="${INSTALL_LOCAL_SGL_KERNEL}"
 
 ########################################################
 ########## Runtime Image ##############################
@@ -793,6 +821,9 @@ COPY --from=framework_final /sgl-workspace /sgl-workspace
 # Copy sgl-model-gateway binary
 COPY --from=framework_final /usr/local/bin/sgl-model-gateway /usr/local/bin/sgl-model-gateway
 
+# Copy sglang binary
+COPY --from=framework_final /usr/local/bin/sglang /usr/local/bin/sglang
+
 # Copy py-spy binary
 COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 
@@ -814,16 +845,19 @@ WORKDIR /sgl-workspace/sglang
 ARG SGLANG_BUILD_COMMIT=unknown
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ARG INSTALL_LOCAL_SGL_KERNEL=0
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev} \
+    SGLANG_LOCAL_SGL_KERNEL=${INSTALL_LOCAL_SGL_KERNEL}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
+      ai.sglang.local_sgl_kernel="${INSTALL_LOCAL_SGL_KERNEL}"
 
 # Default command
 CMD ["/bin/bash"]
