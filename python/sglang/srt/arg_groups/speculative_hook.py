@@ -136,9 +136,18 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
             "Currently DFLASH speculative decoding does not support dp attention."
         )
 
-    if server_args.pp_size != 1:
+    dflash_pp2_enabled = (
+        server_args.pp_size == 2
+        and server_args.disable_overlap_schedule
+        and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+        and server_args._supports_pipeline_parallel_speculative_decoding()
+    )
+    if server_args.pp_size != 1 and not dflash_pp2_enabled:
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "Currently DFLASH speculative decoding only supports pp_size == 1. "
+            "Set SGLANG_OMNIVA_DFLASH_PP2=1 with pp_size=2 and "
+            "SGLANG_OMNIVA_PP_IMMEDIATE_OUTPUT_FORWARD=1 to use the "
+            "experimental Omniva DFLASH PP2 path."
         )
 
     if server_args.speculative_draft_model_path is None:
