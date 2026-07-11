@@ -29,6 +29,7 @@ dispatch are inherited unchanged from the parent.
 """
 
 import logging
+from inspect import signature
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -62,6 +63,11 @@ logger = logging.getLogger(__name__)
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
 
 
+def _supports_custom_decode_mask(decode_fn) -> bool:
+    parameters = signature(decode_fn).parameters
+    return "custom_mask" in parameters and "cmask_off" in parameters
+
+
 def _get_tokenspeed_workspace(
     device: torch.device, num_heads: int, kv_lora_rank: int, q_len: int
 ) -> torch.Tensor:
@@ -82,7 +88,9 @@ def _get_tokenspeed_workspace(
 class TokenspeedMLABackend(TRTLLMMLABackend):
     """tokenspeed-mla CuTe DSL attention backend (Blackwell SM100, FP8 KV)."""
 
-    supports_custom_decode_mask: bool = True
+    supports_custom_decode_mask: bool = is_tokenspeed_mla_available() and (
+        _supports_custom_decode_mask(tokenspeed_mla.tokenspeed_mla_decode)
+    )
 
     def __init__(
         self,
@@ -306,7 +314,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
-        return tokenspeed_mla.tokenspeed_mla_decode(
+        decode_kwargs = dict(
             query=query,
             kv_cache=kv_cache,
             workspace_buffer=self._ensure_workspace(query.device, query.shape[1]),
@@ -317,10 +325,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len=int(max_seq_len),
             softmax_scale=softmax_scale,
             output_scale=output_scale,
-            custom_mask=custom_mask,
-            cmask_off=custom_mask_offsets,
             enable_pdl=is_arch_support_pdl(),
         )
+        if self.supports_custom_decode_mask:
+            decode_kwargs.update(
+                custom_mask=custom_mask,
+                cmask_off=custom_mask_offsets,
+            )
+        return tokenspeed_mla.tokenspeed_mla_decode(**decode_kwargs)
 
     def _run_prefill_kernel(
         self,

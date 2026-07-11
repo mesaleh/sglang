@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG SGLANG_BUILD_COMMIT
+ARG SGLANG_IMAGE_TAG
+ARG TOKENSPEED_MLA_BUILD_COMMIT
+
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG} \
+    TOKENSPEED_MLA_BUILD_COMMIT=${TOKENSPEED_MLA_BUILD_COMMIT}
+
+WORKDIR /sgl-workspace/sglang
+
+COPY python/sglang python/sglang
+COPY --from=tokenspeed_mla_src . /usr/local/lib/python3.12/dist-packages/tokenspeed_mla
+
+RUN python3 -m py_compile \
+        python/sglang/srt/layers/attention/tokenspeed_mla_backend.py \
+    && python3 -c "import inspect; import tokenspeed_mla; from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration; params = inspect.signature(tokenspeed_mla.tokenspeed_mla_decode).parameters; assert {'custom_mask', 'cmask_off'} <= params.keys()"
