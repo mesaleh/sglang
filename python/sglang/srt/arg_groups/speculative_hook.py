@@ -459,6 +459,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
     # pass + per-branch expand pass with prefix-tail dup). Only these backends implement
     # it; flashmla / trtllm_mla / cutlass_mla can't express the per-branch tree, so reject.
     _PAGE_TREE_SPEC_BACKENDS = ("flashinfer", "fa3", "triton")
+    if os.environ.get("SGLANG_KIMI_MLA_TREE", "0") == "1":
+        _PAGE_TREE_SPEC_BACKENDS += ("tokenspeed_mla",)
     view = resolved_view(server_args)
     if (
         server_args.speculative_eagle_topk > 1
