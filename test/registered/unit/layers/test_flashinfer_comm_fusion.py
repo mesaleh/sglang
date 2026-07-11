@@ -1,6 +1,6 @@
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -72,6 +72,103 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
+    def test_full_tp_uses_torch_dist_for_rendezvous_but_default_runtime_group(self):
+        device_group = object()
+        cpu_group = object()
+        created_backends = []
+
+        class _FakeTorchDistBackend:
+            def __init__(self, device_group, cpu_group):
+                self.device_group = device_group
+                self.cpu_group = cpu_group
+                created_backends.append(self)
+
+        fake_comm = _FakeFlashInferComm()
+        manager = fusion.FlashInferWorkspaceManager()
+        with (
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(
+                fusion,
+                "_create_allreduce_fusion_workspace",
+                fake_comm.create_allreduce_fusion_workspace,
+            ),
+            patch.object(fusion, "_TorchDistBackend", _FakeTorchDistBackend),
+            patch.object(fusion, "_flashinfer_create_workspace_supports_group", True),
+            patch.object(
+                fusion, "_flashinfer_create_workspace_supports_comm_backend", True
+            ),
+            patch.object(
+                fusion, "_preflight_check_workspace_memory", return_value=True
+            ) as preflight,
+            patch.object(
+                fusion, "in_the_same_node_as", return_value=[True, True, True, True]
+            ),
+        ):
+            manager.initialize(
+                world_size=4,
+                rank=0,
+                max_token_num=8,
+                hidden_dim=16,
+                backend="mnnvl",
+                device_group=None,
+                cpu_group=None,
+                comm_device_group=device_group,
+                comm_cpu_group=cpu_group,
+            )
+
+        self.assertEqual(len(created_backends), 1)
+        self.assertIs(created_backends[0].device_group, device_group)
+        self.assertIs(created_backends[0].cpu_group, cpu_group)
+        preflight.assert_called_once_with(
+            world_size=4,
+            max_token_num=8,
+            hidden_dim=16,
+            dtype=None,
+            cpu_group=cpu_group,
+        )
+        self.assertIs(fake_comm.calls[0]["comm_backend"], created_backends[0])
+        self.assertIsNone(fake_comm.calls[0]["group"])
+        self.assertEqual(fake_comm.calls[0]["gpus_per_node"], 4)
+        self.assertEqual(manager.group, (None, None))
+
+    def test_full_tp_keeps_groups_for_workspace_rendezvous(self):
+        device_group = object()
+        cpu_group = object()
+        coordinator = types.SimpleNamespace(
+            device_group=device_group,
+            cpu_group=cpu_group,
+            world_size=4,
+        )
+        manager = MagicMock()
+        manager.initialized = False
+
+        with (
+            patch.object(fusion, "_flashinfer_allreduce_unavailable", False),
+            patch.object(fusion, "is_flashinfer_available", return_value=True),
+            patch.object(fusion, "_flashinfer_comm", object()),
+            patch.object(fusion, "get_attn_tp_group", return_value=coordinator),
+            patch.object(fusion, "get_tp_group", return_value=coordinator),
+            patch.object(
+                fusion, "get_global_server_args", return_value=types.SimpleNamespace()
+            ),
+            patch.object(fusion, "_get_workspace_manager", return_value=manager),
+            patch.object(
+                fusion,
+                "resolve_flashinfer_allreduce_fusion_backend",
+                return_value="mnnvl",
+            ),
+            patch.object(fusion, "_sync_allreduce_unavailable_across_tp"),
+            get_parallel().override(attn_tp_size=4, attn_tp_rank=0),
+        ):
+            fusion.ensure_workspace_initialized()
+
+        manager.initialize.assert_called_once()
+        kwargs = manager.initialize.call_args.kwargs
+        self.assertIsNone(kwargs["device_group"])
+        self.assertIsNone(kwargs["cpu_group"])
+        self.assertIs(kwargs["comm_device_group"], device_group)
+        self.assertIs(kwargs["comm_cpu_group"], cpu_group)
+
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="auto", nnodes=1

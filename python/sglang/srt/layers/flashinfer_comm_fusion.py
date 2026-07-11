@@ -414,6 +414,8 @@ class FlashInferWorkspaceManager:
         use_oneshot: Optional[bool] = None,
         device_group: Optional["torch.distributed.ProcessGroup"] = None,
         cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
+        comm_device_group: Optional["torch.distributed.ProcessGroup"] = None,
+        comm_cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
     ):
         """Initialize workspace using FlashInfer's unified API."""
         global _flashinfer_allreduce_unavailable
@@ -452,7 +454,7 @@ class FlashInferWorkspaceManager:
             max_token_num=max_token_num,
             hidden_dim=hidden_dim,
             dtype=dtype,
-            cpu_group=cpu_group,
+            cpu_group=comm_cpu_group or cpu_group,
         ):
             _flashinfer_allreduce_unavailable = True
             self.workspace = None
@@ -461,20 +463,20 @@ class FlashInferWorkspaceManager:
 
         # Determine GPUs per node for MNNVL topology detection
         gpus_per_node = None
-        node_pg = cpu_group if cpu_group is not None else group
+        node_pg = comm_cpu_group or cpu_group or group
         if node_pg is not None:
             gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
         comm_backend = None
         if (
             _TorchDistBackend is not None
-            and device_group is not None
-            and cpu_group is not None
+            and comm_device_group is not None
+            and comm_cpu_group is not None
         ):
             comm_backend = _TorchDistBackend(
-                device_group=device_group, cpu_group=cpu_group
+                device_group=comm_device_group, cpu_group=comm_cpu_group
             )
-        elif _mnnvl_comm_backend is not None and group is not None:
-            comm_backend = _mnnvl_comm_backend(group)
+        elif _mnnvl_comm_backend is not None and node_pg is not None:
+            comm_backend = _mnnvl_comm_backend(node_pg)
 
         try:
             alloc_token_num = max(max_token_num, self._max_token_num_seen or 0)
@@ -657,6 +659,8 @@ def ensure_workspace_initialized(
             coordinator = get_moe_tp_group()
 
     tp_coordinator = get_tp_group()
+    comm_device_group = coordinator.device_group
+    comm_cpu_group = coordinator.cpu_group
     # For the full TP group, keep FlashInfer's default process-group fast
     # path. Passing an explicit full-TP group adds measurable GB200 decode
     # overhead. True subgroups still need an explicit group so flashinfer
@@ -704,6 +708,8 @@ def ensure_workspace_initialized(
             use_oneshot=use_oneshot,
             device_group=device_group,
             cpu_group=cpu_group,
+            comm_device_group=comm_device_group,
+            comm_cpu_group=comm_cpu_group,
         )
 
         _sync_allreduce_unavailable_across_tp()
