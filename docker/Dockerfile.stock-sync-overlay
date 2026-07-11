@@ -16,6 +16,7 @@ WORKDIR /sgl-workspace/sglang
 COPY python/sglang python/sglang
 COPY --from=tokenspeed_mla_src . /usr/local/lib/python3.12/dist-packages/tokenspeed_mla
 
-RUN python3 -m py_compile \
+RUN python3 -m pip install --no-deps "mpi4py==4.1.2" \
+    && python3 -m py_compile \
         python/sglang/srt/layers/attention/tokenspeed_mla_backend.py \
     && python3 -c "import inspect; import tokenspeed_mla; from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration; params = inspect.signature(tokenspeed_mla.tokenspeed_mla_decode).parameters; assert {'custom_mask', 'cmask_off'} <= params.keys()"
