@@ -1345,8 +1345,10 @@ class Req(ReqDllmMixin):
         token_window = self.output_ids[start:]
 
         # Old prefixes were checked in the previous step.
+        first_new_token = len(token_window) - new_accepted_len + 1
+        first_min_token = self.sampling_params.min_new_tokens - start
         for token_count in range(
-            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+            max(1, first_new_token, first_min_token), len(token_window)
         ):
             if matched(self.tokenizer.decode(token_window[:token_count])):
                 return start + token_count

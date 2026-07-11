@@ -141,3 +141,35 @@ def test_check_finished_ignores_string_stop_before_min_new_tokens():
     req.output_ids.append(8)
     req.update_finish_state()
     assert req.finished_reason.to_json() == {"type": "stop", "matched": "stop"}
+
+
+def test_string_stop_inside_speculative_accept_respects_min_new_tokens():
+    req = _req(
+        _sampling_params(
+            max_new_tokens=8,
+            min_new_tokens=4,
+            stop="stop",
+        )
+    )
+
+    req.output_ids = [7, 8, 9, 10]
+    req.update_finish_state(new_accepted_len=4)
+
+    assert req.finished_reason.to_json() == {"type": "stop", "matched": "stop"}
+    assert req.finished_len == 4
+
+
+def test_regex_stop_inside_speculative_accept_respects_min_new_tokens():
+    req = _req(
+        _sampling_params(
+            max_new_tokens=8,
+            min_new_tokens=4,
+            stop_regex="st.*",
+        )
+    )
+
+    req.output_ids = [7, 8, 9, 10]
+    req.update_finish_state(new_accepted_len=4)
+
+    assert req.finished_reason.to_json() == {"type": "stop", "matched": "st.*"}
+    assert req.finished_len == 4
