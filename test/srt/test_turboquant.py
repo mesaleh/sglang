@@ -14,11 +14,32 @@ Usage:
     python -m pytest test/srt/test_turboquant.py -v                # All
 """
 
+import argparse
 import math
 import unittest
 from types import SimpleNamespace
 
 import numpy as np
+
+
+class TestTurboQuantCLI(unittest.TestCase):
+
+    def test_preserved_kv_cache_dtype_choices_parse(self):
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        for dtype in (
+            "turboquant_2bit",
+            "turboquant_4bit",
+            "turboquant_4bit_uniform",
+            "turboquant_k4v2",
+        ):
+            args = parser.parse_args(
+                ["--model-path", "test-model", "--kv-cache-dtype", dtype]
+            )
+            self.assertEqual(args.kv_cache_dtype, dtype)
 
 
 class TestCodebook(unittest.TestCase):
