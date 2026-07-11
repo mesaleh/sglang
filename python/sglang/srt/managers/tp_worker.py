@@ -242,12 +242,13 @@ class TpModelWorker(BaseTpWorker):
         memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
         context_length: Optional[int] = None,
+        pp_size: Optional[int] = None,
     ):
         # Parse args
         self.server_args = server_args
         self.tp_size = server_args.tp_size
         self.ep_size = server_args.ep_size
-        self.pp_size = server_args.pp_size
+        self.pp_size = server_args.pp_size if pp_size is None else pp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank

@@ -1,4 +1,3 @@
-import copy
 import logging
 import math
 from typing import List, Optional
@@ -14,6 +13,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
+    PPProxyTensors,
     compute_position,
 )
 from sglang.srt.server_args import ServerArgs
@@ -134,13 +134,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
-        draft_server_args = server_args
-        if server_args.pp_size > 1 and envs.SGLANG_OMNIVA_DFLASH_PP2.get():
-            draft_server_args = copy.deepcopy(server_args)
-            draft_server_args.pp_size = 1
-
         self._draft_worker = TpModelWorker(
-            server_args=draft_server_args,
+            server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
@@ -151,6 +146,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             nccl_port=nccl_port,
             is_draft_worker=True,
             context_length=target_worker.model_runner.model_config.context_len,
+            pp_size=(
+                1
+                if server_args.pp_size > 1
+                and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+                else None
+            ),
         )
         self.draft_model_runner = self._draft_worker.model_runner
         self._draft_sampler = None
@@ -1270,17 +1271,33 @@ class DFlashWorkerV2(BaseSpecWorker):
         self,
         batch: ScheduleBatch,
         on_publish=None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."
             )
         self._validate_phase1_sampling_support(batch)
+        pp_mode = (
+            self.server_args.pp_size > 1
+            and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+        )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
             batch.capture_hidden_mode = CaptureHiddenMode.FULL
-            batch_output = self.target_worker.forward_batch_generation(batch)
+            batch_output = self.target_worker.forward_batch_generation(
+                batch, pp_proxy_tensors=pp_proxy_tensors
+            )
+            if pp_mode:
+                batch._omniva_dflash_pp_phase = "prefill"
+                batch._omniva_dflash_pp_ready_event = (
+                    torch.get_device_module(self.device).Event()
+                )
+                batch._omniva_dflash_pp_ready_event.record(
+                    torch.get_device_module(self.device).current_stream()
+                )
+                return batch_output
 
             logits_output, next_token_ids = (
                 batch_output.logits_output,
@@ -1354,6 +1371,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if on_publish is not None:
                 on_publish(next_draft_input.new_seq_lens)
+            if pp_mode:
+                batch._omniva_dflash_pp_phase = "idle"
             return GenerationBatchResult(
                 logits_output=None,
                 next_token_ids=empty_ids,
@@ -1612,9 +1631,36 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
             is_verify=True,
             skip_attn_backend_init=True,
         )
+        if pp_mode:
+            batch._omniva_dflash_pp_phase = "verify"
+            batch._omniva_dflash_pp_context = {
+                "draft_input": draft_input,
+                "bs": bs,
+                "device": device,
+                "block_size": block_size,
+                "prefix_lens": prefix_lens,
+                # PP result processing is delayed by the ring. Preserve buffer-backed
+                # tensors before the next microbatch reuses the worker scratch space.
+                "positions": positions.clone(),
+                "verify_out_cache_loc": verify_out_cache_loc.clone(),
+                "verify_out_cache_loc_2d": verify_out_cache_loc_2d.clone(),
+                "draft_tokens": draft_tokens.clone(),
+                "sampling_info": sampling_info,
+                "need_mamba_verify_commit": need_mamba_verify_commit,
+                "seq_lens_pre_verify": seq_lens_pre_verify,
+            }
+            batch._omniva_dflash_pp_ready_event = (
+                torch.get_device_module(self.device).Event()
+            )
+            batch._omniva_dflash_pp_ready_event.record(
+                torch.get_device_module(self.device).current_stream()
+            )
+            return target_out
+
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -1758,3 +1804,230 @@ class DFlashWorkerV2(BaseSpecWorker):
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
         )
+
+    def process_pp_batch_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        phase = getattr(batch, "_omniva_dflash_pp_phase", None)
+        if phase == "verify":
+            return self._process_pp_verify_result(batch, result)
+        if phase == "prefill":
+            return self._process_pp_prefill_result(batch, result)
+        if phase == "idle":
+            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
+            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
+            result.next_draft_input = self._make_next_draft_input_decode(
+                bonus_tokens=empty_ids,
+                new_seq_lens=empty_lens,
+            )
+            result.next_token_ids = empty_ids
+            result.accept_lens = empty_lens
+            result.speculative_num_draft_tokens = int(self.block_size)
+            result.new_seq_lens = empty_lens
+            delattr(batch, "_omniva_dflash_pp_phase")
+            return result
+        raise RuntimeError("PP DFLASH result is missing its deferred phase marker.")
+
+    def _wait_pp_local_forward(self, batch: ScheduleBatch) -> None:
+        ready_event = getattr(batch, "_omniva_dflash_pp_ready_event", None)
+        if ready_event is None:
+            raise RuntimeError("PP DFLASH result is missing its local forward event.")
+        torch.get_device_module(self.device).current_stream().wait_event(ready_event)
+        delattr(batch, "_omniva_dflash_pp_ready_event")
+
+    def _process_pp_prefill_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        self._wait_pp_local_forward(batch)
+        logits_output = result.logits_output
+        next_token_ids = result.next_token_ids
+        if logits_output is None or next_token_ids is None:
+            raise RuntimeError(
+                "PP DFLASH prefill requires logits and sampled tokens from the "
+                "last pipeline stage."
+            )
+        if logits_output.hidden_states is None:
+            raise RuntimeError(
+                "PP DFLASH requires target aux hidden capture for prefill."
+            )
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "PP DFLASH expected extend_lens and prefix_lens in prefill."
+            )
+        if batch.out_cache_loc is None:
+            raise RuntimeError("PP DFLASH prefill expected out_cache_loc.")
+
+        device = next_token_ids.device
+        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
+        draft_seq_lens = torch.tensor(
+            batch.prefix_lens, dtype=torch.int32, device=device
+        )
+        positions, _ = compute_position(
+            self.model_runner.server_args.attention_backend,
+            draft_seq_lens,
+            ctx_lens,
+            int(sum(batch.extend_lens)),
+        )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=logits_output.hidden_states,
+            cache_loc=batch.out_cache_loc,
+            positions=positions,
+        )
+        logits_output.hidden_states = None
+        result.next_draft_input = self._make_next_draft_input_prefill(
+            bonus_tokens=next_token_ids,
+            seq_lens=batch.seq_lens,
+        )
+        result.new_seq_lens = batch.seq_lens
+        delattr(batch, "_omniva_dflash_pp_phase")
+        return result
+
+    def _process_pp_verify_result(
+        self, batch: ScheduleBatch, result: GenerationBatchResult
+    ) -> GenerationBatchResult:
+        self._wait_pp_local_forward(batch)
+        context = getattr(batch, "_omniva_dflash_pp_context", None)
+        if context is None:
+            raise RuntimeError("PP DFLASH verify result is missing local draft context.")
+        logits_output = result.logits_output
+        if logits_output is None or logits_output.next_token_logits is None:
+            raise RuntimeError(
+                "PP DFLASH verify requires target logits from the last pipeline stage."
+            )
+
+        draft_input = context["draft_input"]
+        bs = context["bs"]
+        device = context["device"]
+        block_size = context["block_size"]
+        prefix_lens = context["prefix_lens"]
+        positions = context["positions"]
+        verify_out_cache_loc = context["verify_out_cache_loc"]
+        verify_out_cache_loc_2d = context["verify_out_cache_loc_2d"]
+        draft_tokens = context["draft_tokens"]
+        sampling_info = context["sampling_info"]
+
+        if sampling_info is not None:
+            apply_dflash_verify_logits_adjustments(
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                draft_token_num=block_size,
+            )
+
+        candidates = draft_tokens
+        new_seq_lens = None
+        if (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+        ):
+            accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
+                candidates=candidates,
+                next_token_logits=logits_output.next_token_logits,
+                sampling_info=sampling_info,
+                max_top_k=draft_input.max_top_k,
+                uniform_top_k_value=draft_input.uniform_top_k_value,
+            )
+            commit_lens = accept_len.to(torch.int32) + 1
+            out_tokens = torch.empty(
+                (bs, block_size), dtype=torch.int64, device=device
+            )
+            if block_size > 1:
+                out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+            out_tokens[:, block_size - 1].fill_(0)
+            out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
+        else:
+            target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, block_size)
+            if self._use_triton_accept_bonus:
+                try:
+                    (
+                        accept_len,
+                        commit_lens,
+                        bonus,
+                        out_tokens,
+                        new_seq_lens,
+                    ) = self._next_accept_bonus_buffers(bs)
+                    _compute_dflash_accept_bonus_triton_unchecked(
+                        candidates=candidates,
+                        target_top1=target_predict,
+                        accept_lens_out=accept_len,
+                        commit_lens_out=commit_lens,
+                        bonus_ids_out=bonus,
+                        out_tokens_out=out_tokens,
+                        prefix_lens=prefix_lens,
+                        new_seq_lens_out=new_seq_lens,
+                    )
+                except Exception as e:
+                    self._use_triton_accept_bonus = False
+                    logger.warning(
+                        "DFLASH Triton accept/bonus failed in PP2; falling back "
+                        "to the eager path: %s",
+                        e,
+                    )
+                    accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                        candidates=candidates,
+                        target_predict=target_predict,
+                    )
+                    commit_lens = accept_len.to(torch.int32) + 1
+                    out_tokens = torch.empty(
+                        (bs, block_size), dtype=torch.int64, device=device
+                    )
+                    if block_size > 1:
+                        out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+                    out_tokens[:, block_size - 1].fill_(0)
+                    out_tokens.scatter_(
+                        1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                    )
+            else:
+                accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+                commit_lens = accept_len.to(torch.int32) + 1
+                out_tokens = torch.empty(
+                    (bs, block_size), dtype=torch.int64, device=device
+                )
+                if block_size > 1:
+                    out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
+                out_tokens[:, block_size - 1].fill_(0)
+                out_tokens.scatter_(
+                    1, accept_len.to(torch.int64)[:, None], bonus[:, None]
+                )
+
+        if context["need_mamba_verify_commit"]:
+            seq_lens_pre_verify = context["seq_lens_pre_verify"]
+            assert seq_lens_pre_verify is not None
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
+            )
+
+        if new_seq_lens is None:
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError("PP DFLASH verify requires target hidden states.")
+        hidden = hidden.view(bs, block_size, -1)
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            cache_loc=verify_out_cache_loc,
+            cache_loc_2d=verify_out_cache_loc_2d,
+            positions=positions,
+            commit_lens=commit_lens,
+        )
+        logits_output.hidden_states = None
+
+        result.next_token_ids = out_tokens.reshape(-1)
+        result.accept_lens = commit_lens
+        result.next_draft_input = self._make_next_draft_input_decode(
+            bonus_tokens=bonus,
+            new_seq_lens=new_seq_lens,
+        )
+        result.speculative_num_draft_tokens = block_size
+        result.new_seq_lens = new_seq_lens
+        delattr(batch, "_omniva_dflash_pp_context")
+        delattr(batch, "_omniva_dflash_pp_phase")
+        return result

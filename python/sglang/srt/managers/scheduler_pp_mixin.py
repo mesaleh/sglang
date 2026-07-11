@@ -99,6 +99,17 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
+        and not (
+            batch.spec_algorithm.is_dflash()
+            and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+        )
+    )
+
+
+def _pp_deferred_dflash_result(batch: ScheduleBatch) -> bool:
+    return (
+        batch.spec_algorithm.is_dflash()
+        and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
     )
 
 
@@ -1316,7 +1327,7 @@ class SchedulerPPMixin:
         if result.next_token_ids is not None:
             tensor_dict["next_token_ids"] = result.next_token_ids
 
-        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+        if _pp_deferred_dflash_result(batch):
             logits_output = result.logits_output
             if logits_output is not None:
                 if logits_output.next_token_logits is not None:
@@ -1331,8 +1342,7 @@ class SchedulerPPMixin:
                     )
 
         if batch.return_logprob and not (
-            not batch.spec_algorithm.is_none()
-            and not batch.is_spec_v2
+            _pp_deferred_dflash_result(batch)
             and batch.forward_mode.is_target_verify()
         ):
             logprob_dict = get_logprob_dict_from_result(result)
@@ -1484,8 +1494,7 @@ class SchedulerPPMixin:
         extend_logprob_start_len_per_req = None
 
         if batch.return_logprob and not (
-            not batch.spec_algorithm.is_none()
-            and not batch.is_spec_v2
+            _pp_deferred_dflash_result(batch)
             and batch.forward_mode.is_target_verify()
         ):
             (
@@ -1493,7 +1502,7 @@ class SchedulerPPMixin:
                 extend_input_len_per_req,
                 extend_logprob_start_len_per_req,
             ) = get_logprob_from_pp_outputs(pp_outputs)
-        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+        if _pp_deferred_dflash_result(batch):
             if logits_output is None:
                 logits_output = LogitsProcessorOutput(
                     next_token_logits=pp_outputs.tensors.get(
@@ -1536,7 +1545,7 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
-        if not batch.spec_algorithm.is_none() and not batch.is_spec_v2:
+        if _pp_deferred_dflash_result(batch):
             if not hasattr(self.model_worker, "process_pp_batch_result"):
                 raise RuntimeError(
                     "Pipeline parallel speculative decoding requires the "
@@ -1544,6 +1553,19 @@ class SchedulerPPMixin:
                 )
             output_result = self.model_worker.process_pp_batch_result(
                 batch, output_result
+            )
+            batch.spec_info = output_result.next_draft_input
+            if output_result.new_seq_lens is not None:
+                batch.seq_lens = output_result.new_seq_lens
+                if batch.seq_lens_cpu is not None:
+                    batch.seq_lens_cpu = output_result.new_seq_lens.to("cpu")
+                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+            batch.input_ids = None
+            self.update_cache_from_scheduler(batch, output_result)
+            output_result.copy_done = self.device_module.Event()
+            output_result.copy_to_cpu(
+                return_logprob=batch.return_logprob,
+                return_hidden_states=batch.return_hidden_states,
             )
         self.process_batch_result(batch, output_result)
 
