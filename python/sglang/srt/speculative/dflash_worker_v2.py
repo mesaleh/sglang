@@ -1,5 +1,6 @@
 import logging
 import math
+from copy import deepcopy
 from typing import List, Optional
 
 import torch
@@ -46,6 +47,13 @@ _is_npu = is_npu()
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+def _copy_dflash_draft_server_args(server_args: ServerArgs) -> ServerArgs:
+    draft_server_args = deepcopy(server_args)
+    if str(draft_server_args.kv_cache_dtype).startswith(("fp8_", "fp4_")):
+        draft_server_args.kv_cache_dtype = "auto"
+    return draft_server_args
 
 
 def _get_fused_kv_materialize_helper():
@@ -134,8 +142,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
+        draft_server_args = _copy_dflash_draft_server_args(server_args)
+        if draft_server_args.kv_cache_dtype != server_args.kv_cache_dtype:
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH draft runner resets kv_cache_dtype from %s to auto; "
+                    "the target runner keeps its configured KV dtype.",
+                    server_args.kv_cache_dtype,
+                )
         self._draft_worker = TpModelWorker(
-            server_args=server_args,
+            server_args=draft_server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
