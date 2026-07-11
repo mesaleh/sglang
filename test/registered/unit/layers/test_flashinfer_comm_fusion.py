@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
+from sglang.srt.layers import layernorm
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -72,6 +73,49 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
+    def test_declined_fusion_preserves_pre_allreduce_addition(self):
+        norm = types.SimpleNamespace(
+            variance_epsilon=1e-6,
+            forward=MagicMock(return_value=(object(), object())),
+        )
+        x = torch.tensor([[1.0, 2.0]])
+        residual = torch.tensor([[3.0, 4.0]])
+        post_add = torch.tensor([[5.0, 6.0]])
+        pre_add = torch.tensor([[7.0, 8.0]])
+
+        def fake_moe_all_reduce(value):
+            return value * 4
+
+        with (
+            patch.object(layernorm, "_use_aiter", False),
+            patch.object(
+                fusion,
+                "flashinfer_allreduce_residual_rmsnorm",
+                return_value=(None, None),
+            ),
+            patch(
+                "sglang.srt.distributed.moe_tensor_model_parallel_all_reduce",
+                side_effect=fake_moe_all_reduce,
+            ) as all_reduce,
+            get_parallel().override(moe_ep_size=1, moe_tp_size=4),
+        ):
+            result = layernorm._forward_with_allreduce_fusion(
+                norm_module=norm,
+                x=x,
+                residual=residual,
+                post_residual_addition=post_add,
+                weight=torch.ones(2),
+                use_attn_tp_group=False,
+                pre_allreduce_addition=pre_add,
+            )
+
+        self.assertEqual(result, norm.forward.return_value)
+        torch.testing.assert_close(all_reduce.call_args.args[0], x + pre_add)
+        reduced, adjusted_residual, deferred_post = norm.forward.call_args.args
+        torch.testing.assert_close(reduced, (x + pre_add) * 4)
+        torch.testing.assert_close(adjusted_residual, residual + post_add)
+        self.assertIsNone(deferred_post)
+
     def test_full_tp_uses_torch_dist_for_rendezvous_but_default_runtime_group(self):
         device_group = object()
         cpu_group = object()

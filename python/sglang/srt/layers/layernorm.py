@@ -155,6 +155,7 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
@@ -198,6 +199,20 @@ def _forward_with_allreduce_fusion(
             if _use_aiter and get_global_server_args().enable_aiter_allreduce_fusion:
                 x = tensor_model_parallel_all_reduce(x)
                 return norm_module.forward(x, residual, None)
+
+            # FlashInfer may decline after the caller deferred a shared-expert
+            # addition for pre-allreduce fusion. Preserve the unfused contract:
+            # combine the TP partials, reduce them on the selected group, then
+            # normalize with the residual addition already applied above.
+            if pre_allreduce_addition is not None:
+                x = x + pre_allreduce_addition
+            all_reduce = (
+                tensor_model_parallel_all_reduce
+                if use_attn_tp_group
+                else moe_tensor_model_parallel_all_reduce
+            )
+            x = all_reduce(x)
+            return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
 
