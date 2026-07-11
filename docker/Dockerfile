@@ -741,6 +741,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     PyJWT \
     pyparsing
 
+# The CUDA 12.9 dependency solve can leave an older cuda-pathfinder that CuPy
+# cannot import. Keep the 1.x ABI while satisfying CuPy/cuda-core, and stage
+# GDRCopy from Debian's multiarch directory for the runtime COPY below.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --upgrade \
+        "cuda-pathfinder>=1.4.2,<2" \
+        "setuptools>=80,<82" \
+    && cp -a /usr/lib/$(uname -m)-linux-gnu/libgdrapi.so* /usr/lib/
+
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
