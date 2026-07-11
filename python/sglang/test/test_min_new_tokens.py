@@ -14,9 +14,15 @@ class FakeBatch:
     pass
 
 
+TEST_TOKENIZER = SimpleNamespace(
+    eos_token_id=99,
+    encode=lambda text, add_special_tokens=False: [1],
+)
+
+
 def _sampling_params(**kwargs):
     params = SamplingParams(**kwargs)
-    params.normalize(tokenizer=None)
+    params.normalize(tokenizer=TEST_TOKENIZER)
     return params
 
 
@@ -79,11 +85,11 @@ def test_check_finished_ignores_token_stop_before_min_new_tokens():
     )
 
     req.output_ids = [42]
-    req.check_finished()
+    req.update_finish_state()
     assert req.finished_reason is None
 
     req.output_ids.append(42)
-    req.check_finished()
+    req.update_finish_state()
     assert req.finished_reason.to_json() == {"type": "stop", "matched": 42}
     assert req.finished_len == 2
 
@@ -98,7 +104,7 @@ def test_check_finished_skips_early_stop_inside_speculative_acceptance():
     )
 
     req.output_ids = [42, 42]
-    req.check_finished(new_accepted_len=2)
+    req.update_finish_state(new_accepted_len=2)
 
     assert req.finished_reason.to_json() == {"type": "stop", "matched": 42}
     assert req.finished_len == 2
@@ -114,7 +120,7 @@ def test_check_finished_does_not_carry_early_stop_to_later_token():
     )
 
     req.output_ids = [42, 7]
-    req.check_finished(new_accepted_len=2)
+    req.update_finish_state(new_accepted_len=2)
 
     assert req.finished_reason is None
 
@@ -129,9 +135,9 @@ def test_check_finished_ignores_string_stop_before_min_new_tokens():
     )
 
     req.output_ids = [7]
-    req.check_finished()
+    req.update_finish_state()
     assert req.finished_reason is None
 
     req.output_ids.append(8)
-    req.check_finished()
+    req.update_finish_state()
     assert req.finished_reason.to_json() == {"type": "stop", "matched": "stop"}

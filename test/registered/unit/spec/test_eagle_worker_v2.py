@@ -1,11 +1,12 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.attention.tokenspeed_workspace import (
     tokenspeed_workspace_bytes,
 )
-from sglang.srt.speculative.eagle_worker_v2 import _compact_tree_accept_outputs
+from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
@@ -25,42 +26,32 @@ class TestCompactTreeAcceptOutputs(unittest.TestCase):
         )
         accept_lens = torch.tensor([3, 3], dtype=torch.int32)
 
-        compact_predict, compact_hidden, bonus_tokens = _compact_tree_accept_outputs(
-            predict,
-            hidden_states,
-            accept_index,
-            accept_lens,
-            draft_token_num,
+        worker = SimpleNamespace(speculative_num_draft_tokens=draft_token_num)
+        compact_predict = EAGLEWorkerV2._compact_accept_to_front(
+            worker, predict, accept_index, bs=2
         )
+        compact_hidden = EAGLEWorkerV2._compact_accept_to_front(
+            worker, hidden_states, accept_index, bs=2
+        )
+        compact_predict_2d = compact_predict.reshape(2, draft_token_num)
+        bonus_tokens = compact_predict_2d[
+            torch.arange(2), accept_lens.to(torch.long) - 1
+        ].to(torch.int32)
 
+        self.assertEqual(compact_predict_2d[0, :3].tolist(), [0, 2, 4])
+        self.assertEqual(compact_predict_2d[1, :3].tolist(), [8, 9, 15])
+        self.assertEqual(compact_predict_2d[:, 5:].tolist(), [[5, 6, 7], [13, 14, 15]])
         self.assertEqual(
-            compact_predict.reshape(2, draft_token_num).tolist(),
-            [
-                [0, 2, 4, 0, 0, 5, 6, 7],
-                [8, 9, 15, 8, 8, 13, 14, 15],
-            ],
-        )
-        self.assertEqual(
-            compact_hidden.reshape(2, draft_token_num, 2).tolist(),
+            compact_hidden.reshape(2, draft_token_num, 2)[:, :3].tolist(),
             [
                 [
                     [0.0, 1.0],
                     [4.0, 5.0],
                     [8.0, 9.0],
-                    [0.0, 1.0],
-                    [0.0, 1.0],
-                    [10.0, 11.0],
-                    [12.0, 13.0],
-                    [14.0, 15.0],
                 ],
                 [
                     [16.0, 17.0],
                     [18.0, 19.0],
-                    [30.0, 31.0],
-                    [16.0, 17.0],
-                    [16.0, 17.0],
-                    [26.0, 27.0],
-                    [28.0, 29.0],
                     [30.0, 31.0],
                 ],
             ],

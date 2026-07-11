@@ -1355,6 +1355,9 @@ class Req(ReqDllmMixin):
         return len(self.output_ids)
 
     def _check_str_based_finish(self, new_accepted_len: int = 1):
+        if len(self.output_ids) < self.sampling_params.min_new_tokens:
+            return False
+
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
