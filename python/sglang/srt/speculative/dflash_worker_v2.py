@@ -1663,10 +1663,16 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        next_token_logits = logits_output.next_token_logits
+        has_argmax_token_ids = (
+            next_token_logits is not None
+            and next_token_logits.ndim == 1
+            and next_token_logits.dtype in (torch.int32, torch.int64, torch.long)
+        )
 
-        if sampling_info is not None:
+        if sampling_info is not None and not has_argmax_token_ids:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=int(self.block_size),
             )
@@ -1676,11 +1682,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
+            and not has_argmax_token_ids
             and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
@@ -1694,8 +1701,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
+            target_predict = (
+                next_token_logits.view(bs, int(self.block_size))
+                if has_argmax_token_ids
+                else torch.argmax(next_token_logits, dim=-1).view(
+                    bs, int(self.block_size)
+                )
             )
             if self._use_triton_accept_bonus:
                 try:
@@ -1905,10 +1916,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc_2d = context["verify_out_cache_loc_2d"]
         draft_tokens = context["draft_tokens"]
         sampling_info = context["sampling_info"]
+        next_token_logits = logits_output.next_token_logits
+        has_argmax_token_ids = (
+            next_token_logits.ndim == 1
+            and next_token_logits.dtype in (torch.int32, torch.int64, torch.long)
+        )
 
-        if sampling_info is not None:
+        if sampling_info is not None and not has_argmax_token_ids:
             apply_dflash_verify_logits_adjustments(
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 draft_token_num=block_size,
             )
@@ -1918,11 +1934,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
+            and not has_argmax_token_ids
             and is_dflash_sampling_verify_available()
         ):
             accept_len, bonus = compute_dflash_sampling_correct_drafts_and_bonus(
                 candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
+                next_token_logits=next_token_logits,
                 sampling_info=sampling_info,
                 max_top_k=draft_input.max_top_k,
                 uniform_top_k_value=draft_input.uniform_top_k_value,
@@ -1936,9 +1953,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[:, block_size - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
-            target_predict = torch.argmax(
-                logits_output.next_token_logits, dim=-1
-            ).view(bs, block_size)
+            target_predict = (
+                next_token_logits.view(bs, block_size)
+                if has_argmax_token_ids
+                else torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+            )
             if self._use_triton_accept_bonus:
                 try:
                     (

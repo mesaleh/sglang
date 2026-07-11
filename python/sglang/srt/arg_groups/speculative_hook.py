@@ -5,6 +5,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.environ import envs
+
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 

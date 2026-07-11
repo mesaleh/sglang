@@ -12,6 +12,9 @@ COPY python/sglang/srt/managers/scheduler.py python/sglang/srt/managers/schedule
 COPY python/sglang/srt/managers/scheduler_pp_mixin.py python/sglang/srt/managers/scheduler_pp_mixin.py
 COPY python/sglang/srt/managers/tp_worker.py python/sglang/srt/managers/tp_worker.py
 COPY python/sglang/srt/model_executor/model_runner.py python/sglang/srt/model_executor/model_runner.py
+COPY python/sglang/srt/model_executor/runner/base_runner.py python/sglang/srt/model_executor/runner/base_runner.py
+COPY python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+COPY python/sglang/srt/model_executor/runner_utils/buffers.py python/sglang/srt/model_executor/runner_utils/buffers.py
 COPY python/sglang/srt/models/deepseek_v2.py python/sglang/srt/models/deepseek_v2.py
 COPY python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
 COPY python/sglang/srt/models/dflash.py python/sglang/srt/models/dflash.py
@@ -33,6 +36,9 @@ RUN python3 -m py_compile \
     python/sglang/srt/managers/scheduler_pp_mixin.py \
     python/sglang/srt/managers/tp_worker.py \
     python/sglang/srt/model_executor/model_runner.py \
+    python/sglang/srt/model_executor/runner/base_runner.py \
+    python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py \
+    python/sglang/srt/model_executor/runner_utils/buffers.py \
     python/sglang/srt/models/deepseek_v2.py \
     python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py \
     python/sglang/srt/models/dflash.py \

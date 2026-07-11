@@ -1429,5 +1429,39 @@ class TestComputedSlots(unittest.TestCase):
         )
 
 
+class TestDecodeInputBuffersPPProxySizing(unittest.TestCase):
+    def test_pp_proxy_buffers_use_token_capacity(self):
+        from sglang.srt.model_executor.runner_utils.buffers import DecodeInputBuffers
+
+        max_bs = 2
+        max_num_token = 10
+        buffers = DecodeInputBuffers.create(
+            device=torch.device("cpu"),
+            max_bs=max_bs,
+            max_num_token=max_num_token,
+            hidden_size=8,
+            next_token_logits_buffer=torch.zeros((max_num_token, 16)),
+            dtype=torch.float32,
+            dp_size=1,
+            pp_size=2,
+            is_encoder_decoder=False,
+            require_mlp_tp_gather=False,
+            seq_len_fill_value=1,
+            encoder_len_fill_value=1,
+            num_tokens_per_bs=5,
+            cache_loc_dtype=torch.int64,
+            enable_mamba_track=False,
+        )
+
+        self.assertEqual(
+            buffers.pp_proxy_tensors["hidden_states"].shape,
+            (max_num_token, 8),
+        )
+        self.assertEqual(
+            buffers.pp_proxy_tensors["residual"].shape,
+            (max_num_token, 8),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
