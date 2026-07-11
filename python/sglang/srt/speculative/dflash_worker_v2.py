@@ -1,6 +1,5 @@
 import logging
 import math
-from copy import deepcopy
 from typing import List, Optional
 
 import torch
@@ -49,11 +48,8 @@ logger = logging.getLogger(__name__)
 _FusedKVMaterializeHelper = None
 
 
-def _copy_dflash_draft_server_args(server_args: ServerArgs) -> ServerArgs:
-    draft_server_args = deepcopy(server_args)
-    if str(draft_server_args.kv_cache_dtype).startswith(("fp8_", "fp4_")):
-        draft_server_args.kv_cache_dtype = "auto"
-    return draft_server_args
+def _max_compact_draft_seq_len(window_size: int, page_size: int) -> int:
+    return int(window_size) + max(int(page_size) - 1, 0)
 
 
 def _get_fused_kv_materialize_helper():
@@ -130,6 +126,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.nccl_port = nccl_port
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        self._need_mamba_verify_commit = False
         self.page_size = server_args.page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = (
@@ -142,16 +139,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._logged_first_verify = False
 
         # Draft runner (separate KV cache + attention backend).
-        draft_server_args = _copy_dflash_draft_server_args(server_args)
-        if draft_server_args.kv_cache_dtype != server_args.kv_cache_dtype:
-            if self.tp_rank == 0:
-                logger.info(
-                    "DFLASH draft runner resets kv_cache_dtype from %s to auto; "
-                    "the target runner keeps its configured KV dtype.",
-                    server_args.kv_cache_dtype,
-                )
         self._draft_worker = TpModelWorker(
-            server_args=draft_server_args,
+            server_args=server_args,
             gpu_id=gpu_id,
             tp_rank=tp_rank,
             moe_ep_rank=moe_ep_rank,
@@ -330,6 +319,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
+        self._need_mamba_verify_commit = (
+            self.model_runner.mambaish_config is not None
+            and hasattr(
+                self.model_runner.attn_backend,
+                "update_mamba_state_after_mtp_verify",
+            )
+        )
 
     def init_cuda_graphs(self):
         capture_decode_cuda_graph = not self.server_args.disable_cuda_graph
@@ -1449,7 +1445,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     block_end_out=self._draft_block_end_buf[:bs],
                     window_size=int(self.draft_window_size),
                     page_size=int(self.page_size),
-                    max_compact_len=int(self.draft_window_size),
+                    max_compact_len=_max_compact_draft_seq_len(
+                        self.draft_window_size, self.page_size
+                    ),
                     mask_token_id=int(self._mask_token_id),
                 )
                 block_prepared = compact_block_prepared = True
@@ -1620,12 +1618,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = verify_out_cache_loc
         sampling_info = batch.sampling_info
 
-        need_mamba_verify_commit = hasattr(
-            self.target_worker.model_runner.attn_backend,
-            "update_mamba_state_after_mtp_verify",
-        )
         seq_lens_pre_verify = (
-            batch.seq_lens.clone() if need_mamba_verify_commit else None
+            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
@@ -1666,7 +1660,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "verify_out_cache_loc_2d": verify_out_cache_loc_2d.clone(),
                 "draft_tokens": draft_tokens.clone(),
                 "sampling_info": sampling_info,
-                "need_mamba_verify_commit": need_mamba_verify_commit,
+                "need_mamba_verify_commit": self._need_mamba_verify_commit,
                 "seq_lens_pre_verify": seq_lens_pre_verify,
             }
             batch._omniva_dflash_pp_ready_event = (
@@ -1783,7 +1777,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     1, accept_len.to(torch.int64)[:, None], bonus[:, None]
                 )
 
-        if need_mamba_verify_commit:
+        if self._need_mamba_verify_commit:
             assert seq_lens_pre_verify is not None
             self._update_target_mamba_state_after_verify(
                 batch=batch,
