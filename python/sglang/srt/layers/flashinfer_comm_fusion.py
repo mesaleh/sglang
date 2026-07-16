@@ -13,6 +13,7 @@ from sglang.srt.distributed import (
     get_tp_group,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -37,6 +38,8 @@ _flashinfer_create_workspace_supports_comm_backend = False
 _flashinfer_allreduce_supports_trigger_completion = False
 _flashinfer_allreduce_supports_pre_allreduce_add = False
 _posix_transport_override_logged = False
+_trtllm_multinode_override_logged = False
+_unsupported_pre_allreduce_add_backend_logged = False
 
 
 def _mnnvl_supported(is_multi_node: bool) -> bool:
@@ -66,9 +69,24 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
         return "trtllm"
 
     if backend == "trtllm" and is_multi_node:
-        raise ValueError(
-            "FlashInfer allreduce fusion trtllm backend supports single-node only."
-        )
+        if not (
+            is_sm100_supported()
+            and envs.SGLANG_FLASHINFER_TRTLLM_MULTINODE.get()
+        ):
+            raise ValueError(
+                "FlashInfer allreduce fusion trtllm backend supports single-node "
+                "only by default. On GB200, the experimental multi-node path "
+                "requires SGLANG_FLASHINFER_TRTLLM_MULTINODE=1 and an explicit "
+                "trtllm backend selection."
+            )
+
+        global _trtllm_multinode_override_logged
+        if not _trtllm_multinode_override_logged:
+            logger.warning(
+                "Experimental FlashInfer TRTLLM multi-node allreduce fusion is "
+                "enabled on GB200. Auto backend selection remains MNNVL."
+            )
+            _trtllm_multinode_override_logged = True
 
     if backend == "mnnvl" and not _mnnvl_supported(is_multi_node):
         raise ValueError(
@@ -84,6 +102,37 @@ def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
         return None
     is_multi_node = getattr(server_args, "nnodes", 1) > 1
     return _resolve_backend(backend, is_multi_node)
+
+
+def supports_flashinfer_pre_allreduce_add(server_args=None) -> bool:
+    """Whether the selected backend implements the pre-allreduce-add extension.
+
+    The legacy Omniva API added the argument to the unified Python signature,
+    but only its TRTLLM implementation consumed it. Treating that signature as
+    a backend-independent capability allowed MNNVL to silently drop Kimi's
+    deferred shared-expert output.
+    """
+    if not _flashinfer_allreduce_supports_pre_allreduce_add:
+        return False
+    if server_args is None:
+        server_args = get_global_server_args()
+    try:
+        return resolve_flashinfer_allreduce_fusion_backend(server_args) == "trtllm"
+    except ValueError:
+        return False
+
+
+def _workspace_supports_pre_allreduce_add(workspace) -> bool:
+    if not _flashinfer_allreduce_supports_pre_allreduce_add:
+        return False
+
+    explicit_capability = getattr(workspace, "supports_pre_allreduce_add", None)
+    if explicit_capability is not None:
+        return bool(explicit_capability)
+
+    # The Omniva v0.6.8 extension predates workspace capability metadata and
+    # implements pre_allreduce_add only in the TRTLLM backend.
+    return getattr(workspace, "backend", None) == "trtllm"
 
 
 if is_flashinfer_available():
@@ -825,6 +874,20 @@ def flashinfer_allreduce_residual_rmsnorm(
     workspace_manager = _get_workspace_manager(use_attn_tp_group)
     if workspace_manager.workspace is None:
         logger.debug("FlashInfer workspace is None")
+        return None, None
+
+    if pre_allreduce_addition is not None and not _workspace_supports_pre_allreduce_add(
+        workspace_manager.workspace
+    ):
+        global _unsupported_pre_allreduce_add_backend_logged
+        if not _unsupported_pre_allreduce_add_backend_logged:
+            logger.warning(
+                "FlashInfer pre_allreduce_add was requested for backend=%s, but "
+                "that workspace does not implement it; declining fusion to "
+                "preserve the deferred addition.",
+                getattr(workspace_manager.workspace, "backend", "unknown"),
+            )
+            _unsupported_pre_allreduce_add_backend_logged = True
         return None, None
 
     residual_out = torch.empty_like(residual)

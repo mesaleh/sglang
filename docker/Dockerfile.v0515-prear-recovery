@@ -1,0 +1,12 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG SGLANG_BUILD_COMMIT=unknown
+
+COPY python/sglang/srt/environ.py /sgl-workspace/sglang/python/sglang/srt/environ.py
+COPY python/sglang/srt/layers/flashinfer_comm_fusion.py /sgl-workspace/sglang/python/sglang/srt/layers/flashinfer_comm_fusion.py
+COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
+
+LABEL org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      omniva.experiment="v0.5.15-preallreduce-recovery-20260716" \
+      omniva.flashinfer.preallreduce.backend="trtllm-multinode"

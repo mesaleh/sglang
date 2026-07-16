@@ -73,6 +73,28 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
+    def test_pre_allreduce_add_capability_is_backend_specific(self):
+        trtllm = types.SimpleNamespace(
+            flashinfer_allreduce_fusion_backend="trtllm", nnodes=1
+        )
+        mnnvl = types.SimpleNamespace(
+            flashinfer_allreduce_fusion_backend="mnnvl", nnodes=1
+        )
+
+        with (
+            patch.object(
+                fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", True
+            ),
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+        ):
+            self.assertTrue(fusion.supports_flashinfer_pre_allreduce_add(trtllm))
+            self.assertFalse(fusion.supports_flashinfer_pre_allreduce_add(mnnvl))
+
+        with patch.object(
+            fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", False
+        ):
+            self.assertFalse(fusion.supports_flashinfer_pre_allreduce_add(trtllm))
+
     def test_declined_fusion_preserves_pre_allreduce_addition(self):
         norm = types.SimpleNamespace(
             variance_epsilon=1e-6,
@@ -295,6 +317,31 @@ class TestFlashInferCommFusion(unittest.TestCase):
             with self.assertRaises(ValueError):
                 fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
 
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+            fusion.envs.SGLANG_FLASHINFER_TRTLLM_MULTINODE.override(True),
+        ):
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(
+                    multi_node_trtllm
+                ),
+                "trtllm",
+            )
+            auto = types.SimpleNamespace(
+                flashinfer_allreduce_fusion_backend="auto", nnodes=2
+            )
+            self.assertEqual(
+                fusion.resolve_flashinfer_allreduce_fusion_backend(auto), "mnnvl"
+            )
+
+        with (
+            patch.object(fusion, "is_sm100_supported", return_value=False),
+            patch.object(fusion, "is_sm90_supported", return_value=True),
+            fusion.envs.SGLANG_FLASHINFER_TRTLLM_MULTINODE.override(True),
+        ):
+            with self.assertRaises(ValueError):
+                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm)
+
         for arch in ("pre_sm90", "post_sm10x"):
             with (
                 self.subTest(arch=arch),
@@ -372,6 +419,36 @@ class TestFlashInferCommFusion(unittest.TestCase):
             fusion._create_allreduce_fusion_workspace = original_create
             fusion._attn_tp_workspace_manager = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
+
+    def test_mnnvl_workspace_declines_pre_allreduce_add(self):
+        if not torch.cuda.is_available():
+            self.skipTest("FlashInfer allreduce custom op is CUDA-only")
+        fake_comm = MagicMock()
+        fake_comm.AllReduceFusionPattern.kARResidualRMSNorm = object()
+        manager = types.SimpleNamespace(
+            workspace=_FakeWorkspace("mnnvl", 4), initialized=True
+        )
+        input_tensor = torch.ones(2, 4, device="cuda")
+
+        with (
+            patch.object(fusion, "is_flashinfer_available", return_value=True),
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(
+                fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", True
+            ),
+            patch.object(fusion, "ensure_workspace_initialized", return_value=True),
+            patch.object(fusion, "_get_workspace_manager", return_value=manager),
+            get_parallel().override(attn_tp_size=4),
+        ):
+            result = fusion.flashinfer_allreduce_residual_rmsnorm(
+                input_tensor=input_tensor,
+                residual=torch.ones_like(input_tensor),
+                weight=torch.ones(4, device="cuda"),
+                pre_allreduce_addition=torch.ones_like(input_tensor),
+            )
+
+        self.assertEqual(result, (None, None))
+        fake_comm.allreduce_fusion.assert_not_called()
 
 
 if __name__ == "__main__":

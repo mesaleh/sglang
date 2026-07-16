@@ -83,6 +83,9 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_size,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.flashinfer_comm_fusion import (
+    supports_flashinfer_pre_allreduce_add,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -574,6 +577,7 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         self._enable_pre_allreduce_add_fusion = (
             envs.SGLANG_FLASHINFER_PRE_ALLREDUCE_ADD_FUSION.get()
+            and supports_flashinfer_pre_allreduce_add()
         )
 
         n_shared_experts = (

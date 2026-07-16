@@ -583,6 +583,10 @@ class Envs:
     # Research gate: add an optional tensor to FlashInfer allreduce input before
     # the allreduce. Used to fuse Kimi routed-output + shared-output on GB200.
     SGLANG_FLASHINFER_PRE_ALLREDUCE_ADD_FUSION = EnvBool(False)
+    # Research gate: permit an explicitly selected TRTLLM allreduce-fusion
+    # workspace across multiple GB200 nodes. This restores the backend used by
+    # the patched pre-allreduce-add extension; auto selection remains MNNVL.
+    SGLANG_FLASHINFER_TRTLLM_MULTINODE = EnvBool(False)
     # Skip-softmax threshold scale factor for TRT-LLM attention (prefill and decode separately).
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
