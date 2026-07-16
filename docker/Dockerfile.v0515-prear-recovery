@@ -4,6 +4,7 @@ FROM ${BASE_IMAGE}
 ARG SGLANG_BUILD_COMMIT=unknown
 
 COPY python/sglang/srt/environ.py /sgl-workspace/sglang/python/sglang/srt/environ.py
+COPY python/sglang/srt/layers/communicator.py /sgl-workspace/sglang/python/sglang/srt/layers/communicator.py
 COPY python/sglang/srt/layers/flashinfer_comm_fusion.py /sgl-workspace/sglang/python/sglang/srt/layers/flashinfer_comm_fusion.py
 COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
 

@@ -584,6 +584,13 @@ class LayerCommunicator:
                         )
                     )
                 else:
+                    pre_allreduce_addition = getattr(
+                        hidden_states,
+                        "_sglang_pre_allreduce_addition",
+                        None,
+                    )
+                    if pre_allreduce_addition is not None:
+                        hidden_states = hidden_states + pre_allreduce_addition
                     hidden_states = moe_tensor_model_parallel_all_reduce(hidden_states)
                     hidden_states, residual = self.input_layernorm(
                         hidden_states, residual

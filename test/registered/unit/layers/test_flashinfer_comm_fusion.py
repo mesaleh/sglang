@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
+from sglang.srt.layers import communicator
 from sglang.srt.layers import layernorm
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -73,6 +74,62 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
+    def test_prepare_attn_fallback_restores_deferred_pre_allreduce_addition(self):
+        layer_communicator = communicator.LayerCommunicator.__new__(
+            communicator.LayerCommunicator
+        )
+        norm_out = torch.tensor([[11.0, 12.0]])
+        residual_out = torch.tensor([[13.0, 14.0]])
+        layer_communicator.input_layernorm = MagicMock(
+            return_value=(norm_out, residual_out)
+        )
+        layer_communicator._context = object()
+        layer_communicator.qkv_latent_func = None
+        layer_communicator._communicate_simple_fn = MagicMock(
+            side_effect=lambda hidden_states, **_kwargs: hidden_states
+        )
+        hidden_states = torch.tensor([[1.0, 2.0]])
+        pre_add = torch.tensor([[3.0, 4.0]])
+        residual = torch.tensor([[5.0, 6.0]])
+        hidden_states._sglang_needs_allreduce_fusion = True
+        hidden_states._sglang_pre_allreduce_addition = pre_add
+
+        with (
+            patch.object(
+                communicator,
+                "get_attn_tp_context",
+                return_value=types.SimpleNamespace(input_scattered=False),
+            ),
+            patch.object(
+                communicator,
+                "apply_flashinfer_allreduce_fusion",
+                return_value=False,
+            ),
+            patch.object(
+                communicator,
+                "apply_aiter_all_reduce_fusion",
+                return_value=False,
+            ),
+            patch.object(
+                communicator,
+                "moe_tensor_model_parallel_all_reduce",
+                side_effect=lambda value: value * 4,
+            ) as all_reduce,
+        ):
+            actual_norm, actual_residual = layer_communicator.prepare_attn(
+                hidden_states,
+                residual,
+                forward_batch=MagicMock(),
+            )
+
+        torch.testing.assert_close(all_reduce.call_args.args[0], hidden_states + pre_add)
+        layer_communicator.input_layernorm.assert_called_once()
+        reduced, norm_residual = layer_communicator.input_layernorm.call_args.args
+        torch.testing.assert_close(reduced, (hidden_states + pre_add) * 4)
+        torch.testing.assert_close(norm_residual, residual)
+        self.assertIs(actual_norm, norm_out)
+        self.assertIs(actual_residual, residual_out)
+
     def test_legacy_pre_allreduce_add_capability_is_backend_specific(self):
         trtllm = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="trtllm", nnodes=1
