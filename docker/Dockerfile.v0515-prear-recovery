@@ -2,12 +2,22 @@ ARG BASE_IMAGE=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang@sha256:
 FROM ${BASE_IMAGE}
 
 ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=unknown
+ARG SGLANG_IMAGE_TAG=unknown
+
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG}
 
 COPY python/sglang/srt/environ.py /sgl-workspace/sglang/python/sglang/srt/environ.py
 COPY python/sglang/srt/layers/communicator.py /sgl-workspace/sglang/python/sglang/srt/layers/communicator.py
 COPY python/sglang/srt/layers/flashinfer_comm_fusion.py /sgl-workspace/sglang/python/sglang/srt/layers/flashinfer_comm_fusion.py
 COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
 
-LABEL org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+LABEL ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       omniva.experiment="v0.5.15-preallreduce-recovery-20260716" \
       omniva.flashinfer.preallreduce.backend="trtllm-multinode"
