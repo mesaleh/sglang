@@ -132,8 +132,9 @@ def _backend_supports_pre_allreduce_add(backend: Optional[str]) -> bool:
     )
     if callable(capability_fn):
         try:
-            return bool(capability_fn(backend))
-        except (TypeError, ValueError):
+            pattern = _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm
+            return bool(capability_fn(backend, pattern))
+        except (AttributeError, TypeError, ValueError):
             logger.warning(
                 "FlashInfer rejected pre_allreduce_add capability query for "
                 "backend=%s; disabling the fusion",

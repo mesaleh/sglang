@@ -162,7 +162,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
             flashinfer_allreduce_fusion_backend="mnnvl", nnodes=2
         )
         advertised_comm = types.SimpleNamespace(
-            supports_pre_allreduce_add=lambda backend: backend == "mnnvl"
+            AllReduceFusionPattern=types.SimpleNamespace(
+                kARResidualRMSNorm=object()
+            ),
+            supports_pre_allreduce_add=lambda backend, _pattern: backend == "mnnvl",
         )
 
         with (
@@ -536,7 +539,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         fake_comm = MagicMock()
         fake_comm.AllReduceFusionPattern.kARResidualRMSNorm = object()
         fake_comm.supports_pre_allreduce_add.side_effect = (
-            lambda backend: backend == "mnnvl"
+            lambda backend, _pattern: backend == "mnnvl"
         )
         manager = types.SimpleNamespace(
             workspace=_FakeWorkspace("mnnvl", 4), initialized=True
