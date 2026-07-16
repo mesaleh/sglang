@@ -117,9 +117,33 @@ def supports_flashinfer_pre_allreduce_add(server_args=None) -> bool:
     if server_args is None:
         server_args = get_global_server_args()
     try:
-        return resolve_flashinfer_allreduce_fusion_backend(server_args) == "trtllm"
+        backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     except ValueError:
         return False
+    return _backend_supports_pre_allreduce_add(backend)
+
+
+def _backend_supports_pre_allreduce_add(backend: Optional[str]) -> bool:
+    if backend is None or not _flashinfer_allreduce_supports_pre_allreduce_add:
+        return False
+
+    capability_fn = getattr(
+        _flashinfer_comm, "supports_pre_allreduce_add", None
+    )
+    if callable(capability_fn):
+        try:
+            return bool(capability_fn(backend))
+        except (TypeError, ValueError):
+            logger.warning(
+                "FlashInfer rejected pre_allreduce_add capability query for "
+                "backend=%s; disabling the fusion",
+                backend,
+            )
+            return False
+
+    # The Omniva v0.6.8 extension predates capability metadata and implements
+    # pre_allreduce_add only in the TRTLLM backend.
+    return backend == "trtllm"
 
 
 def _workspace_supports_pre_allreduce_add(workspace) -> bool:
@@ -130,9 +154,9 @@ def _workspace_supports_pre_allreduce_add(workspace) -> bool:
     if explicit_capability is not None:
         return bool(explicit_capability)
 
-    # The Omniva v0.6.8 extension predates workspace capability metadata and
-    # implements pre_allreduce_add only in the TRTLLM backend.
-    return getattr(workspace, "backend", None) == "trtllm"
+    return _backend_supports_pre_allreduce_add(
+        getattr(workspace, "backend", None)
+    )
 
 
 if is_flashinfer_available():

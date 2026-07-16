@@ -73,7 +73,7 @@ def _torch_allreduce_residual_rmsnorm_baseline(
 
 
 class TestFlashInferCommFusion(unittest.TestCase):
-    def test_pre_allreduce_add_capability_is_backend_specific(self):
+    def test_legacy_pre_allreduce_add_capability_is_backend_specific(self):
         trtllm = types.SimpleNamespace(
             flashinfer_allreduce_fusion_backend="trtllm", nnodes=1
         )
@@ -85,6 +85,11 @@ class TestFlashInferCommFusion(unittest.TestCase):
             patch.object(
                 fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", True
             ),
+            patch.object(
+                fusion,
+                "_flashinfer_comm",
+                types.SimpleNamespace(),
+            ),
             patch.object(fusion, "is_sm100_supported", return_value=True),
         ):
             self.assertTrue(fusion.supports_flashinfer_pre_allreduce_add(trtllm))
@@ -94,6 +99,23 @@ class TestFlashInferCommFusion(unittest.TestCase):
             fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", False
         ):
             self.assertFalse(fusion.supports_flashinfer_pre_allreduce_add(trtllm))
+
+    def test_advertised_mnnvl_pre_allreduce_add_capability(self):
+        mnnvl = types.SimpleNamespace(
+            flashinfer_allreduce_fusion_backend="mnnvl", nnodes=2
+        )
+        advertised_comm = types.SimpleNamespace(
+            supports_pre_allreduce_add=lambda backend: backend == "mnnvl"
+        )
+
+        with (
+            patch.object(
+                fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", True
+            ),
+            patch.object(fusion, "_flashinfer_comm", advertised_comm),
+            patch.object(fusion, "is_sm100_supported", return_value=True),
+        ):
+            self.assertTrue(fusion.supports_flashinfer_pre_allreduce_add(mnnvl))
 
     def test_declined_fusion_preserves_pre_allreduce_addition(self):
         norm = types.SimpleNamespace(
@@ -425,6 +447,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
             self.skipTest("FlashInfer allreduce custom op is CUDA-only")
         fake_comm = MagicMock()
         fake_comm.AllReduceFusionPattern.kARResidualRMSNorm = object()
+        fake_comm.supports_pre_allreduce_add = None
         manager = types.SimpleNamespace(
             workspace=_FakeWorkspace("mnnvl", 4), initialized=True
         )
@@ -449,6 +472,42 @@ class TestFlashInferCommFusion(unittest.TestCase):
 
         self.assertEqual(result, (None, None))
         fake_comm.allreduce_fusion.assert_not_called()
+
+    def test_mnnvl_workspace_accepts_advertised_pre_allreduce_add(self):
+        if not torch.cuda.is_available():
+            self.skipTest("FlashInfer allreduce custom op is CUDA-only")
+        fake_comm = MagicMock()
+        fake_comm.AllReduceFusionPattern.kARResidualRMSNorm = object()
+        fake_comm.supports_pre_allreduce_add.side_effect = (
+            lambda backend: backend == "mnnvl"
+        )
+        manager = types.SimpleNamespace(
+            workspace=_FakeWorkspace("mnnvl", 4), initialized=True
+        )
+        input_tensor = torch.ones(2, 4, device="cuda")
+        pre_add = torch.full_like(input_tensor, 2)
+
+        with (
+            patch.object(fusion, "is_flashinfer_available", return_value=True),
+            patch.object(fusion, "_flashinfer_comm", fake_comm),
+            patch.object(
+                fusion, "_flashinfer_allreduce_supports_pre_allreduce_add", True
+            ),
+            patch.object(fusion, "ensure_workspace_initialized", return_value=True),
+            patch.object(fusion, "_get_workspace_manager", return_value=manager),
+            get_parallel().override(attn_tp_size=4),
+        ):
+            fusion.flashinfer_allreduce_residual_rmsnorm(
+                input_tensor=input_tensor,
+                residual=torch.ones_like(input_tensor),
+                weight=torch.ones(4, device="cuda"),
+                pre_allreduce_addition=pre_add,
+            )
+
+        self.assertIs(
+            fake_comm.allreduce_fusion.call_args.kwargs["pre_allreduce_add"],
+            pre_add,
+        )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-ARG BASE_IMAGE
+ARG BASE_IMAGE=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang@sha256:bf521f069d1f4720f1fb3a89eb16d20682aa109f045855c26913bc6294768965
 FROM ${BASE_IMAGE}
 
 ARG SGLANG_BUILD_COMMIT=unknown
