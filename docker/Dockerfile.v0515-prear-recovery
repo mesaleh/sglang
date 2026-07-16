@@ -1,23 +1,23 @@
 ARG BASE_IMAGE=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang@sha256:bf521f069d1f4720f1fb3a89eb16d20682aa109f045855c26913bc6294768965
 FROM ${BASE_IMAGE}
 
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=unknown
-ARG SGLANG_IMAGE_TAG=unknown
+ARG PROMOTION_SGLANG_BUILD_COMMIT=unknown
+ARG PROMOTION_SGLANG_BUILD_URL=unknown
+ARG PROMOTION_SGLANG_IMAGE_TAG=unknown
 
-ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT} \
-    SGLANG_BUILD_URL=${SGLANG_BUILD_URL} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG}
+ENV SGLANG_BUILD_COMMIT=${PROMOTION_SGLANG_BUILD_COMMIT} \
+    SGLANG_BUILD_URL=${PROMOTION_SGLANG_BUILD_URL} \
+    SGLANG_IMAGE_TAG=${PROMOTION_SGLANG_IMAGE_TAG}
 
 COPY python/sglang/srt/environ.py /sgl-workspace/sglang/python/sglang/srt/environ.py
 COPY python/sglang/srt/layers/communicator.py /sgl-workspace/sglang/python/sglang/srt/layers/communicator.py
 COPY python/sglang/srt/layers/flashinfer_comm_fusion.py /sgl-workspace/sglang/python/sglang/srt/layers/flashinfer_comm_fusion.py
 COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
 
-LABEL ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
-      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+LABEL ai.sglang.build.commit="${PROMOTION_SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${PROMOTION_SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${PROMOTION_SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.revision="${PROMOTION_SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${PROMOTION_SGLANG_IMAGE_TAG}" \
       omniva.experiment="v0.5.15-preallreduce-recovery-20260716" \
       omniva.flashinfer.preallreduce.backend="trtllm-multinode"

@@ -2,16 +2,16 @@ ARG BASE_IMAGE=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang@sha256:
 FROM flashinfer_source AS flashinfer_source
 FROM ${BASE_IMAGE}
 
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG FLASHINFER_BUILD_COMMIT=unknown
-ARG FLASHINFER_SOURCE_TREE_SHA256=unknown
-ARG SGLANG_BUILD_URL=unknown
-ARG SGLANG_IMAGE_TAG=unknown
+ARG PROMOTION_SGLANG_BUILD_COMMIT=unknown
+ARG PROMOTION_FLASHINFER_BUILD_COMMIT=unknown
+ARG PROMOTION_FLASHINFER_SOURCE_TREE_SHA256=unknown
+ARG PROMOTION_SGLANG_BUILD_URL=unknown
+ARG PROMOTION_SGLANG_IMAGE_TAG=unknown
 
-ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT} \
-    FLASHINFER_BUILD_COMMIT=${FLASHINFER_BUILD_COMMIT} \
-    SGLANG_BUILD_URL=${SGLANG_BUILD_URL} \
-    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG}
+ENV SGLANG_BUILD_COMMIT=${PROMOTION_SGLANG_BUILD_COMMIT} \
+    FLASHINFER_BUILD_COMMIT=${PROMOTION_FLASHINFER_BUILD_COMMIT} \
+    SGLANG_BUILD_URL=${PROMOTION_SGLANG_BUILD_URL} \
+    SGLANG_IMAGE_TAG=${PROMOTION_SGLANG_IMAGE_TAG}
 
 COPY python/sglang/srt/environ.py /sgl-workspace/sglang/python/sglang/srt/environ.py
 COPY python/sglang/srt/layers/communicator.py /sgl-workspace/sglang/python/sglang/srt/layers/communicator.py
@@ -26,12 +26,12 @@ COPY --from=flashinfer_source /flashinfer/comm/allreduce.py /opt/flashinfer-gb20
 COPY --from=flashinfer_source /flashinfer/comm/trtllm_mnnvl_ar.py /opt/flashinfer-gb200-phase65-prear-add/flashinfer/comm/trtllm_mnnvl_ar.py
 COPY --from=flashinfer_source /flashinfer/comm/workspace_base.py /opt/flashinfer-gb200-phase65-prear-add/flashinfer/comm/workspace_base.py
 
-LABEL ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
-      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}" \
-      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
-      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
-      omniva.flashinfer.revision="${FLASHINFER_BUILD_COMMIT}" \
-      omniva.flashinfer.source_tree_sha256="${FLASHINFER_SOURCE_TREE_SHA256}" \
+LABEL ai.sglang.build.commit="${PROMOTION_SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${PROMOTION_SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${PROMOTION_SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.revision="${PROMOTION_SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${PROMOTION_SGLANG_IMAGE_TAG}" \
+      omniva.flashinfer.revision="${PROMOTION_FLASHINFER_BUILD_COMMIT}" \
+      omniva.flashinfer.source_tree_sha256="${PROMOTION_FLASHINFER_SOURCE_TREE_SHA256}" \
       omniva.experiment="v0.5.15-mnnvl-preallreduce-recovery-20260716" \
       omniva.flashinfer.preallreduce.backend="trtllm,mnnvl"
