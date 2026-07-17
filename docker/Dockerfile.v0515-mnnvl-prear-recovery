@@ -5,6 +5,7 @@ FROM ${BASE_IMAGE}
 ARG PROMOTION_SGLANG_BUILD_COMMIT=unknown
 ARG PROMOTION_FLASHINFER_BUILD_COMMIT=unknown
 ARG PROMOTION_FLASHINFER_SOURCE_TREE_SHA256=unknown
+ARG PROMOTION_FLASHINFER_PATCH_SHA256=unknown
 ARG PROMOTION_SGLANG_BUILD_URL=unknown
 ARG PROMOTION_SGLANG_IMAGE_TAG=unknown
 
@@ -18,6 +19,9 @@ COPY python/sglang/srt/layers/communicator.py /sgl-workspace/sglang/python/sglan
 COPY python/sglang/srt/layers/flashinfer_comm_fusion.py /sgl-workspace/sglang/python/sglang/srt/layers/flashinfer_comm_fusion.py
 COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
 COPY test/registered/unit/layers/test_flashinfer_comm_fusion.py /sgl-workspace/sglang/test/registered/unit/layers/test_flashinfer_comm_fusion.py
+
+COPY docker/autotune/gb200-kimi-k26-tp8/ /root/.cache/sglang/
+COPY docker/flashinfer-patches/v0.6.8.post1-omniva-mnnvl-pre-allreduce-add.patch.gz /opt/flashinfer-gb200-phase65-prear-add/source/v0.6.8.post1-omniva-mnnvl-pre-allreduce-add.patch.gz
 
 COPY --from=flashinfer_source /csrc/trtllm_mnnvl_allreduce.cu /opt/flashinfer-gb200-phase65-prear-add/csrc/trtllm_mnnvl_allreduce.cu
 COPY --from=flashinfer_source /include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh /opt/flashinfer-gb200-phase65-prear-add/include/flashinfer/comm/trtllm_mnnvl_allreduce.cuh
@@ -33,5 +37,7 @@ LABEL ai.sglang.build.commit="${PROMOTION_SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${PROMOTION_SGLANG_IMAGE_TAG}" \
       omniva.flashinfer.revision="${PROMOTION_FLASHINFER_BUILD_COMMIT}" \
       omniva.flashinfer.source_tree_sha256="${PROMOTION_FLASHINFER_SOURCE_TREE_SHA256}" \
+      omniva.flashinfer.source_patch_sha256="${PROMOTION_FLASHINFER_PATCH_SHA256}" \
+      omniva.flashinfer.autotune.config="gb200-kimi-k26-tp8-control-confirm-20260716" \
       omniva.experiment="v0.5.15-mnnvl-preallreduce-recovery-20260716" \
       omniva.flashinfer.preallreduce.backend="trtllm,mnnvl"

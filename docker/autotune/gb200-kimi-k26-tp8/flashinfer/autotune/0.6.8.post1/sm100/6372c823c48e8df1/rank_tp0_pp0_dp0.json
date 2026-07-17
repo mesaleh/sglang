@@ -1,0 +1,58 @@
+{
+  "_metadata": {
+    "flashinfer_version": "0.6.8.post1",
+    "cuda_version": "12.9",
+    "cublas_version": "12.9.1",
+    "cudnn_version": "91701",
+    "gpu": "NVIDIA GB200"
+  },
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((1, 7168), (1, 384), (1, 8), (1, 8), (1, 7168), (0,)))": [
+    "MoERunner",
+    [
+      16,
+      55
+    ]
+  ],
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((16, 7168), (16, 384), (16, 8), (16, 8), (16, 7168), (0,)))": [
+    "MoERunner",
+    [
+      16,
+      31
+    ]
+  ],
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((2, 7168), (2, 384), (2, 8), (2, 8), (2, 7168), (0,)))": [
+    "MoERunner",
+    [
+      8,
+      11
+    ]
+  ],
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((32, 7168), (32, 384), (32, 8), (32, 8), (32, 7168), (0,)))": [
+    "MoERunner",
+    [
+      32,
+      63
+    ]
+  ],
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((4, 7168), (4, 384), (4, 8), (4, 8), (4, 7168), (0,)))": [
+    "MoERunner",
+    [
+      8,
+      11
+    ]
+  ],
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((64, 7168), (64, 384), (64, 8), (64, 8), (64, 7168), (0,)))": [
+    "MoERunner",
+    [
+      16,
+      31
+    ]
+  ],
+  "('flashinfer::trtllm_mxint4_block_scale_moe', 'MoERunner', ((8, 7168), (8, 384), (8, 8), (8, 8), (8, 7168), (0,)))": [
+    "MoERunner",
+    [
+      16,
+      31
+    ]
+  ]
+}

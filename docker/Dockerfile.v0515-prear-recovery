@@ -2,6 +2,7 @@ ARG BASE_IMAGE=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang@sha256:
 FROM ${BASE_IMAGE}
 
 ARG PROMOTION_SGLANG_BUILD_COMMIT=unknown
+ARG PROMOTION_FLASHINFER_PATCH_SHA256=unknown
 ARG PROMOTION_SGLANG_BUILD_URL=unknown
 ARG PROMOTION_SGLANG_IMAGE_TAG=unknown
 
@@ -13,11 +14,13 @@ COPY python/sglang/srt/environ.py /sgl-workspace/sglang/python/sglang/srt/enviro
 COPY python/sglang/srt/layers/communicator.py /sgl-workspace/sglang/python/sglang/srt/layers/communicator.py
 COPY python/sglang/srt/layers/flashinfer_comm_fusion.py /sgl-workspace/sglang/python/sglang/srt/layers/flashinfer_comm_fusion.py
 COPY python/sglang/srt/models/deepseek_v2.py /sgl-workspace/sglang/python/sglang/srt/models/deepseek_v2.py
+COPY docker/flashinfer-patches/v0.6.8.post1-omniva-mnnvl-pre-allreduce-add.patch.gz /opt/flashinfer-gb200-phase65-prear-add/source/v0.6.8.post1-omniva-mnnvl-pre-allreduce-add.patch.gz
 
 LABEL ai.sglang.build.commit="${PROMOTION_SGLANG_BUILD_COMMIT}" \
       ai.sglang.build.url="${PROMOTION_SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${PROMOTION_SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.revision="${PROMOTION_SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${PROMOTION_SGLANG_IMAGE_TAG}" \
+      omniva.flashinfer.source_patch_sha256="${PROMOTION_FLASHINFER_PATCH_SHA256}" \
       omniva.experiment="v0.5.15-preallreduce-recovery-20260716" \
       omniva.flashinfer.preallreduce.backend="trtllm-multinode"
