@@ -136,6 +136,23 @@ class TestEagleDsaSeedTransfer(unittest.TestCase):
         self.assertEqual(data_lens[-2], buffers.output_dsa_topk_indices.nbytes)
         self.assertEqual(item_lens[-2], buffers.output_dsa_topk_indices[0].nbytes)
 
+    def test_metadata_buffer_clears_reused_slot_after_seedless_prefill(self):
+        buffers = MetadataBuffers(
+            size=1,
+            hidden_size=2,
+            hidden_states_dtype=torch.float32,
+            output_dsa_topk_indices_dim=3,
+        )
+        buffers.set_buf(
+            self._make_req(torch.tensor([4, 5, 6], dtype=torch.int32))
+        )
+
+        seedless_req = self._make_req(None)
+        seedless_req.hidden_states_tensor = None
+        buffers.set_buf(seedless_req)
+
+        self.assertEqual(buffers.output_dsa_topk_indices[0].tolist(), [-1, -1, -1])
+
     def test_decode_input_requires_valid_seed_for_every_request(self):
         seeds = (
             torch.tensor([1, 2, 3], dtype=torch.int32),

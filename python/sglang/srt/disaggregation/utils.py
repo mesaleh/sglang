@@ -423,14 +423,14 @@ class MetadataBuffers:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )
-            if self.output_dsa_topk_indices is not None:
-                dsa_topk_indices = req.output_dsa_topk_indices
-                if dsa_topk_indices is not None:
-                    self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
-                        dsa_topk_indices
-                    )
-                else:
-                    self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
+        if self.output_dsa_topk_indices is not None:
+            dsa_topk_indices = req.output_dsa_topk_indices
+            if req.hidden_states_tensor is not None and dsa_topk_indices is not None:
+                self.output_dsa_topk_indices[req.metadata_buffer_index].copy_(
+                    dsa_topk_indices
+                )
+            else:
+                self.output_dsa_topk_indices[req.metadata_buffer_index].fill_(-1)
         # Store bootstrap_room for validation on decode side
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
