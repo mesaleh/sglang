@@ -2,11 +2,14 @@ ARG BASE_IMAGE=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang@sha256:
 FROM ${BASE_IMAGE}
 
 ARG PROMOTION_SGLANG_BUILD_COMMIT=unknown
-ARG PROMOTION_FLASHINFER_PATCH_SHA256=unknown
+ARG PROMOTION_FLASHINFER_BUILD_COMMIT=444738e816232cb28ea2960bf0075633b6f3e9d0
+ARG PROMOTION_FLASHINFER_SOURCE_TREE_SHA256=0eafff36f8673b8cb34eca1decf07eeee9e919bc353a2b1708b8b57081d1fda1
+ARG PROMOTION_FLASHINFER_PATCH_SHA256=715fe3fa63593f1a7a7e72f09ff1facbb516c3d88f44b54121581ecf0c2caa9e
 ARG PROMOTION_SGLANG_BUILD_URL=unknown
 ARG PROMOTION_SGLANG_IMAGE_TAG=unknown
 
 ENV SGLANG_BUILD_COMMIT=${PROMOTION_SGLANG_BUILD_COMMIT} \
+    FLASHINFER_BUILD_COMMIT=${PROMOTION_FLASHINFER_BUILD_COMMIT} \
     SGLANG_BUILD_URL=${PROMOTION_SGLANG_BUILD_URL} \
     SGLANG_IMAGE_TAG=${PROMOTION_SGLANG_IMAGE_TAG}
 
@@ -21,6 +24,8 @@ LABEL ai.sglang.build.commit="${PROMOTION_SGLANG_BUILD_COMMIT}" \
       ai.sglang.image.tag="${PROMOTION_SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.revision="${PROMOTION_SGLANG_BUILD_COMMIT}" \
       org.opencontainers.image.version="${PROMOTION_SGLANG_IMAGE_TAG}" \
+      omniva.flashinfer.revision="${PROMOTION_FLASHINFER_BUILD_COMMIT}" \
+      omniva.flashinfer.source_tree_sha256="${PROMOTION_FLASHINFER_SOURCE_TREE_SHA256}" \
       omniva.flashinfer.source_patch_sha256="${PROMOTION_FLASHINFER_PATCH_SHA256}" \
       omniva.experiment="v0.5.15-preallreduce-recovery-20260716" \
       omniva.flashinfer.preallreduce.backend="trtllm-multinode"
