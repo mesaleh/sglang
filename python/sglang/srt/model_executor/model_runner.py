@@ -2463,6 +2463,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.kv_cache_dtype = resolved
 
     def configure_kv_cache_dtype(self):
+        # The DFlash draft owns an independent MHA cache. A target-level
+        # TurboQuant setting must not leak into that cache: FA4 consumes the
+        # draft model's compute dtype, and treating the draft as TurboQuant
+        # also mutates the shared decode-backend setting to Triton. Besides
+        # selecting the wrong representation, that path is not graph-safe for
+        # DFlash's symbolic KVWriteLoc capture input.
+        if (
+            self.is_draft_worker
+            and self.spec_algorithm.is_dflash()
+            and self.server_args.speculative_draft_attention_backend == "fa4"
+            and self.server_args.kv_cache_dtype.startswith("turboquant_")
+        ):
+            self.kv_cache_dtype = self.dtype
+            logger.info(
+                "DFLASH fa4 draft: isolating KV cache from target %s -> %s "
+                "(TurboQuant applies to the target MLA cache only).",
+                self.server_args.kv_cache_dtype,
+                self.dtype,
+            )
+            return
+
         if self.server_args.kv_cache_dtype == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)

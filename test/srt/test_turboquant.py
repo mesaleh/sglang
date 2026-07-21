@@ -42,6 +42,29 @@ class TestTurboQuantCLI(unittest.TestCase):
             )
             self.assertEqual(args.kv_cache_dtype, dtype)
 
+    def test_dflash_fa4_draft_does_not_inherit_target_turboquant(self):
+        import torch
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        server_args = SimpleNamespace(
+            kv_cache_dtype="turboquant_4bit",
+            speculative_draft_attention_backend="fa4",
+            decode_attention_backend=None,
+        )
+        runner = SimpleNamespace(
+            server_args=server_args,
+            is_draft_worker=True,
+            spec_algorithm=SimpleNamespace(is_dflash=lambda: True),
+            dtype=torch.bfloat16,
+        )
+
+        ModelRunner.configure_kv_cache_dtype(runner)
+
+        self.assertIs(runner.kv_cache_dtype, torch.bfloat16)
+        self.assertFalse(hasattr(runner, "turboquant_bits"))
+        self.assertIsNone(server_args.decode_attention_backend)
+
 
 class TestCodebook(unittest.TestCase):
 
