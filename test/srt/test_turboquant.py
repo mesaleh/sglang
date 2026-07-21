@@ -18,6 +18,7 @@ import argparse
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -108,6 +109,42 @@ class TestTurboQuantConfig(unittest.TestCase):
         self.assertIs(get_mha_turboquant_config(mha_pool), cfg)
         self.assertIsNone(get_mha_turboquant_config(mla_pool))
         self.assertIsNone(get_mha_turboquant_config(wrapped_mla_pool))
+
+
+class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
+
+    def test_out_graph_refreshes_packed_indices_for_decode(self):
+        import torch
+
+        from sglang.srt.layers.attention.flashmla_backend import (
+            FlashMLABackend,
+            TurboQuantMLABackend,
+        )
+
+        backend = object.__new__(TurboQuantMLABackend)
+        backend._tq_use_staged_flashmla = False
+        backend._tq_build_kv_indices = Mock()
+
+        req_pool_indices = torch.tensor([3, 7], dtype=torch.int32)
+        seq_lens = torch.tensor([64, 96], dtype=torch.int32)
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=SimpleNamespace(is_decode_or_idle=lambda: True),
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+        )
+
+        with patch.object(
+            FlashMLABackend, "init_forward_metadata_out_graph"
+        ) as parent_init:
+            backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+        parent_init.assert_called_once_with(forward_batch, in_capture=True)
+        backend._tq_build_kv_indices.assert_called_once()
+        args = backend._tq_build_kv_indices.call_args.args
+        self.assertEqual(args[0], 2)
+        self.assertIs(args[1], req_pool_indices)
+        torch.testing.assert_close(args[2], seq_lens)
 
 
 try:

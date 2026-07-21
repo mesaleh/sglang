@@ -674,10 +674,11 @@ class TurboQuantMLABackend(FlashMLABackend):
     Subclasses FlashMLABackend. Inherits:
       - __init__  (we re-use all the paging / metadata setup)
       - init_forward_metadata (decode + extend + target_verify)
-      - init_cuda_graph_state / capture / replay
+      - init_cuda_graph_state
       - forward_extend (falls through to parent — Stage A dequant-on-read path)
 
-    Overrides only forward_decode. Extend paths keep using the Stage A
+    Overrides forward_decode and augments the current CUDA-graph metadata
+    callback. Extend paths keep using the Stage A
     dequant-on-read + flashmla kernel: flashmla's forward_extend calls
     pool.get_key_buffer() which returns the un-rotated bf16 view Stage A
     produces, so it Just Works. Only decode swaps to our fused path.
@@ -1168,59 +1169,36 @@ class TurboQuantMLABackend(FlashMLABackend):
                     bs, forward_batch.req_pool_indices, forward_batch.seq_lens
                 )
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
         self,
-        bs: int,
-        num_tokens: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional["SpecInput"],
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
     ):
-        # Parent fills block_kv_indices + mla_metadata + num_splits for the
-        # forward_metadata object. We re-use it and additionally populate
-        # Stage C's own kv_indptr + kv_indices into the pre-allocated pool.
-        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.capture_parent_metadata"):
-            super().init_forward_metadata_capture_cuda_graph(
-                bs, num_tokens, req_pool_indices, seq_lens,
-                encoder_lens, forward_mode, spec_info,
-            )
-        if forward_mode.is_decode_or_idle():
-            if self._tq_use_staged_flashmla:
-                # CUDA graph capture records the kernel launch grid, so the
-                # staged kernel must launch with a static page count. The
-                # kernel reads device seq_lens and returns early for invalid
-                # pages, preserving correctness on replay with longer prompts.
-                self._tq_staged_pages_per_req = self.cuda_graph_kv_indices.shape[1]
-            with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.capture_tq_indices"):
-                self._tq_build_kv_indices(bs, req_pool_indices, seq_lens)
+        """Refresh packed-cache indices before CUDA-graph capture/replay.
 
-    def init_forward_metadata_replay_cuda_graph(
-        self,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional["SpecInput"],
-        seq_lens_cpu: Optional[torch.Tensor],
-    ):
-        # Replay-time metadata build runs on the CPU before the captured
-        # graph launches, so host-sync operations ARE allowed here. Parent
-        # already does an .item() on seq_lens_cpu.max() — we inherit that
-        # and just add our own in-place buffer refresh.
-        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.replay_parent_metadata"):
-            super().init_forward_metadata_replay_cuda_graph(
-                bs, req_pool_indices, seq_lens, seq_lens_sum,
-                encoder_lens, forward_mode, spec_info, seq_lens_cpu,
+        SGLang's three-method metadata contract removed the legacy capture and
+        replay callbacks. Both graph phases now enter this out-of-graph hook,
+        so the TurboQuant token-index metadata must be refreshed here alongside
+        the parent FlashMLA metadata.
+        """
+        with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.parent_metadata"):
+            super().init_forward_metadata_out_graph(
+                forward_batch, in_capture=in_capture
             )
-        if forward_mode.is_decode_or_idle():
+
+        if forward_batch.forward_mode.is_decode_or_idle():
+            bs = forward_batch.batch_size
             if self._tq_use_staged_flashmla:
+                # CUDA graph capture records the kernel launch grid. Keep the
+                # page ceiling static at capture and replay; the staged kernel
+                # reads seq_lens and exits for pages outside the live request.
                 self._tq_staged_pages_per_req = self.cuda_graph_kv_indices.shape[1]
-            with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.replay_tq_indices"):
-                self._tq_build_kv_indices(bs, req_pool_indices, seq_lens[:bs])
+            with _tq_mla_nvtx_range("omniva.tq_mla.cuda_graph.tq_indices"):
+                self._tq_build_kv_indices(
+                    bs,
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens[:bs],
+                )
 
     def forward_decode(
         self,
