@@ -2732,19 +2732,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         import logging
         logger = logging.getLogger(__name__)
-        # Skip on MLA path: MLATokenToKVPoolTurboQuant._dequant_nope already
-        # applies the inverse WHT on read, so downstream attention sees
-        # un-rotated KV and produces un-rotated output. Pre-rotating o_proj
-        # here would double-inverse-rotate via the compensation path and
-        # corrupt the output projection, producing token-salad despite
-        # numerically correct pool round-trip. For MHA TurboQuant the kernel
-        # returns attention output in rotated space and o_proj pre-rotation
-        # is the correct fusion, but that contract does not hold on MLA.
         if self.use_mla_backend:
+            _, decode_attention_backend = self.server_args.get_attention_backends()
+            uses_native_tq_mla = decode_attention_backend == "tokenspeed_mla"
+            if uses_native_tq_mla and not self.server_args.enable_lora:
+                self._maybe_fuse_tq_mla_absorb_rotations(tq_cfg, logger)
+                return
+
+            # The fallback MLA paths dequantize and inverse-rotate on read, so
+            # downstream attention already produces original-domain output.
+            # Runtime LoRA corrections are also expressed in that domain and
+            # cannot share statically rotated absorb weights.
             logger.info(
-                "TurboQuant+MLA: skipping o_proj rotation fusion "
-                "(MLA pool dequantizes+inverse-rotates on read; attention "
-                "output is already in original domain)."
+                "TurboQuant+MLA: keeping runtime rotations "
+                "(native tokenspeed decode is disabled or LoRA is active)."
             )
             return
         logger.info("TurboQuant: fusing inverse WHT rotation into o_proj weights...")
@@ -2816,6 +2817,70 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     fused,
                     skipped_quantized + skipped_other,
                 )
+
+    def _maybe_fuse_tq_mla_absorb_rotations(self, tq_cfg, logger):
+        """Move MLA target decode into the packed cache's rotation domain."""
+        if getattr(tq_cfg, "mla_absorb_rotation_fused", False):
+            logger.info("TurboQuant native MLA rotations are already fused.")
+            return
+
+        safe_dtypes = (torch.float16, torch.bfloat16, torch.float32)
+        candidates = []
+        rejected = []
+        for name, module in self.model.named_modules():
+            if not (hasattr(module, "w_kc") and hasattr(module, "w_vc")):
+                continue
+            w_kc = module.w_kc
+            w_vc = module.w_vc
+            if not isinstance(w_kc, torch.Tensor) or not isinstance(
+                w_vc, torch.Tensor
+            ):
+                rejected.append((name, "non-tensor absorb weights"))
+                continue
+            if (
+                w_kc.dtype not in safe_dtypes
+                or w_vc.dtype not in safe_dtypes
+                or w_kc.ndim != 3
+                or w_vc.ndim != 3
+                or w_kc.shape[-1] != tq_cfg.head_dim
+                or w_vc.shape[-2] != tq_cfg.head_dim
+                or w_kc.shape[0] != w_vc.shape[0]
+                or w_kc.dtype != w_vc.dtype
+                or w_kc.device != w_vc.device
+            ):
+                rejected.append(
+                    (
+                        name,
+                        f"w_kc={tuple(w_kc.shape)}/{w_kc.dtype}, "
+                        f"w_vc={tuple(w_vc.shape)}/{w_vc.dtype}",
+                    )
+                )
+                continue
+            candidates.append((name, w_kc, w_vc))
+
+        if not candidates or rejected:
+            logger.warning(
+                "TurboQuant native MLA rotation fusion disabled: "
+                "eligible_layers=%d rejected_layers=%s",
+                len(candidates),
+                rejected,
+            )
+            return
+
+        with torch.no_grad():
+            for _, w_kc, w_vc in candidates:
+                w_kc_rotated, w_vc_rotated = tq_cfg.fuse_mla_absorb_rotations(
+                    w_kc, w_vc
+                )
+                w_kc.copy_(w_kc_rotated)
+                w_vc.copy_(w_vc_rotated)
+
+        tq_cfg.mla_absorb_rotation_fused = True
+        logger.info(
+            "TurboQuant native MLA: fused query/output rotations into %d "
+            "w_kc/w_vc layer pairs.",
+            len(candidates),
+        )
 
 
     def maybe_init_ngram_embedding(self):

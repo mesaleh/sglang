@@ -370,6 +370,50 @@ class TurboQuantConfig:
         wht_scale = 1.0 / math.sqrt(self.head_dim)
         return hadamard_transform_with_signs(o, self.signs2, self.signs1, scale=wht_scale)
 
+    def fuse_mla_absorb_rotations(
+        self,
+        w_kc: torch.Tensor,
+        w_vc: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Absorb the TurboQuant rotation into MLA's latent-side BMM weights.
+
+        MLA forms the latent query as ``q @ w_kc`` and projects the latent
+        attention result with ``o @ w_vc``.  If the packed cache stores
+        ``k @ R``, the equivalent weights are ``w_kc @ R`` and
+        ``R.T @ w_vc``.  The latter is evaluated as ``(w_vc.T @ R).T`` so
+        both transforms can use the row-oriented forward rotation kernel.
+        """
+        if w_kc.ndim != 3 or w_vc.ndim != 3:
+            raise ValueError(
+                "MLA rotation fusion requires rank-3 w_kc and w_vc tensors; "
+                f"got {tuple(w_kc.shape)} and {tuple(w_vc.shape)}"
+            )
+        if w_kc.shape[-1] != self.head_dim:
+            raise ValueError(
+                f"w_kc output dim must be {self.head_dim}, got {w_kc.shape[-1]}"
+            )
+        if w_vc.shape[-2] != self.head_dim:
+            raise ValueError(
+                f"w_vc input dim must be {self.head_dim}, got {w_vc.shape[-2]}"
+            )
+        if w_kc.shape[0] != w_vc.shape[0]:
+            raise ValueError(
+                "w_kc and w_vc must have the same head count; "
+                f"got {w_kc.shape[0]} and {w_vc.shape[0]}"
+            )
+        if w_kc.dtype != w_vc.dtype or w_kc.device != w_vc.device:
+            raise ValueError(
+                "w_kc and w_vc must share dtype and device; "
+                f"got {w_kc.dtype}/{w_kc.device} and "
+                f"{w_vc.dtype}/{w_vc.device}"
+            )
+
+        w_kc_rotated = self.rotate_query(w_kc.contiguous())
+        w_vc_rotated = self.rotate_query(
+            w_vc.transpose(-2, -1).contiguous()
+        ).transpose(-2, -1).contiguous()
+        return w_kc_rotated, w_vc_rotated
+
     def fuse_inverse_rotation_into_o_proj(self, o_proj_weight: torch.Tensor, num_heads: int) -> torch.Tensor:
         """Absorb inverse WHT rotation into o_proj weight matrix.
 

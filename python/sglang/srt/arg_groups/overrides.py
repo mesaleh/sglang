@@ -1608,9 +1608,10 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3"]:
+        if view.kv_cache_dtype not in ["fp8_e4m3", "turboquant_4bit"]:
             raise ValueError(
-                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3 "
+                "or turboquant_4bit, "
                 f"got {view.kv_cache_dtype}."
             )
     return {}

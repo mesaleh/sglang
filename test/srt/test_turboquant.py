@@ -366,6 +366,38 @@ class TestTurboQuantGPU(unittest.TestCase):
         max_err = (x.float() - x_back.float()).abs().max().item()
         self.assertLess(max_err, 0.02, f"Rotation roundtrip error: {max_err}")
 
+    def test_mla_absorb_weight_rotation_equivalence(self):
+        cfg = self.configs[4]
+        torch.manual_seed(42)
+        heads, batch, qk_dim, value_dim = 3, 5, 64, 80
+        w_kc = torch.randn(
+            heads, qk_dim, 128, device=self.device, dtype=torch.float32
+        )
+        w_vc = torch.randn(
+            heads, 128, value_dim, device=self.device, dtype=torch.float32
+        )
+        q = torch.randn(
+            heads, batch, qk_dim, device=self.device, dtype=torch.float32
+        )
+        o = torch.randn(
+            heads, batch, 128, device=self.device, dtype=torch.float32
+        )
+
+        w_kc_rotated, w_vc_rotated = cfg.fuse_mla_absorb_rotations(w_kc, w_vc)
+
+        torch.testing.assert_close(
+            torch.bmm(q, w_kc_rotated),
+            cfg.rotate_query(torch.bmm(q, w_kc)),
+            atol=2e-4,
+            rtol=2e-4,
+        )
+        torch.testing.assert_close(
+            torch.bmm(cfg.rotate_query(o), w_vc_rotated),
+            torch.bmm(o, w_vc),
+            atol=2e-4,
+            rtol=2e-4,
+        )
+
     def test_rotspace_dequant_v_output_equivalence(self):
         """Verify attention output equivalence for V side:
         D1@H@D2 @ sum(attn_i * V_rotspace_i) == sum(attn_i * V_dequant_i)"""

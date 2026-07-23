@@ -68,6 +68,40 @@ def _supports_custom_decode_mask(decode_fn) -> bool:
     return "custom_mask" in parameters and "cmask_off" in parameters
 
 
+def _find_mla_turboquant_pool(token_to_kv_pool):
+    if getattr(token_to_kv_pool, "is_mla_turboquant_pool", False):
+        return token_to_kv_pool
+    wrapped_pool = getattr(token_to_kv_pool, "full_kv_pool", None)
+    if getattr(wrapped_pool, "is_mla_turboquant_pool", False):
+        return wrapped_pool
+    return None
+
+
+def _tq4_split_override(batch_size: int, max_seq_len: int, num_sms: int) -> int:
+    tiles = (max_seq_len + 127) // 128
+    blocks_per_request = max(1, num_sms // max(1, batch_size) // 2)
+    return min(tiles, blocks_per_request, 64)
+
+
+def _quantize_tq4_query(
+    query: torch.Tensor, kv_lora_rank: int, enable_pdl: bool
+) -> torch.Tensor:
+    query_fp8 = torch.empty(
+        query.shape, dtype=torch.float8_e4m3fn, device=query.device
+    )
+    fp8_quantize(
+        query[..., :kv_lora_rank],
+        out=query_fp8[..., :kv_lora_rank],
+        enable_pdl=enable_pdl,
+    )
+    fp8_quantize(
+        query[..., kv_lora_rank:],
+        out=query_fp8[..., kv_lora_rank:],
+        enable_pdl=enable_pdl,
+    )
+    return query_fp8
+
+
 def _get_tokenspeed_workspace(
     device: torch.device, num_heads: int, kv_lora_rank: int, q_len: int
 ) -> torch.Tensor:
@@ -106,15 +140,30 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
         )
 
-        if self.data_type != torch.float8_e4m3fn:
+        self._tq_pool = _find_mla_turboquant_pool(self.token_to_kv_pool)
+        self._tq4_cache = self._tq_pool is not None
+        self._tq_config = self._tq_pool.tq_config if self._tq4_cache else None
+
+        if not self._tq4_cache and self.data_type != torch.float8_e4m3fn:
             raise ValueError(
                 "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
                 f"got data_type={self.data_type}."
             )
-        if self.page_size not in (32, 64):
+        if self._tq4_cache and self.page_size != 32:
+            raise ValueError(
+                "native TurboQuant tokenspeed_mla requires page_size=32, "
+                f"got page_size={self.page_size}."
+            )
+        if not self._tq4_cache and self.page_size not in (32, 64):
             raise ValueError(
                 "tokenspeed_mla backend requires page_size in {32, 64}, "
                 f"got page_size={self.page_size}."
+            )
+        if self._tq4_cache and not hasattr(
+            tokenspeed_mla, "tokenspeed_mla_decode_tq4"
+        ):
+            raise RuntimeError(
+                "installed tokenspeed_mla does not provide native TQ4 decode"
             )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
@@ -129,38 +178,43 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
             # min; without warm-up the first request trips the 300 s scheduler
             # watchdog.
-            _compile_prefill_kernel = tokenspeed_mla.mla_prefill._compile_prefill_kernel
-            _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
-            head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
-            enable_ex2_emulation = tokenspeed_mla.mla_prefill._enable_ex2_emulation()
-            use_pdl = is_arch_support_pdl()
-            for is_causal in (True, False):
-                for return_lse in (True, False):
-                    # Non-causal is only entered from the chunked-prefix
-                    # branch, which always asks for the LSE.
-                    if is_causal is False and return_lse is False:
-                        continue
-                    # Runtime feeds fp8_e4m3fn q/k/v
-                    config = (
-                        torch.float8_e4m3fn,
-                        head_dim_qk,
-                        self.v_head_dim,
-                        is_causal,
-                        return_lse,
-                        use_pdl,
-                        enable_ex2_emulation,
-                    )
-                    if config in _compiled_kernels:
-                        continue
-                    _compiled_kernels[config] = _compile_prefill_kernel(
-                        torch.float8_e4m3fn,
-                        head_dim_qk,
-                        self.v_head_dim,
-                        is_causal,
-                        return_lse,
-                        use_pdl=use_pdl,
-                        enable_ex2_emulation=enable_ex2_emulation,
-                    )
+            if not self._tq4_cache:
+                _compile_prefill_kernel = (
+                    tokenspeed_mla.mla_prefill._compile_prefill_kernel
+                )
+                _compiled_kernels = tokenspeed_mla.mla_prefill._compiled_kernels
+                head_dim_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+                enable_ex2_emulation = (
+                    tokenspeed_mla.mla_prefill._enable_ex2_emulation()
+                )
+                use_pdl = is_arch_support_pdl()
+                for is_causal in (True, False):
+                    for return_lse in (True, False):
+                        # Non-causal is only entered from the chunked-prefix
+                        # branch, which always asks for the LSE.
+                        if is_causal is False and return_lse is False:
+                            continue
+                        # Runtime feeds fp8_e4m3fn q/k/v
+                        config = (
+                            torch.float8_e4m3fn,
+                            head_dim_qk,
+                            self.v_head_dim,
+                            is_causal,
+                            return_lse,
+                            use_pdl,
+                            enable_ex2_emulation,
+                        )
+                        if config in _compiled_kernels:
+                            continue
+                        _compiled_kernels[config] = _compile_prefill_kernel(
+                            torch.float8_e4m3fn,
+                            head_dim_qk,
+                            self.v_head_dim,
+                            is_causal,
+                            return_lse,
+                            use_pdl=use_pdl,
+                            enable_ex2_emulation=enable_ex2_emulation,
+                        )
 
     def _fused_rope_fp8_quantize(
         self,
@@ -294,6 +348,33 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
         return self._tokenspeed_workspace
 
+    def _page_table_padding_value(self) -> int:
+        # Packed TMA stages load complete 128-token tiles before applying the
+        # sequence mask. Page zero is an allocated, zero-initialized safe page.
+        return (
+            0
+            if getattr(self, "_tq4_cache", False)
+            else super()._page_table_padding_value()
+        )
+
+    def _get_decode_kv_cache(self, layer: RadixAttention) -> torch.Tensor:
+        if not self._tq4_cache:
+            return super()._get_decode_kv_cache(layer)
+        layer_id_rel = layer.layer_id - self._tq_pool.start_layer
+        packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+        if packed.shape[0] % self.page_size != 0:
+            raise RuntimeError(
+                "TurboQuant pool token count must be page aligned; "
+                f"got {packed.shape[0]} tokens for page_size={self.page_size}"
+            )
+        return packed.view(-1, self.page_size, packed.shape[-1]).unsqueeze(1)
+
+    def _validate_decode_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        if self._tq4_cache:
+            assert kv_cache.dtype == torch.uint8
+            return
+        super()._validate_decode_kv_cache(kv_cache)
+
     def _run_decode_kernel(
         self,
         query: torch.Tensor,
@@ -305,6 +386,70 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         custom_mask: Optional[torch.Tensor] = None,
         custom_mask_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._tq4_cache:
+            if max_seq_len > 32768:
+                raise RuntimeError(
+                    "native TurboQuant MLA currently supports max_seq_len <= 32768; "
+                    f"got {max_seq_len}"
+                )
+            rotation_fused = getattr(
+                self._tq_config, "mla_absorb_rotation_fused", False
+            )
+            if rotation_fused:
+                query_rotated = query
+            else:
+                query_nope_rotated = self._tq_config.rotate_query(
+                    query[..., : self.kv_lora_rank]
+                )
+                query_rotated = torch.cat(
+                    (query_nope_rotated, query[..., self.kv_lora_rank :]), dim=-1
+                )
+            query_fp8 = _quantize_tq4_query(
+                query_rotated,
+                self.kv_lora_rank,
+                is_arch_support_pdl(),
+            )
+            layer_id_rel = layer.layer_id - self._tq_pool.start_layer
+            scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel].view(
+                -1, self.page_size
+            )
+            rope = self._tq_pool.kv_rope_buffer[layer_id_rel].view(
+                -1, self.page_size, self.qk_rope_head_dim
+            )
+            seq_lens_i32 = (
+                seq_lens
+                if seq_lens.dtype == torch.int32
+                else seq_lens.to(torch.int32)
+            )
+            split_kv = _tq4_split_override(
+                query.shape[0],
+                int(max_seq_len),
+                tokenspeed_mla.get_num_sm(query.device),
+            )
+            output = tokenspeed_mla.tokenspeed_mla_decode_tq4(
+                query=query_fp8,
+                kv_nope_packed=kv_cache,
+                kv_nope_scale=scale,
+                kv_rope=rope,
+                centroids=self._tq_config.k_centroids,
+                workspace_buffer=self._ensure_workspace(
+                    query.device, query.shape[1]
+                ),
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=block_tables,
+                seq_lens=seq_lens_i32,
+                max_seq_len=int(max_seq_len),
+                softmax_scale=float(layer.scaling),
+                enable_pdl=is_arch_support_pdl(),
+                custom_mask=custom_mask,
+                cmask_off=custom_mask_offsets,
+                split_kv_override=split_kv,
+            )
+            if not rotation_fused:
+                output = self._tq_config.inverse_rotate_output(output)
+            return output
+
         k_scale = getattr(layer, "k_scale_float", None)
         if k_scale is None:
             k_scale = 1.0
@@ -352,6 +497,24 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
+        if self._tq4_cache:
+            return TRTLLMMLABackend._run_prefill_kernel(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                batch_size,
+                cum_seq_lens_q,
+                max_q_len,
+                seq_lens_kv,
+                cum_seq_lens_kv,
+                max_kv_len,
+                is_causal,
+                return_lse,
+                out_buffer,
+                o_sf_scale,
+            )
         return tokenspeed_mla.tokenspeed_mla_prefill(
             query=q,
             key=k,
