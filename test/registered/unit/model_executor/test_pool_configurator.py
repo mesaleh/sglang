@@ -206,6 +206,35 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
+    def test_mla_turboquant_tokenspeed_codebook_is_accounted(self):
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        num_layers = 61
+        for decode_backend, expected_bytes in (
+            ("triton", 386),
+            ("tokenspeed_mla", 402),
+        ):
+            mr = _make_model_runner(
+                use_mla_backend=True,
+                num_layers=num_layers,
+            )
+            mr.model_config.kv_lora_rank = 512
+            mr.model_config.qk_rope_head_dim = 64
+            mr.turboquant_bits = 4
+            mr.turboquant_k_bits = 4
+            mr.server_args.get_attention_backends = lambda backend=decode_backend: (
+                "flashinfer_mla",
+                backend,
+            )
+            with mock_cpu_env():
+                configurator = DefaultPoolConfigurator(mr)
+            self.assertEqual(
+                configurator._cell_size,
+                expected_bytes * num_layers,
+            )
+
 
 class TestHybridSWAConfigurator(unittest.TestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""

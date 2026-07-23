@@ -675,6 +675,9 @@ class TestTurboQuantGPU(unittest.TestCase):
         fused_packed = torch.zeros_like(legacy_packed)
         fused_scale = torch.zeros_like(legacy_scale)
         fused_rope = torch.zeros_like(legacy_rope)
+        fused_codebook = torch.zeros(
+            pool_size, 1, 16, dtype=torch.uint8, device=self.device
+        )
         pre_unit = torch.empty(
             tokens, 1, lora_rank, dtype=torch.float32, device=self.device
         )
@@ -695,6 +698,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             pre_unit=pre_unit,
             pre_norms=pre_norms,
             pre_y=pre_y,
+            codebook_buffer=fused_codebook.view(torch.float8_e4m3fn),
             rope_src=cache_k_rope.contiguous(),
             rope_buffer=fused_rope,
         )
@@ -706,6 +710,13 @@ class TestTurboQuantGPU(unittest.TestCase):
             legacy_scale[loc].float(),
             atol=1e-2,
             rtol=1e-2,
+        )
+        expected_fused_codebook = (
+            cfg.k_centroids.float().view(1, 1, 16)
+            * fused_scale[loc].float().unsqueeze(-1)
+        ).to(torch.float8_e4m3fn)
+        torch.testing.assert_close(
+            fused_codebook[loc], expected_fused_codebook.view(torch.uint8)
         )
 
         legacy_rot = batched_dequantize_rotspace(
@@ -742,6 +753,7 @@ class TestTurboQuantGPU(unittest.TestCase):
                 turboquant_bits=4,
                 turboquant_k_bits=4,
                 turboquant_v_bits=4,
+                enable_fp8_codebook=True,
                 start_layer=0,
                 end_layer=0,
             )
@@ -786,6 +798,25 @@ class TestTurboQuantGPU(unittest.TestCase):
             legacy_pool.kv_nope_scale_buffer[0][loc].float(),
             atol=1e-2,
             rtol=1e-2,
+        )
+        for pool in (legacy_pool, fused_pool, fused_rope_pool):
+            scale = pool.kv_nope_scale_buffer[0][loc]
+            expected_codebook = (
+                cfg.k_centroids.float().view(1, 1, 16)
+                * scale.float().unsqueeze(-1)
+            ).to(torch.float8_e4m3fn)
+            torch.testing.assert_close(
+                pool.kv_nope_codebook_buffer[0][loc],
+                expected_codebook.view(torch.uint8),
+            )
+            self.assertEqual(pool.get_kv_size_bytes(), pool_size * 402)
+
+        src = torch.tensor([loc[0].item()], device=self.device)
+        dst = torch.tensor([pool_size - 1], device=self.device)
+        expected_codebook = fused_pool.kv_nope_codebook_buffer[0][src].clone()
+        fused_pool.move_kv_cache(dst, src)
+        torch.testing.assert_close(
+            fused_pool.kv_nope_codebook_buffer[0][dst], expected_codebook
         )
 
     def test_non_128_head_dim(self):

@@ -246,6 +246,7 @@ def _fused_pack_store_4bit_kernel(
     Loc,            # (tokens,) int64 — pool slot indices
     KBuffer,        # (pool_size, heads, packed_dim) uint8 — destination
     DScaleBuffer,   # (pool_size, heads) bf16 — destination
+    CodebookBuffer, # optional (pool_size, heads, 16) E4M3FN alias
     RopeSrc,        # optional (tokens, heads, rope_dim) bf16
     RopeBuffer,     # optional (pool_size, heads, rope_dim) bf16
     Boundaries,
@@ -255,6 +256,8 @@ def _fused_pack_store_4bit_kernel(
     stride_kb_s,    # KBuffer stride for pool_size dim
     stride_kb_h,
     stride_ds_s,    # DScaleBuffer stride for pool_size dim
+    stride_cb_s,
+    stride_cb_h,
     stride_rope_src_t,
     stride_rope_src_h,
     stride_rope_dst_s,
@@ -264,6 +267,7 @@ def _fused_pack_store_4bit_kernel(
     BLOCK_PACKED: tl.constexpr,
     Lk_half: tl.constexpr,
     ROPE_DIM: tl.constexpr,
+    STORE_CODEBOOK: tl.constexpr,
     STORE_ROPE: tl.constexpr,
 ):
     """Fused searchsorted + pack + dscale + optional RoPE scatter store."""
@@ -303,6 +307,20 @@ def _fused_pack_store_4bit_kernel(
     p_ptr = KBuffer + pool_slot * stride_kb_s + pid_h * stride_kb_h + offs_pair
     tl.store(p_ptr, packed.to(tl.uint8), mask=mask_pair)
     tl.store(DScaleBuffer + pool_slot * stride_ds_s + pid_h, dscale)
+
+    if STORE_CODEBOOK:
+        codebook_mask = offs_pair < 16
+        centroid = tl.load(
+            Centroids + offs_pair, mask=codebook_mask, other=0.0
+        ).to(tl.float32)
+        codebook_value = (centroid * dscale.to(tl.float32)).to(tl.float8e4nv)
+        codebook_ptr = (
+            CodebookBuffer
+            + pool_slot * stride_cb_s
+            + pid_h * stride_cb_h
+            + offs_pair
+        )
+        tl.store(codebook_ptr, codebook_value, mask=codebook_mask)
 
     if STORE_ROPE:
         rope_mask = offs_pair < ROPE_DIM
@@ -522,6 +540,7 @@ def fused_turboquant_quantize_and_store(
     pre_y=None,
     rope_src=None,
     rope_buffer=None,
+    codebook_buffer=None,
 ):
     """Fused quantize + scatter store: norm → normalize → WHT → pack+dscale → scatter to KV pool.
 
@@ -581,11 +600,33 @@ def fused_turboquant_quantize_and_store(
     )
 
     # Step 3: Fused pack + dscale + scatter store (1 Triton kernel)
+    store_codebook = codebook_buffer is not None
     store_rope = rope_src is not None and rope_buffer is not None
     if (rope_src is None) != (rope_buffer is None):
         raise ValueError("rope_src and rope_buffer must be provided together")
     if store_rope and bit_width != 4:
         raise ValueError("Fused RoPE write is currently supported only for 4-bit")
+    if store_codebook:
+        if bit_width != 4 or centroids.shape[0] != 16:
+            raise ValueError(
+                "Fused FP8 codebook write requires 4-bit quantization and 16 centroids"
+            )
+        if codebook_buffer.dtype != torch.float8_e4m3fn:
+            raise ValueError("FP8 codebook writer requires an E4M3FN storage view")
+        if codebook_buffer.device != x.device:
+            raise ValueError("FP8 codebook writer requires storage on the input device")
+        if (
+            codebook_buffer.dim() != 3
+            or tuple(codebook_buffer.shape[:2]) != tuple(dscale_buffer.shape)
+            or codebook_buffer.shape[-1] != 16
+            or not codebook_buffer.is_contiguous()
+        ):
+            raise ValueError(
+                "FP8 codebook writer requires contiguous (pool, heads, 16) storage "
+                "matching the dequant-scale buffer"
+            )
+        if codebook_buffer.data_ptr() % 16:
+            raise ValueError("FP8 codebook writer requires 16-byte-aligned storage")
 
     if bit_width == 4:
         packed_dim = dim // 2
@@ -600,12 +641,15 @@ def fused_turboquant_quantize_and_store(
         _fused_pack_store_4bit_kernel[grid_ps](
             y, norms, loc,
             kv_buffer, dscale_buffer,
+            codebook_buffer if store_codebook else kv_buffer,
             rope_src if store_rope else x,
             rope_buffer if store_rope else kv_buffer,
             boundaries, centroids,
             y.stride(0), y.stride(1),
             kv_buffer.stride(0), kv_buffer.stride(1),
             dscale_buffer.stride(0),
+            codebook_buffer.stride(0) if store_codebook else 0,
+            codebook_buffer.stride(1) if store_codebook else 0,
             rope_src.stride(0) if store_rope else 0,
             rope_src.stride(1) if store_rope else 0,
             rope_buffer.stride(0) if store_rope else 0,
@@ -615,6 +659,7 @@ def fused_turboquant_quantize_and_store(
             BLOCK_PACKED=BLOCK_PACKED,
             Lk_half=packed_dim,
             ROPE_DIM=rope_dim,
+            STORE_CODEBOOK=store_codebook,
             STORE_ROPE=store_rope,
             num_warps=4,
         )
@@ -738,16 +783,18 @@ def fused_turboquant_quantize_and_store_kv(
             _fused_pack_store_4bit_kernel[grid_ps](
                 k_y, k_norms, loc,
                 k_buffer, k_dscale_buffer,
+                k_buffer,
                 cache_k, k_buffer,
                 k_boundaries, k_centroids,
                 k_y.stride(0), k_y.stride(1),
                 k_buffer.stride(0), k_buffer.stride(1),
                 k_dscale_buffer.stride(0),
+                0, 0,
                 0, 0, 0, 0,
                 k_norms.stride(0),
                 N_BOUNDARIES=k_boundaries.shape[0],
                 BLOCK_PACKED=BLOCK_PACKED, Lk_half=packed_dim,
-                ROPE_DIM=0, STORE_ROPE=False, num_warps=4,
+                ROPE_DIM=0, STORE_CODEBOOK=False, STORE_ROPE=False, num_warps=4,
             )
         elif k_bit_width == 2:
             packed_dim = dim // 4
@@ -771,16 +818,18 @@ def fused_turboquant_quantize_and_store_kv(
             _fused_pack_store_4bit_kernel[grid_ps](
                 v_y, v_norms, loc,
                 v_buffer, v_dscale_buffer,
+                v_buffer,
                 cache_v, v_buffer,
                 v_boundaries, v_centroids,
                 v_y.stride(0), v_y.stride(1),
                 v_buffer.stride(0), v_buffer.stride(1),
                 v_dscale_buffer.stride(0),
+                0, 0,
                 0, 0, 0, 0,
                 v_norms.stride(0),
                 N_BOUNDARIES=v_boundaries.shape[0],
                 BLOCK_PACKED=BLOCK_PACKED, Lk_half=packed_dim,
-                ROPE_DIM=0, STORE_ROPE=False, num_warps=4,
+                ROPE_DIM=0, STORE_CODEBOOK=False, STORE_ROPE=False, num_warps=4,
             )
         elif v_bit_width == 2:
             packed_dim = dim // 4

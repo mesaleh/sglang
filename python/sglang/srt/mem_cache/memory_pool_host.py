@@ -1710,18 +1710,20 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
 
     The parent MLATokenToKVPoolHost assumes a uniform element layout:
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim, single dtype, single
-    buffer. TurboQuant-MLA stores three separate device buffers per layer
+    buffer. TurboQuant-MLA stores three or four separate device buffers per layer
     with different dtypes and per-token widths:
 
       - kv_nope_packed:  (size, 1, kv_lora_rank // 2) uint8   — packed 4-bit
       - kv_nope_scale:   (size, 1)                  bfloat16  — per-token scale
       - kv_rope:         (size, 1, qk_rope_head_dim) bfloat16  — raw rope
+      - kv_nope_codebook: optional (size, 1, 16) uint8 — raw E4M3FN bytes
 
     Total per-token-per-layer bytes (Kimi K2.6, lora=512, rope=64, k=4):
-      packed_nope (256) + scale (2) + rope (128) = 386 bytes.
+      packed_nope (256) + scale (2) + rope (128) = 386 bytes, plus an
+      optional TokenSpeed codebook (16) = 402 bytes.
 
-    We mirror this on pinned CPU memory as three separate contiguous
-    pinned tensors (one per layer per sub-buffer). Three small transfers
+    We mirror this on pinned CPU memory as separate contiguous pinned tensors
+    (one per layer per sub-buffer). Three or four small transfers
     per layer per swap — simpler than a fused packed host layout, and
     correctness-first as per the design doc.
 
@@ -1765,10 +1767,16 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
         self.kv_lora_rank = device_pool.kv_lora_rank
         self.qk_rope_head_dim = device_pool.qk_rope_head_dim
         self.layer_num = device_pool.layer_num
+        self.enable_fp8_codebook = device_pool.kv_nope_codebook_buffer is not None
         # 4-bit packed: 2 values per byte.
         self.packed_dim = self.kv_lora_rank // 2
         # Per-token-per-layer bytes for sizing the pool.
-        self._cell_bytes = self.packed_dim + 2 + self.qk_rope_head_dim * 2
+        self._cell_bytes = (
+            self.packed_dim
+            + 2
+            + self.qk_rope_head_dim * 2
+            + (16 if self.enable_fp8_codebook else 0)
+        )
 
         super().__init__(
             device_pool,
@@ -1800,7 +1808,7 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
     # ------------------------------------------------------------------
 
     def init_kv_buffer(self):
-        # Three separate pinned CPU buffers per layer. Allocate each sub-buffer
+        # Separate pinned CPU buffers per layer. Allocate each sub-buffer
         # as a single contiguous per-layer tensor for simple indexing.
         alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
 
@@ -1819,6 +1827,17 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,
+        )
+        self.kv_nope_codebook_host = (
+            alloc_func(
+                (self.layer_num, self.size, 1, 16),
+                dtype=torch.uint8,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            if self.enable_fp8_codebook
+            else None
         )
         # Rope: (layer_num, size, 1, qk_rope_head_dim) bfloat16
         self.kv_rope_host = alloc_func(
@@ -1849,7 +1868,7 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
         """Copy one layer's packed KV for host_indices into device_pool's
-        corresponding rows at device_indices. Three sub-transfers.
+        corresponding rows at device_indices. Three or four sub-transfers.
         """
         if io_backend != "direct":
             raise NotImplementedError(
@@ -1884,6 +1903,14 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
             dst_indices=device_indices,
             page_size=self.page_size,
         )
+        if self.enable_fp8_codebook:
+            transfer_kv_direct(
+                src_layers=[self.kv_nope_codebook_host[layer_id]],
+                dst_layers=[device_pool.kv_nope_codebook_buffer[layer_id]],
+                src_indices=host_indices,
+                dst_indices=device_indices,
+                page_size=self.page_size,
+            )
 
     # ------------------------------------------------------------------
     # Transfer: device -> host
@@ -1893,7 +1920,7 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         """Copy all layers' packed KV from device_pool's device_indices into
-        host rows at host_indices. Three sub-transfers across all layers.
+        host rows at host_indices. Three or four sub-transfers across all layers.
         """
         if io_backend != "direct":
             raise NotImplementedError(
@@ -1923,6 +1950,16 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
             dst_indices=host_indices,
             page_size=self.page_size,
         )
+        if self.enable_fp8_codebook:
+            transfer_kv_direct(
+                src_layers=device_pool.kv_nope_codebook_buffer,
+                dst_layers=[
+                    self.kv_nope_codebook_host[i] for i in range(self.layer_num)
+                ],
+                src_indices=device_indices,
+                dst_indices=host_indices,
+                page_size=self.page_size,
+            )
 
     # ------------------------------------------------------------------
     # External persistence (disagg / storage backends) — out of v1 scope

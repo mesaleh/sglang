@@ -887,6 +887,10 @@ class ModelRunnerKVCacheMixin:
                     turboquant_k_bits=getattr(self, "turboquant_k_bits", 0),
                     turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
                     turboquant_uniform=getattr(self, "turboquant_uniform", False),
+                    enable_fp8_codebook=(
+                        self.server_args.get_attention_backends()[1]
+                        == "tokenspeed_mla"
+                    ),
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )

@@ -570,6 +570,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             rope = self._tq_pool.kv_rope_buffer[layer_id_rel].view(
                 -1, self.page_size, self.qk_rope_head_dim
             )
+            codebook_buffer = self._tq_pool.kv_nope_codebook_buffer
+            if codebook_buffer is None:
+                raise RuntimeError(
+                    "native TokenSpeed TQ4 decode requires its FP8 codebook buffer"
+                )
+            codebook = codebook_buffer[layer_id_rel].view(
+                -1, self.page_size, 16
+            )
             seq_lens_i32 = (
                 seq_lens
                 if seq_lens.dtype == torch.int32
@@ -586,6 +594,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 kv_nope_scale=scale,
                 kv_rope=rope,
                 centroids=self._tq_config.k_centroids,
+                kv_nope_codebook=codebook,
                 workspace_buffer=self._ensure_workspace(
                     query.device,
                     query.shape[1],

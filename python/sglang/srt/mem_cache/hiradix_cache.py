@@ -100,8 +100,9 @@ class HiRadixCache(RadixCache):
             # Filled by attach_hybrid_minimax_sparse_pool_to_hiradix_cache.
             self.token_to_kv_pool_host = None
         elif isinstance(self.kv_cache, MLATokenToKVPoolTurboQuant):
-            # Packed TurboQuant-MLA layout: three separate sub-buffers on device
-            # (uint8 nope + bf16 scale + bf16 rope) instead of the uniform
+            # Packed TurboQuant-MLA layout: separate sub-buffers on device
+            # (uint8 nope + bf16 scale + bf16 rope + optional FP8 codebook)
+            # instead of the uniform
             # bf16 kv_buffer the parent host pool assumes. See
             # OmniSec/Inference/Performance Optimization/Design - Hicache MLA
             # packed-layout transfer.md for design rationale.

@@ -189,6 +189,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 #   nope_packed:  (lora_rank // 2) bytes    (4-bit: 2 values/byte)
                 #   scale:        2 bytes                   (bf16, one per token)
                 #   rope_raw:     qk_rope_head_dim * 2 bytes (bf16 unmodified)
+                #   fp8_codebook: 16 bytes for TokenSpeed MLA decode only
                 # Only 4-bit is supported for MLA in this first implementation
                 # (the pool class raises on k_bits != 4). We assert here so the
                 # sizing math cannot silently diverge from what the pool creates.
@@ -205,7 +206,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_bytes = 2
                 # Raw rope (bf16).
                 rope_bytes = rope * 2
-                per_layer_per_token = nope_packed_bytes + scale_bytes + rope_bytes
+                codebook_bytes = (
+                    16
+                    if mr.server_args.get_attention_backends()[1]
+                    == "tokenspeed_mla"
+                    else 0
+                )
+                per_layer_per_token = (
+                    nope_packed_bytes + scale_bytes + rope_bytes + codebook_bytes
+                )
                 cell_size = per_layer_per_token * num_layers
             else:
                 cell_size = (

@@ -3352,6 +3352,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
       = (512 * 0.5 + 64 * 2 + 2) B  /  (576 * 2 B)
       = 386 / 1152  ≈  0.335  → ~3x compression vs bf16, ~1.5x vs fp8.
 
+    TokenSpeed MLA decode additionally stores a 16-byte FP8 codebook per token
+    so its SM100 reader can replace indexed scalar lookups with register
+    permutations. That backend-specific layout is 402 bytes/token/layer,
+    still 30.2% smaller than the 576-byte FP8 baseline.
+
     Storage layout (per layer):
       - kv_nope_packed_buffer: (size+page, 1, lora_rank // 2) uint8
           packed 4-bit nope indices (2 values per byte at 4-bit)
@@ -3359,6 +3364,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
           one dequant-scale (norm / max(qnorm, eps)) per token
       - kv_rope_buffer: (size+page, 1, qk_rope_head_dim) bfloat16
           raw rope values
+      - kv_nope_codebook_buffer: optional (size+page, 1, 16) uint8
+          raw E4M3FN codebook bytes, enabled only for TokenSpeed MLA decode
 
     Correctness approach:
       This class overrides get_key_buffer / get_value_buffer / get_mla_kv_buffer
@@ -3387,6 +3394,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         turboquant_uniform: bool = False,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_fp8_codebook: bool = False,
     ):
         # For MLA, V is derived from the same latent as K (no separate V buffer).
         # We honor turboquant_v_bits for API symmetry with the MHA pool, but
@@ -3408,6 +3416,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                 f"MLA TurboQuant currently supports only 4-bit; got {k_bits}."
             )
         self.turboquant_bits = k_bits
+        self.enable_fp8_codebook = enable_fp8_codebook
 
         # Build a TurboQuantConfig for the NOPE dim only. The WHT sign vectors
         # and codebook all key off this dim; RoPE is stored raw, so no config
@@ -3493,6 +3502,30 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+                # TokenSpeed's SM100 TQ4 reader consumes exact E4M3FN bytes.
+                # Keep uint8 as the canonical storage/lifecycle representation;
+                # the FP8 views below alias it without allocating a shadow copy.
+                self.kv_nope_codebook_buffer = (
+                    [
+                        torch.zeros(
+                            (m, 1, 16),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    if self.enable_fp8_codebook
+                    else None
+                )
+                self._kv_nope_codebook_fp8_buffer = (
+                    [
+                        buffer.view(torch.float8_e4m3fn)
+                        for buffer in self.kv_nope_codebook_buffer
+                    ]
+                    if self.kv_nope_codebook_buffer is not None
+                    else None
+                )
+
                 # RoPE stored uncompressed in bf16 (raw rotary values).
                 self.kv_rope_buffer = [
                     torch.zeros(
@@ -3533,6 +3566,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             del self.kv_buffer
         del self.kv_nope_packed_buffer
         del self.kv_nope_scale_buffer
+        del self.kv_nope_codebook_buffer
+        del self._kv_nope_codebook_fp8_buffer
         del self.kv_rope_buffer
         del self._tq_mla_kv_write_unit
         del self._tq_mla_kv_write_norms
@@ -3544,11 +3579,14 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        for buffers in (
+        buffer_groups = [
             self.kv_nope_packed_buffer,
             self.kv_nope_scale_buffer,
             self.kv_rope_buffer,
-        ):
+        ]
+        if self.kv_nope_codebook_buffer is not None:
+            buffer_groups.append(self.kv_nope_codebook_buffer)
+        for buffers in buffer_groups:
             for cache in buffers:
                 cache[tgt_loc_flat] = cache[src_loc_flat]
 
@@ -3558,6 +3596,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             total += self.kv_nope_packed_buffer[i].nbytes
             total += self.kv_nope_scale_buffer[i].nbytes
             total += self.kv_rope_buffer[i].nbytes
+            if self.kv_nope_codebook_buffer is not None:
+                total += self.kv_nope_codebook_buffer[i].nbytes
         return total
 
     # ------------------------------------------------------------------
@@ -3738,6 +3778,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             pre_unit=self._tq_mla_kv_write_unit,
             pre_norms=self._tq_mla_kv_write_norms,
             pre_y=self._tq_mla_kv_write_y,
+            codebook_buffer=(
+                self._kv_nope_codebook_fp8_buffer[layer_id_rel]
+                if self._kv_nope_codebook_fp8_buffer is not None
+                else None
+            ),
             rope_src=cache_k_rope if fuse_rope_write else None,
             rope_buffer=self.kv_rope_buffer[layer_id_rel] if fuse_rope_write else None,
         )
@@ -3845,11 +3890,19 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             quant_norms,
             self._qnorm_replacement,
         )
-        dequant_scale = norms / safe_qnorm
+        dequant_scale = (norms / safe_qnorm).to(torch.bfloat16)
 
         # Write packed nope + scale at loc.
         self.kv_nope_packed_buffer[layer_id_rel][loc] = packed
         self.kv_nope_scale_buffer[layer_id_rel][loc] = dequant_scale
+        if self.kv_nope_codebook_buffer is not None:
+            codebook = (
+                cfg.k_centroids.float().view(1, 1, 16)
+                * dequant_scale.float().unsqueeze(-1)
+            ).to(torch.float8_e4m3fn)
+            self.kv_nope_codebook_buffer[layer_id_rel][loc] = codebook.view(
+                torch.uint8
+            )
 
         # Write rope raw at loc.
         self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
@@ -3925,7 +3978,15 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                 rope_cpu = self.kv_rope_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
-                layer_chunks.append((packed_cpu, scale_cpu, rope_cpu))
+                if self.kv_nope_codebook_buffer is not None:
+                    codebook_cpu = self.kv_nope_codebook_buffer[layer_id][
+                        chunk_indices
+                    ].to("cpu", non_blocking=True)
+                    layer_chunks.append(
+                        (packed_cpu, scale_cpu, rope_cpu, codebook_cpu)
+                    )
+                else:
+                    layer_chunks.append((packed_cpu, scale_cpu, rope_cpu))
             kv_cache_cpu.append(layer_chunks)
         torch.cuda.synchronize()
         return kv_cache_cpu
@@ -3937,9 +3998,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                packed_cpu, scale_cpu, rope_cpu = kv_cache_cpu[layer_id][
-                    i // chunk_size
-                ]
+                cpu_chunk = kv_cache_cpu[layer_id][i // chunk_size]
+                packed_cpu, scale_cpu, rope_cpu = cpu_chunk[:3]
                 dev = self.kv_nope_packed_buffer[0].device
                 self.kv_nope_packed_buffer[layer_id][chunk_indices] = packed_cpu.to(
                     dev, non_blocking=True
@@ -3950,6 +4010,12 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                 self.kv_rope_buffer[layer_id][chunk_indices] = rope_cpu.to(
                     dev, non_blocking=True
                 )
+                if self.kv_nope_codebook_buffer is not None:
+                    if len(cpu_chunk) != 4:
+                        raise ValueError("CPU copy is missing the TQ4 FP8 codebook")
+                    self.kv_nope_codebook_buffer[layer_id][
+                        chunk_indices
+                    ] = cpu_chunk[3].to(dev, non_blocking=True)
         torch.cuda.synchronize()
 
 

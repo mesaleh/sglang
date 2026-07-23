@@ -65,6 +65,10 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         quant_norms > 1e-10, quant_norms, torch.ones_like(quant_norms)
     )
     dequant_scale = (norms / safe_quant_norms).to(torch.bfloat16)
+    codebook = (
+        config.k_centroids.float().view(1, 1, 16)
+        * dequant_scale.float().unsqueeze(-1)
+    ).to(torch.float8_e4m3fn)
     rope = torch.randn(
         tokens, 1, rope_dim, device=device, dtype=torch.bfloat16
     )
@@ -74,6 +78,7 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         tq_config=config,
         kv_nope_packed_buffer=[packed],
         kv_nope_scale_buffer=[dequant_scale],
+        kv_nope_codebook_buffer=[codebook.view(torch.uint8).contiguous()],
         kv_rope_buffer=[rope],
     )
     backend = object.__new__(TokenspeedMLABackend)
