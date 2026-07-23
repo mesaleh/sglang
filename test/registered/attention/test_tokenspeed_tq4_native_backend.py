@@ -81,6 +81,7 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
     backend._tq_pool = pool
     backend._tq_config = config
     backend.page_size = page_size
+    backend.max_context_len = 32768
     backend.kv_lora_rank = latent
     backend.qk_rope_head_dim = rope_dim
     backend.num_q_heads = heads
@@ -135,3 +136,44 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         enable_pdl=True,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0.002)
+
+
+@pytest.mark.parametrize("query_length", (1, 5))
+def test_tq4_query_quantization_fuses_latent_and_rope_casts(query_length):
+    from sglang.jit_kernel.fp8_quantize import fp8_quantize
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+        _quantize_tq4_query,
+    )
+
+    torch.manual_seed(20260723)
+    query = torch.randn(
+        1, query_length, 8, 576, device="cuda", dtype=torch.bfloat16
+    )
+    expected = torch.empty_like(query, dtype=torch.float8_e4m3fn)
+    fp8_quantize(query[..., :512], out=expected[..., :512], enable_pdl=True)
+    fp8_quantize(query[..., 512:], out=expected[..., 512:], enable_pdl=True)
+
+    actual = _quantize_tq4_query(query, 512, enable_pdl=True)
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=0, atol=0)
+
+
+def test_tq4_query_quantization_matches_every_bf16_encoding():
+    from sglang.jit_kernel.fp8_quantize import fp8_quantize
+    from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+        _quantize_tq4_query,
+    )
+
+    bits = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.uint16)
+    padding = (-bits.numel()) % 576
+    bits = torch.nn.functional.pad(bits, (0, padding)).view(-1, 576)
+    query = bits.view(torch.bfloat16)
+    expected = torch.empty_like(query, dtype=torch.float8_e4m3fn)
+    fp8_quantize(query[..., :512], out=expected[..., :512], enable_pdl=True)
+    fp8_quantize(query[..., 512:], out=expected[..., 512:], enable_pdl=True)
+
+    actual = _quantize_tq4_query(query, 512, enable_pdl=True)
+
+    torch.testing.assert_close(
+        actual.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )

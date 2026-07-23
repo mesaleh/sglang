@@ -1,10 +1,14 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
+
 from sglang.srt.layers.attention.tokenspeed_mla_backend import (
     TokenspeedMLABackend,
     _supports_custom_decode_mask,
+    _tq4_kernel_max_seq_len,
     _tq4_split_override,
+    _tq4_workspace_bytes,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -25,11 +29,24 @@ def test_custom_decode_mask_contract_requires_both_parameters():
     assert not _supports_custom_decode_mask(stock_decode)
 
 
-def test_tq4_split_override_tracks_tiles_and_sm_budget():
+def test_tq4_split_override_keeps_one_compact_graph_specialization():
     assert _tq4_split_override(batch_size=1, max_seq_len=128, num_sms=148) == 1
     assert _tq4_split_override(batch_size=1, max_seq_len=129, num_sms=148) == 2
     assert _tq4_split_override(batch_size=1, max_seq_len=10_000, num_sms=148) == 64
-    assert _tq4_split_override(batch_size=8, max_seq_len=10_000, num_sms=148) == 9
+    assert _tq4_split_override(batch_size=8, max_seq_len=10_000, num_sms=148) == 64
+
+
+def test_tq4_kernel_max_seq_len_clamps_capture_padding_only():
+    assert _tq4_kernel_max_seq_len(32_768, 32_768) == 32_768
+    assert _tq4_kernel_max_seq_len(32_773, 32_768) == 32_768
+
+    with pytest.raises(ValueError, match="context_length <= 32768"):
+        _tq4_kernel_max_seq_len(32_769, 32_769)
+
+
+def test_tq4_workspace_tracks_fixed_split_graph_shape():
+    assert _tq4_workspace_bytes(8, 8, 512, 5, 64) == 42_024_960
+    assert _tq4_workspace_bytes(1, 8, 512, 5, 1) == 0
 
 
 def test_tq4_absorb_rotation_does_not_override_mha_prefill():

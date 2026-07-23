@@ -33,6 +33,8 @@ from inspect import signature
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
@@ -78,35 +80,145 @@ def _find_mla_turboquant_pool(token_to_kv_pool):
 
 
 def _tq4_split_override(batch_size: int, max_seq_len: int, num_sms: int) -> int:
+    # Keep graph-capture shapes on one compact CuTe specialization.  The
+    # packed conversion loop is specialized by tiles-per-split, so scaling
+    # the split count down with batch size creates a different, increasingly
+    # large unrolled kernel for every captured batch.  Sixty-four splits is
+    # already the c1 decode choice on GB200 and bounds the 32K conversion loop
+    # at four 128-token tiles for every graph shape.
+    del batch_size, num_sms
     tiles = (max_seq_len + 127) // 128
-    blocks_per_request = max(1, num_sms // max(1, batch_size) // 2)
-    return min(tiles, blocks_per_request, 64)
+    return min(tiles, 64)
+
+
+def _tq4_kernel_max_seq_len(requested: int, configured: int) -> int:
+    if configured > 32768:
+        raise ValueError(
+            "native TurboQuant MLA requires context_length <= 32768; "
+            f"got {configured}"
+        )
+    return min(requested, configured)
+
+
+def _tq4_workspace_bytes(
+    batch_size: int,
+    num_heads: int,
+    kv_lora_rank: int,
+    q_len: int,
+    split_kv: int,
+) -> int:
+    if split_kv == 1:
+        return 0
+    return batch_size * num_heads * q_len * split_kv * (kv_lora_rank + 1) * 4
+
+
+@triton.jit
+def _fp8_quantize_tq4_query_kernel(
+    x_ptr,
+    out_ptr,
+    m_rows,
+    x_row_stride,
+    out_row_stride,
+    LATENT_N: tl.constexpr,
+    ROPE_N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    m_idx = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = m_idx < m_rows
+    latent_idx = tl.arange(0, LATENT_N)
+    rope_idx = tl.arange(0, ROPE_N)
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    x_row = m_idx[:, None] * x_row_stride
+    out_row = m_idx[:, None] * out_row_stride
+    latent = tl.load(x_ptr + x_row + latent_idx[None, :], mask=m_mask[:, None])
+    rope = tl.load(
+        x_ptr + x_row + LATENT_N + rope_idx[None, :], mask=m_mask[:, None]
+    )
+    tl.store(
+        out_ptr + out_row + latent_idx[None, :],
+        latent.to(tl.float8e4nv),
+        mask=m_mask[:, None],
+    )
+    tl.store(
+        out_ptr + out_row + LATENT_N + rope_idx[None, :],
+        rope.to(tl.float8e4nv),
+        mask=m_mask[:, None],
+    )
+
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _quantize_tq4_query(
     query: torch.Tensor, kv_lora_rank: int, enable_pdl: bool
 ) -> torch.Tensor:
+    if kv_lora_rank != 512 or query.shape[-1] != 576:
+        raise ValueError(
+            "native TurboQuant query quantization requires latent/total "
+            f"dimensions 512/576; got {kv_lora_rank}/{query.shape[-1]}"
+        )
+    if query.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(
+            "native TurboQuant query quantization requires BF16/FP16 input; "
+            f"got {query.dtype}"
+        )
+    if query.stride(-1) != 1:
+        raise ValueError(
+            "native TurboQuant query quantization requires a contiguous "
+            f"inner dimension; got stride {query.stride()}"
+        )
+    for dim in range(query.ndim - 2):
+        expected_stride = query.shape[dim + 1] * query.stride(dim + 1)
+        if query.stride(dim) != expected_stride:
+            raise ValueError(
+                "native TurboQuant query quantization cannot flatten leading "
+                f"dimension {dim}: got stride {query.stride(dim)}, expected "
+                f"{expected_stride} for shape {tuple(query.shape)}"
+            )
     query_fp8 = torch.empty(
         query.shape, dtype=torch.float8_e4m3fn, device=query.device
     )
-    fp8_quantize(
-        query[..., :kv_lora_rank],
-        out=query_fp8[..., :kv_lora_rank],
-        enable_pdl=enable_pdl,
+    rows = query.numel() // query.shape[-1]
+    row_stride = query.stride(-2) if query.ndim > 1 else query.shape[-1]
+    out_row_stride = (
+        query_fp8.stride(-2) if query_fp8.ndim > 1 else query_fp8.shape[-1]
     )
-    fp8_quantize(
-        query[..., kv_lora_rank:],
-        out=query_fp8[..., kv_lora_rank:],
-        enable_pdl=enable_pdl,
+    block_m = 4 if rows <= 2048 else 16 if rows <= 16384 else 32
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _fp8_quantize_tq4_query_kernel[(triton.cdiv(rows, block_m),)](
+        query,
+        query_fp8,
+        rows,
+        row_stride,
+        out_row_stride,
+        LATENT_N=512,
+        ROPE_N=64,
+        BLOCK_M=block_m,
+        ENABLE_PDL=enable_pdl,
+        num_warps=4,
+        num_stages=2,
+        **extra_kwargs,
     )
     return query_fp8
 
 
 def _get_tokenspeed_workspace(
-    device: torch.device, num_heads: int, kv_lora_rank: int, q_len: int
+    device: torch.device,
+    num_heads: int,
+    kv_lora_rank: int,
+    q_len: int,
+    minimum_bytes: int = 0,
 ) -> torch.Tensor:
-    needed = tokenspeed_workspace_bytes(
-        tokenspeed_mla.get_num_sm(device), num_heads, kv_lora_rank, q_len
+    needed = max(
+        minimum_bytes,
+        tokenspeed_workspace_bytes(
+            tokenspeed_mla.get_num_sm(device), num_heads, kv_lora_rank, q_len
+        ),
     )
     existing = _g_tokenspeed_workspace.get(device)
     if existing is None or existing.numel() < needed:
@@ -154,6 +266,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 "native TurboQuant tokenspeed_mla requires page_size=32, "
                 f"got page_size={self.page_size}."
             )
+        if self._tq4_cache:
+            _tq4_kernel_max_seq_len(self.max_context_len, self.max_context_len)
         if not self._tq4_cache and self.page_size not in (32, 64):
             raise ValueError(
                 "tokenspeed_mla backend requires page_size in {32, 64}, "
@@ -168,11 +282,29 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
+            workspace_q_len = max(1, self.num_draft_tokens or 1)
+            tq4_minimum_bytes = 0
+            if self._tq4_cache:
+                decode_graph = model_runner.server_args.cuda_graph_config.decode
+                graph_max_batch = max(1, decode_graph.max_bs or 1)
+                graph_split_kv = _tq4_split_override(
+                    graph_max_batch,
+                    self.max_context_len,
+                    tokenspeed_mla.get_num_sm(self.device),
+                )
+                tq4_minimum_bytes = _tq4_workspace_bytes(
+                    graph_max_batch,
+                    self.num_q_heads,
+                    self.kv_lora_rank,
+                    workspace_q_len,
+                    graph_split_kv,
+                )
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
                 self.device,
                 self.num_q_heads,
                 self.kv_lora_rank,
-                max(1, self.num_draft_tokens or 1),
+                workspace_q_len,
+                minimum_bytes=tq4_minimum_bytes,
             )
 
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
@@ -331,20 +463,44 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             k_nope, k_pe, v, enable_pdl=is_arch_support_pdl()
         )
 
-    def _ensure_workspace(self, device: torch.device, q_len: int) -> torch.Tensor:
-        if (
-            self._tokenspeed_workspace is None
-            or self._tokenspeed_workspace.device != device
-            or self._tokenspeed_workspace.numel()
-            < tokenspeed_workspace_bytes(
+    def _ensure_workspace(
+        self,
+        device: torch.device,
+        q_len: int,
+        batch_size: int = 1,
+        split_kv: Optional[int] = None,
+    ) -> torch.Tensor:
+        tq4_minimum_bytes = (
+            _tq4_workspace_bytes(
+                batch_size,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                q_len,
+                split_kv,
+            )
+            if self._tq4_cache and split_kv is not None
+            else 0
+        )
+        needed = max(
+            tq4_minimum_bytes,
+            tokenspeed_workspace_bytes(
                 tokenspeed_mla.get_num_sm(device),
                 self.num_q_heads,
                 self.kv_lora_rank,
                 q_len,
-            )
+            ),
+        )
+        if (
+            self._tokenspeed_workspace is None
+            or self._tokenspeed_workspace.device != device
+            or self._tokenspeed_workspace.numel() < needed
         ):
             self._tokenspeed_workspace = _get_tokenspeed_workspace(
-                device, self.num_q_heads, self.kv_lora_rank, q_len
+                device,
+                self.num_q_heads,
+                self.kv_lora_rank,
+                q_len,
+                minimum_bytes=tq4_minimum_bytes,
             )
         return self._tokenspeed_workspace
 
@@ -387,11 +543,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         custom_mask_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self._tq4_cache:
-            if max_seq_len > 32768:
-                raise RuntimeError(
-                    "native TurboQuant MLA currently supports max_seq_len <= 32768; "
-                    f"got {max_seq_len}"
-                )
+            kernel_max_seq_len = _tq4_kernel_max_seq_len(
+                int(max_seq_len), self.max_context_len
+            )
             rotation_fused = getattr(
                 self._tq_config, "mla_absorb_rotation_fused", False
             )
@@ -423,7 +577,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
             split_kv = _tq4_split_override(
                 query.shape[0],
-                int(max_seq_len),
+                kernel_max_seq_len,
                 tokenspeed_mla.get_num_sm(query.device),
             )
             output = tokenspeed_mla.tokenspeed_mla_decode_tq4(
@@ -433,13 +587,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 kv_rope=rope,
                 centroids=self._tq_config.k_centroids,
                 workspace_buffer=self._ensure_workspace(
-                    query.device, query.shape[1]
+                    query.device,
+                    query.shape[1],
+                    batch_size=query.shape[0],
+                    split_kv=split_kv,
                 ),
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 block_tables=block_tables,
                 seq_lens=seq_lens_i32,
-                max_seq_len=int(max_seq_len),
+                max_seq_len=kernel_max_seq_len,
                 softmax_scale=float(layer.scaling),
                 enable_pdl=is_arch_support_pdl(),
                 custom_mask=custom_mask,
