@@ -2522,6 +2522,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             import re
 
             tq_str = self.server_args.kv_cache_dtype.split("_", 1)[1]
+            # Native E2M1 uses TurboQuant's rotation and norm correction, but
+            # persists actual SM100 FP4 nibble encodings instead of Lloyd bins.
+            self.turboquant_e2m1 = tq_str.endswith("_e2m1")
+            if self.turboquant_e2m1:
+                tq_str = tq_str.rsplit("_e2m1", 1)[0]
             # Check for uniform quantization suffix
             self.turboquant_uniform = tq_str.endswith("_uniform")
             if self.turboquant_uniform:
@@ -2538,6 +2543,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.turboquant_k_bits = bits
                 self.turboquant_v_bits = bits
                 self.turboquant_bits = bits
+            if self.turboquant_e2m1 and (
+                not self.use_mla_backend
+                or self.turboquant_k_bits != 4
+                or self.turboquant_v_bits != 4
+            ):
+                raise NotImplementedError(
+                    "turboquant_4bit_e2m1 currently requires an MLA model "
+                    "with symmetric 4-bit latent storage"
+                )
             self.kv_cache_dtype = torch.bfloat16
             # TurboQuant fused decode kernel is Triton-only and MHA-only (from PR #23135).
             # On the MLA path (e.g. Kimi K2.6, DeepSeek-V2), MLATokenToKVPoolTurboQuant
@@ -2546,8 +2560,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # triton decode backend here would route MLA decode through an MHA-only
             # kernel and produce garbage. Only override DECODE backend to triton on MHA.
             if not self.use_mla_backend:
-                if self.server_args.decode_attention_backend is None or \
-                   self.server_args.decode_attention_backend != "triton":
+                if (
+                    self.server_args.decode_attention_backend is None
+                    or self.server_args.decode_attention_backend != "triton"
+                ):
                     prev = self.server_args.decode_attention_backend or "default"
                     self.server_args.decode_attention_backend = "triton"
                     logger.info(
@@ -2564,9 +2580,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # On MLA path we never use the fused decode kernel, so CUDA graph stays
             # governed by the chosen MLA backend (flashmla, flashinfer-mla) — not by
             # has_fused. Only gate CUDA graph on the MHA path.
-            has_fused = (
-                self.turboquant_k_bits in (2, 4)
-                and self.turboquant_v_bits in (2, 4)
+            has_fused = self.turboquant_k_bits in (2, 4) and self.turboquant_v_bits in (
+                2,
+                4,
             )
             if not self.use_mla_backend and not has_fused:
                 if not self.server_args.disable_cuda_graph:
@@ -2698,7 +2714,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         head_dim = self.model_config.head_dim
         dummy = torch.randn(1, 1, head_dim, dtype=torch.float32, device=self.device)
-        scale = 1.0 / (head_dim ** 0.5)
+        scale = 1.0 / (head_dim**0.5)
         # Warm up JIT hadamard kernel
         hadamard_transform(dummy, scale=scale)
 
@@ -2710,14 +2726,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 
             cfg = TurboQuantConfig(
-                bit_width=4, head_dim=head_dim, device=self.device,
-                k_bit_width=self.turboquant_k_bits, v_bit_width=self.turboquant_v_bits,
-                uniform=getattr(self, 'turboquant_uniform', False),
+                bit_width=4,
+                head_dim=head_dim,
+                device=self.device,
+                k_bit_width=self.turboquant_k_bits,
+                v_bit_width=self.turboquant_v_bits,
+                uniform=getattr(self, "turboquant_uniform", False),
+                e2m1=getattr(self, "turboquant_e2m1", False),
             )
-            dummy_kv = torch.randn(1, 1, head_dim, dtype=torch.bfloat16, device=self.device)
+            dummy_kv = torch.randn(
+                1, 1, head_dim, dtype=torch.bfloat16, device=self.device
+            )
             fused_turboquant_quantize(
-                dummy_kv, cfg.signs1, cfg.signs2,
-                cfg.k_centroids, cfg.k_boundaries, 4,
+                dummy_kv,
+                cfg.signs1,
+                cfg.signs2,
+                cfg.k_quant_centroids,
+                cfg.k_boundaries,
+                4,
             )
 
     def _maybe_fuse_tq_output_rotation(self):
@@ -2731,6 +2757,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         import logging
+
         logger = logging.getLogger(__name__)
         if self.use_mla_backend:
             _, decode_attention_backend = self.server_args.get_attention_backends()
@@ -2832,9 +2859,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 continue
             w_kc = module.w_kc
             w_vc = module.w_vc
-            if not isinstance(w_kc, torch.Tensor) or not isinstance(
-                w_vc, torch.Tensor
-            ):
+            if not isinstance(w_kc, torch.Tensor) or not isinstance(w_vc, torch.Tensor):
                 rejected.append((name, "non-tensor absorb weights"))
                 continue
             if (
@@ -2881,7 +2906,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "w_kc/w_vc layer pairs.",
             len(candidates),
         )
-
 
     def maybe_init_ngram_embedding(self):
         self.use_ngram_embedding = self.model_config.use_ngram_embedding

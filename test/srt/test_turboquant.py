@@ -35,6 +35,7 @@ class TestTurboQuantCLI(unittest.TestCase):
             "turboquant_2bit",
             "turboquant_4bit",
             "turboquant_4bit_uniform",
+            "turboquant_4bit_e2m1",
             "turboquant_k4v2",
         ):
             args = parser.parse_args(
@@ -65,11 +66,60 @@ class TestTurboQuantCLI(unittest.TestCase):
         self.assertFalse(hasattr(runner, "turboquant_bits"))
         self.assertIsNone(server_args.decode_attention_backend)
 
+    def test_native_e2m1_cli_resolves_mla_format_contract(self):
+        import torch
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        server_args = SimpleNamespace(
+            kv_cache_dtype="turboquant_4bit_e2m1",
+            decode_attention_backend="tokenspeed_mla",
+            disable_cuda_graph=False,
+        )
+        runner = SimpleNamespace(
+            server_args=server_args,
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+            dtype=torch.bfloat16,
+            use_mla_backend=True,
+        )
+
+        ModelRunner.configure_kv_cache_dtype(runner)
+
+        self.assertTrue(runner.turboquant_e2m1)
+        self.assertFalse(runner.turboquant_uniform)
+        self.assertEqual(runner.turboquant_bits, 4)
+        self.assertEqual(runner.turboquant_k_bits, 4)
+        self.assertEqual(runner.turboquant_v_bits, 4)
+        self.assertIs(runner.kv_cache_dtype, torch.bfloat16)
+        self.assertEqual(server_args.decode_attention_backend, "tokenspeed_mla")
+
+    def test_native_e2m1_cli_rejects_mha(self):
+        import torch
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        runner = SimpleNamespace(
+            server_args=SimpleNamespace(
+                kv_cache_dtype="turboquant_4bit_e2m1",
+                decode_attention_backend=None,
+                disable_cuda_graph=False,
+            ),
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
+            dtype=torch.bfloat16,
+            use_mla_backend=False,
+        )
+
+        with self.assertRaisesRegex(NotImplementedError, "requires an MLA model"):
+            ModelRunner.configure_kv_cache_dtype(runner)
+
 
 class TestCodebook(unittest.TestCase):
 
     def test_1bit_centroids(self):
         from sglang.srt.layers.quantization.kv_turboquant import build_codebook
+
         centroids, boundaries = build_codebook(1, head_dim=128)
         self.assertEqual(len(centroids), 2)
         self.assertAlmostEqual(centroids[0], -centroids[1], places=6)
@@ -78,6 +128,7 @@ class TestCodebook(unittest.TestCase):
 
     def test_2bit_centroids(self):
         from sglang.srt.layers.quantization.kv_turboquant import build_codebook
+
         centroids, boundaries = build_codebook(2, head_dim=128)
         self.assertEqual(len(centroids), 4)
         for i in range(len(centroids) - 1):
@@ -85,14 +136,42 @@ class TestCodebook(unittest.TestCase):
 
     def test_4bit_lloyds(self):
         from sglang.srt.layers.quantization.kv_turboquant import build_codebook
+
         centroids, boundaries = build_codebook(4, head_dim=128)
         self.assertEqual(len(centroids), 16)
+
+    def test_e2m1_codebook_matches_hardware_encoding(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            E2M1_GAUSSIAN_SCALE,
+            build_e2m1_codebook,
+        )
+
+        quant, boundaries, decode, code_lut, scale = build_e2m1_codebook(512)
+
+        np.testing.assert_array_equal(
+            code_lut,
+            np.array([15, 14, 13, 12, 11, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7]),
+        )
+        self.assertTrue(np.signbit(decode[8]))
+        np.testing.assert_array_equal(
+            decode,
+            np.array(
+                [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
+                dtype=np.float32,
+            ),
+        )
+        np.testing.assert_allclose(quant, decode[code_lut] * scale, rtol=0, atol=0)
+        np.testing.assert_allclose(
+            boundaries, (quant[:-1] + quant[1:]) / 2, rtol=0, atol=0
+        )
+        self.assertAlmostEqual(scale, E2M1_GAUSSIAN_SCALE / math.sqrt(512))
 
 
 class TestTurboQuantConfig(unittest.TestCase):
 
     def test_config_creation_cpu(self):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
         cfg = TurboQuantConfig(bit_width=4, head_dim=128, device="cpu")
         self.assertEqual(cfg.bit_width, 4)
         self.assertEqual(cfg.k_centroids.shape[0], 16)
@@ -102,19 +181,68 @@ class TestTurboQuantConfig(unittest.TestCase):
 
     def test_signs_are_pm1(self):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
         cfg = TurboQuantConfig(bit_width=4, head_dim=128, device="cpu")
         self.assertTrue((cfg.signs1.abs() == 1.0).all())
         self.assertTrue((cfg.signs2.abs() == 1.0).all())
 
     def test_packed_dim_2bit(self):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
         cfg = TurboQuantConfig(bit_width=2, head_dim=128, device="cpu")
         self.assertEqual(cfg.k_packed_dim, 32)
 
     def test_packed_dim_4bit(self):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
         cfg = TurboQuantConfig(bit_width=4, head_dim=128, device="cpu")
         self.assertEqual(cfg.k_packed_dim, 64)
+
+    def test_native_e2m1_config_separates_quant_and_decode_order(self):
+        import torch
+
+        from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+        cfg = TurboQuantConfig(bit_width=4, head_dim=512, device="cpu", e2m1=True)
+
+        self.assertTrue(cfg.e2m1)
+        self.assertTrue(
+            torch.all(cfg.k_quant_centroids[1:] >= cfg.k_quant_centroids[:-1])
+        )
+        self.assertEqual(cfg.k_centroids[7].item(), 6.0)
+        self.assertEqual(cfg.k_centroids[15].item(), -6.0)
+        torch.testing.assert_close(
+            cfg.k_storage_code_lut,
+            torch.tensor(
+                [15, 14, 13, 12, 11, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7],
+                dtype=torch.uint8,
+            ),
+        )
+        self.assertAlmostEqual(
+            cfg.k_dequant_scale_multiplier,
+            0.48707925311412725 / math.sqrt(512),
+        )
+
+    def test_native_e2m1_rejects_incompatible_modes(self):
+        from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            TurboQuantConfig(
+                bit_width=4,
+                head_dim=512,
+                device="cpu",
+                uniform=True,
+                e2m1=True,
+            )
+        with self.assertRaisesRegex(ValueError, "symmetric 4-bit"):
+            TurboQuantConfig(
+                bit_width=4,
+                head_dim=512,
+                device="cpu",
+                k_bit_width=4,
+                v_bit_width=2,
+                e2m1=True,
+            )
 
     def test_mha_config_gate_skips_mla_pool(self):
         from sglang.srt.layers.quantization.kv_turboquant import (
@@ -172,6 +300,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
 
 try:
     import torch
+
     HAS_CUDA = torch.cuda.is_available()
 except ImportError:
     HAS_CUDA = False
@@ -183,6 +312,7 @@ class TestTurboQuantGPU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
+
         cls.device = "cuda"
         cls.configs = {}
         for bits in [2, 4]:
@@ -192,8 +322,10 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def _roundtrip(self, bits, tokens=64, heads=4):
         from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize, batched_quantize,
+            batched_dequantize,
+            batched_quantize,
         )
+
         cfg = self.configs[bits]
         torch.manual_seed(42)
         x = torch.randn(tokens, heads, 128, device=self.device, dtype=torch.bfloat16)
@@ -222,8 +354,10 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_wht_self_inverse(self):
         """Normalized WHT applied twice should return the original."""
-        from sglang.jit_kernel.hadamard import hadamard_transform
         import math
+
+        from sglang.jit_kernel.hadamard import hadamard_transform
+
         torch.manual_seed(0)
         x = torch.randn(8, 4, 128, device=self.device, dtype=torch.float32)
         scale = 1.0 / math.sqrt(128)
@@ -234,6 +368,7 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_packing_2bit(self):
         from sglang.srt.layers.quantization.kv_turboquant import batched_quantize
+
         cfg = self.configs[2]
         x = torch.randn(8, 4, 128, device=self.device, dtype=torch.bfloat16)
         packed, norms, quant_norms = batched_quantize(
@@ -244,6 +379,7 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_packing_4bit(self):
         from sglang.srt.layers.quantization.kv_turboquant import batched_quantize
+
         cfg = self.configs[4]
         x = torch.randn(8, 4, 128, device=self.device, dtype=torch.bfloat16)
         packed, norms, quant_norms = batched_quantize(
@@ -253,8 +389,10 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_zero_vector(self):
         from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize, batched_quantize,
+            batched_dequantize,
+            batched_quantize,
         )
+
         cfg = self.configs[4]
         x = torch.zeros(1, 1, 128, device=self.device, dtype=torch.bfloat16)
         packed, norms, quant_norms = batched_quantize(
@@ -267,8 +405,10 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_batch_consistency(self):
         from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize, batched_quantize,
+            batched_dequantize,
+            batched_quantize,
         )
+
         cfg = self.configs[4]
         torch.manual_seed(42)
         x = torch.randn(4, 2, 128, device=self.device, dtype=torch.bfloat16)
@@ -276,20 +416,31 @@ class TestTurboQuantGPU(unittest.TestCase):
         packed_b, norms_b, _ = batched_quantize(
             x, cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, 4
         )
-        hat_b = batched_dequantize(packed_b, norms_b, cfg.k_centroids, 4, cfg.signs1, cfg.signs2)
+        hat_b = batched_dequantize(
+            packed_b, norms_b, cfg.k_centroids, 4, cfg.signs1, cfg.signs2
+        )
 
         for i in range(4):
             packed_i, norms_i, _ = batched_quantize(
-                x[i:i+1], cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, 4
+                x[i : i + 1],
+                cfg.signs1,
+                cfg.signs2,
+                cfg.k_centroids,
+                cfg.k_boundaries,
+                4,
             )
-            hat_i = batched_dequantize(packed_i, norms_i, cfg.k_centroids, 4, cfg.signs1, cfg.signs2)
-            torch.testing.assert_close(hat_b[i:i+1], hat_i, atol=1e-4, rtol=0)
+            hat_i = batched_dequantize(
+                packed_i, norms_i, cfg.k_centroids, 4, cfg.signs1, cfg.signs2
+            )
+            torch.testing.assert_close(hat_b[i : i + 1], hat_i, atol=1e-4, rtol=0)
 
     def test_attention_score_preservation(self):
         """Verify Q@K^T scores are well-preserved after quantization."""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize, batched_quantize,
+            batched_dequantize,
+            batched_quantize,
         )
+
         cfg = self.configs[4]
         torch.manual_seed(42)
         Q = torch.randn(1, 4, 128, device=self.device, dtype=torch.bfloat16)
@@ -300,7 +451,9 @@ class TestTurboQuantGPU(unittest.TestCase):
         k_packed, k_norms, _ = batched_quantize(
             K, cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, 4
         )
-        K_hat = batched_dequantize(k_packed, k_norms, cfg.k_centroids, 4, cfg.signs1, cfg.signs2)
+        K_hat = batched_dequantize(
+            k_packed, k_norms, cfg.k_centroids, 4, cfg.signs1, cfg.signs2
+        )
         scores_quant = torch.matmul(Q.float(), K_hat.float().transpose(-2, -1))
 
         cos = torch.nn.functional.cosine_similarity(
@@ -311,8 +464,11 @@ class TestTurboQuantGPU(unittest.TestCase):
     def test_query_rotation_equivalence(self):
         """Verify Q_rot @ K_rotspace produces same scores as Q @ K_dequant."""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize, batched_dequantize_rotspace, batched_quantize,
+            batched_dequantize,
+            batched_dequantize_rotspace,
+            batched_quantize,
         )
+
         for bits in [2, 4]:
             cfg = self.configs[bits]
             torch.manual_seed(42)
@@ -328,32 +484,30 @@ class TestTurboQuantGPU(unittest.TestCase):
             K_hat = batched_dequantize(
                 k_packed, k_norms, cfg.k_centroids, bits, cfg.signs1, cfg.signs2
             )
-            scores_a = torch.einsum(
-                "qhd,khd->hqk", Q.float(), K_hat.float()
-            )
+            scores_a = torch.einsum("qhd,khd->hqk", Q.float(), K_hat.float())
 
             # Method B: Query Rotation + rotspace dequant (no inverse WHT)
             Q_rot = cfg.rotate_query(Q)
-            safe_k_qnorms = torch.where(k_quant_norms > 1e-10, k_quant_norms, torch.ones_like(k_quant_norms))
+            safe_k_qnorms = torch.where(
+                k_quant_norms > 1e-10, k_quant_norms, torch.ones_like(k_quant_norms)
+            )
             k_dequant_scale = k_norms / safe_k_qnorms
             K_rotspace = batched_dequantize_rotspace(
                 k_packed, k_dequant_scale, cfg.k_centroids, bits, head_dim=128
             )
-            scores_b = torch.einsum(
-                "qhd,khd->hqk", Q_rot.float(), K_rotspace.float()
-            )
+            scores_b = torch.einsum("qhd,khd->hqk", Q_rot.float(), K_rotspace.float())
 
             max_diff = (scores_a - scores_b).abs().max().item()
             cos = torch.nn.functional.cosine_similarity(
                 scores_a.flatten(), scores_b.flatten(), dim=0
             ).item()
             self.assertLess(
-                max_diff, 0.2,
-                f"{bits}-bit: Query rotation scores diverge: max_diff={max_diff:.4f}"
+                max_diff,
+                0.2,
+                f"{bits}-bit: Query rotation scores diverge: max_diff={max_diff:.4f}",
             )
             self.assertGreater(
-                cos, 0.99,
-                f"{bits}-bit: Query rotation scores diverge: cos={cos:.6f}"
+                cos, 0.99, f"{bits}-bit: Query rotation scores diverge: cos={cos:.6f}"
             )
 
     def test_output_inverse_rotation(self):
@@ -370,18 +524,12 @@ class TestTurboQuantGPU(unittest.TestCase):
         cfg = self.configs[4]
         torch.manual_seed(42)
         heads, batch, qk_dim, value_dim = 3, 5, 64, 80
-        w_kc = torch.randn(
-            heads, qk_dim, 128, device=self.device, dtype=torch.float32
-        )
+        w_kc = torch.randn(heads, qk_dim, 128, device=self.device, dtype=torch.float32)
         w_vc = torch.randn(
             heads, 128, value_dim, device=self.device, dtype=torch.float32
         )
-        q = torch.randn(
-            heads, batch, qk_dim, device=self.device, dtype=torch.float32
-        )
-        o = torch.randn(
-            heads, batch, 128, device=self.device, dtype=torch.float32
-        )
+        q = torch.randn(heads, batch, qk_dim, device=self.device, dtype=torch.float32)
+        o = torch.randn(heads, batch, 128, device=self.device, dtype=torch.float32)
 
         w_kc_rotated, w_vc_rotated = cfg.fuse_mla_absorb_rotations(w_kc, w_vc)
 
@@ -402,15 +550,16 @@ class TestTurboQuantGPU(unittest.TestCase):
         """Verify attention output equivalence for V side:
         D1@H@D2 @ sum(attn_i * V_rotspace_i) == sum(attn_i * V_dequant_i)"""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize, batched_dequantize_rotspace, batched_quantize,
+            batched_dequantize,
+            batched_dequantize_rotspace,
+            batched_quantize,
         )
+
         cfg = self.configs[4]
         torch.manual_seed(42)
         V = torch.randn(32, 4, 128, device=self.device, dtype=torch.bfloat16)
         # attn_weights: (1, 4, 32) — 1 query, 4 heads, 32 KV tokens
-        attn_weights = torch.softmax(
-            torch.randn(1, 4, 32, device=self.device), dim=-1
-        )
+        attn_weights = torch.softmax(torch.randn(1, 4, 32, device=self.device), dim=-1)
 
         v_packed, v_norms, v_quant_norms = batched_quantize(
             V, cfg.signs1, cfg.signs2, cfg.v_centroids, cfg.v_boundaries, 4
@@ -424,7 +573,9 @@ class TestTurboQuantGPU(unittest.TestCase):
         o_a = torch.einsum("qhk,khd->qhd", attn_weights, V_hat.float())
 
         # Method B: rotspace + inverse rotation on output
-        safe_v_qnorms = torch.where(v_quant_norms > 1e-10, v_quant_norms, torch.ones_like(v_quant_norms))
+        safe_v_qnorms = torch.where(
+            v_quant_norms > 1e-10, v_quant_norms, torch.ones_like(v_quant_norms)
+        )
         v_dequant_scale = v_norms / safe_v_qnorms
         V_rotspace = batched_dequantize_rotspace(
             v_packed, v_dequant_scale, cfg.v_centroids, 4, head_dim=128
@@ -434,20 +585,22 @@ class TestTurboQuantGPU(unittest.TestCase):
 
         max_diff = (o_a - o_b).abs().max().item()
         self.assertLess(
-            max_diff, 0.1,
-            f"V output rotspace equivalence failed: max_diff={max_diff:.4f}"
+            max_diff,
+            0.1,
+            f"V output rotspace equivalence failed: max_diff={max_diff:.4f}",
         )
 
     def test_fused_decode_kernel_correctness(self):
         """Verify fused TQ decode kernel matches PyTorch reference implementation."""
-        from sglang.srt.layers.quantization.kv_turboquant import (
-            batched_dequantize_rotspace, batched_quantize,
+        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+            decode_attention_fwd,
         )
         from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
             tq_decode_attention_fwd,
         )
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
-            decode_attention_fwd,
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            batched_dequantize_rotspace,
+            batched_quantize,
         )
 
         torch.manual_seed(42)
@@ -463,9 +616,15 @@ class TestTurboQuantGPU(unittest.TestCase):
             cfg = self.configs[bits]
 
             # Generate Q (already rotated) and raw K/V
-            Q = torch.randn(batch, q_heads, head_dim, device=self.device, dtype=torch.bfloat16)
-            K_raw = torch.randn(total_kv, kv_heads, head_dim, device=self.device, dtype=torch.bfloat16)
-            V_raw = torch.randn(total_kv, kv_heads, head_dim, device=self.device, dtype=torch.bfloat16)
+            Q = torch.randn(
+                batch, q_heads, head_dim, device=self.device, dtype=torch.bfloat16
+            )
+            K_raw = torch.randn(
+                total_kv, kv_heads, head_dim, device=self.device, dtype=torch.bfloat16
+            )
+            V_raw = torch.randn(
+                total_kv, kv_heads, head_dim, device=self.device, dtype=torch.bfloat16
+            )
 
             # Quantize K and V
             k_packed, k_norms, k_qnorms = batched_quantize(
@@ -476,32 +635,60 @@ class TestTurboQuantGPU(unittest.TestCase):
             )
 
             # Precompute dequant scales
-            safe_k_qn = torch.where(k_qnorms > 1e-10, k_qnorms, torch.ones_like(k_qnorms))
-            safe_v_qn = torch.where(v_qnorms > 1e-10, v_qnorms, torch.ones_like(v_qnorms))
+            safe_k_qn = torch.where(
+                k_qnorms > 1e-10, k_qnorms, torch.ones_like(k_qnorms)
+            )
+            safe_v_qn = torch.where(
+                v_qnorms > 1e-10, v_qnorms, torch.ones_like(v_qnorms)
+            )
             k_dscale = (k_norms / safe_k_qn).to(torch.bfloat16)
             v_dscale = (v_norms / safe_v_qn).to(torch.bfloat16)
 
             # Build kv_indptr and kv_indices (identity mapping: slot i = position i)
-            kv_indptr = torch.tensor([0, seq_lens[0], total_kv], dtype=torch.int32, device=self.device)
+            kv_indptr = torch.tensor(
+                [0, seq_lens[0], total_kv], dtype=torch.int32, device=self.device
+            )
             kv_indices = torch.arange(total_kv, dtype=torch.int64, device=self.device)
 
             # num_kv_splits
-            num_kv_splits = torch.full((batch,), max_kv_splits, dtype=torch.int32, device=self.device)
+            num_kv_splits = torch.full(
+                (batch,), max_kv_splits, dtype=torch.int32, device=self.device
+            )
 
             # --- Method A: Fused kernel ---
-            o_fused = torch.zeros(batch, q_heads, head_dim, device=self.device, dtype=torch.bfloat16)
-            attn_logits_a = torch.zeros(batch, q_heads, max_kv_splits, head_dim, device=self.device, dtype=torch.float32)
-            attn_lse_a = torch.zeros(batch, q_heads, max_kv_splits, device=self.device, dtype=torch.float32)
+            o_fused = torch.zeros(
+                batch, q_heads, head_dim, device=self.device, dtype=torch.bfloat16
+            )
+            attn_logits_a = torch.zeros(
+                batch,
+                q_heads,
+                max_kv_splits,
+                head_dim,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            attn_lse_a = torch.zeros(
+                batch, q_heads, max_kv_splits, device=self.device, dtype=torch.float32
+            )
 
             tq_decode_attention_fwd(
-                Q, k_packed, v_packed,
-                k_dscale, v_dscale,
+                Q,
+                k_packed,
+                v_packed,
+                k_dscale,
+                v_dscale,
                 cfg.k_centroids,
-                o_fused, kv_indptr, kv_indices,
-                attn_logits_a, attn_lse_a,
-                num_kv_splits, max_kv_splits,
-                sm_scale=1.0 / (head_dim ** 0.5),
-                bit_width=bits,
+                cfg.k_centroids,
+                o_fused,
+                kv_indptr,
+                kv_indices,
+                attn_logits_a,
+                attn_lse_a,
+                num_kv_splits,
+                max_kv_splits,
+                sm_scale=1.0 / (head_dim**0.5),
+                k_bit_width=bits,
+                v_bit_width=bits,
             )
 
             # --- Method B: PyTorch reference (rotspace dequant + standard attention) ---
@@ -511,17 +698,35 @@ class TestTurboQuantGPU(unittest.TestCase):
             V_dequant = batched_dequantize_rotspace(
                 v_packed, v_dscale, cfg.k_centroids, bits, head_dim=128
             )
-            o_ref = torch.zeros(batch, q_heads, head_dim, device=self.device, dtype=torch.bfloat16)
-            attn_logits_b = torch.zeros(batch, q_heads, max_kv_splits, head_dim, device=self.device, dtype=torch.float32)
-            attn_lse_b = torch.zeros(batch, q_heads, max_kv_splits, device=self.device, dtype=torch.float32)
+            o_ref = torch.zeros(
+                batch, q_heads, head_dim, device=self.device, dtype=torch.bfloat16
+            )
+            attn_logits_b = torch.zeros(
+                batch,
+                q_heads,
+                max_kv_splits,
+                head_dim,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            attn_lse_b = torch.zeros(
+                batch, q_heads, max_kv_splits, device=self.device, dtype=torch.float32
+            )
 
             decode_attention_fwd(
-                Q, K_dequant, V_dequant, o_ref,
-                kv_indptr, kv_indices,
-                attn_logits_b, attn_lse_b,
-                num_kv_splits, max_kv_splits,
-                sm_scale=1.0 / (head_dim ** 0.5),
-                k_scale=1.0, v_scale=1.0,
+                Q,
+                K_dequant,
+                V_dequant,
+                o_ref,
+                kv_indptr,
+                kv_indices,
+                attn_logits_b,
+                attn_lse_b,
+                num_kv_splits,
+                max_kv_splits,
+                sm_scale=1.0 / (head_dim**0.5),
+                k_scale=1.0,
+                v_scale=1.0,
             )
 
             # Compare
@@ -530,23 +735,27 @@ class TestTurboQuantGPU(unittest.TestCase):
                 o_fused.float().flatten(), o_ref.float().flatten(), dim=0
             ).item()
             self.assertLess(
-                max_diff, 0.1,
-                f"{bits}-bit fused kernel output diverged: max_diff={max_diff:.4f}"
+                max_diff,
+                0.1,
+                f"{bits}-bit fused kernel output diverged: max_diff={max_diff:.4f}",
             )
             self.assertGreater(
-                cos, 0.999,
-                f"{bits}-bit fused kernel output diverged: cos={cos:.6f}"
+                cos, 0.999, f"{bits}-bit fused kernel output diverged: cos={cos:.6f}"
             )
 
     def test_asymmetric_k4v2_roundtrip(self):
         """Verify K=4bit V=2bit asymmetric quantization roundtrip."""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            TurboQuantConfig, batched_quantize, batched_dequantize,
+            TurboQuantConfig,
+            batched_dequantize,
+            batched_quantize,
         )
-        cfg = TurboQuantConfig(bit_width=4, head_dim=128, device=self.device,
-                               k_bit_width=4, v_bit_width=2)
-        self.assertEqual(cfg.k_packed_dim, 64)   # 4-bit: dim//2
-        self.assertEqual(cfg.v_packed_dim, 32)    # 2-bit: dim//4
+
+        cfg = TurboQuantConfig(
+            bit_width=4, head_dim=128, device=self.device, k_bit_width=4, v_bit_width=2
+        )
+        self.assertEqual(cfg.k_packed_dim, 64)  # 4-bit: dim//2
+        self.assertEqual(cfg.v_packed_dim, 32)  # 2-bit: dim//4
         self.assertEqual(cfg.k_centroids.shape[0], 16)
         self.assertEqual(cfg.v_centroids.shape[0], 4)
 
@@ -555,37 +764,61 @@ class TestTurboQuantGPU(unittest.TestCase):
         V = torch.randn(16, 4, 128, device=self.device, dtype=torch.bfloat16)
 
         k_packed, k_norms, k_qnorms = batched_quantize(
-            K, cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, cfg.k_bit_width)
+            K,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            cfg.k_bit_width,
+        )
         v_packed, v_norms, v_qnorms = batched_quantize(
-            V, cfg.signs1, cfg.signs2, cfg.v_centroids, cfg.v_boundaries, cfg.v_bit_width)
+            V,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.v_centroids,
+            cfg.v_boundaries,
+            cfg.v_bit_width,
+        )
 
         self.assertEqual(k_packed.shape[-1], 64)
         self.assertEqual(v_packed.shape[-1], 32)
 
         # Use full dequant (with inverse WHT) to compare in original domain
         K_hat = batched_dequantize(
-            k_packed, k_norms, cfg.k_centroids, cfg.k_bit_width, cfg.signs1, cfg.signs2)
+            k_packed, k_norms, cfg.k_centroids, cfg.k_bit_width, cfg.signs1, cfg.signs2
+        )
         V_hat = batched_dequantize(
-            v_packed, v_norms, cfg.v_centroids, cfg.v_bit_width, cfg.signs1, cfg.signs2)
+            v_packed, v_norms, cfg.v_centroids, cfg.v_bit_width, cfg.signs1, cfg.signs2
+        )
 
         k_cos = torch.nn.functional.cosine_similarity(
-            K.float().reshape(-1), K_hat.float().reshape(-1), dim=0).item()
+            K.float().reshape(-1), K_hat.float().reshape(-1), dim=0
+        ).item()
         v_cos = torch.nn.functional.cosine_similarity(
-            V.float().reshape(-1), V_hat.float().reshape(-1), dim=0).item()
+            V.float().reshape(-1), V_hat.float().reshape(-1), dim=0
+        ).item()
         self.assertGreater(k_cos, 0.9, f"K 4-bit roundtrip cos too low: {k_cos:.4f}")
         self.assertGreater(v_cos, 0.5, f"V 2-bit roundtrip cos too low: {v_cos:.4f}")
 
     def test_move_kv_cache_dequant_correctness(self):
         """Verify data is correct after move_kv_cache."""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            TurboQuantConfig, batched_quantize, batched_dequantize_rotspace,
+            batched_dequantize_rotspace,
+            batched_quantize,
         )
+
         cfg = self.configs[4]
         torch.manual_seed(42)
         x = torch.randn(4, 8, 128, device=self.device, dtype=torch.bfloat16)
 
         packed, norms, qnorms = batched_quantize(
-            x, cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, cfg.k_bit_width)
+            x,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_centroids,
+            cfg.k_boundaries,
+            cfg.k_bit_width,
+        )
 
         # Simulate pool: write to positions 0-3, move to 10-13
         pool_packed = torch.zeros(20, 8, 64, dtype=torch.uint8, device=self.device)
@@ -605,9 +838,11 @@ class TestTurboQuantGPU(unittest.TestCase):
 
         # Dequant from moved positions
         hat_src = batched_dequantize_rotspace(
-            pool_packed[src], pool_dscale[src], cfg.k_centroids, 4, head_dim=128)
+            pool_packed[src], pool_dscale[src], cfg.k_centroids, 4, head_dim=128
+        )
         hat_tgt = batched_dequantize_rotspace(
-            pool_packed[tgt], pool_dscale[tgt], cfg.k_centroids, 4, head_dim=128)
+            pool_packed[tgt], pool_dscale[tgt], cfg.k_centroids, 4, head_dim=128
+        )
 
         torch.testing.assert_close(hat_src, hat_tgt, atol=1e-6, rtol=0)
 
@@ -802,8 +1037,7 @@ class TestTurboQuantGPU(unittest.TestCase):
         for pool in (legacy_pool, fused_pool, fused_rope_pool):
             scale = pool.kv_nope_scale_buffer[0][loc]
             expected_codebook = (
-                cfg.k_centroids.float().view(1, 1, 16)
-                * scale.float().unsqueeze(-1)
+                cfg.k_centroids.float().view(1, 1, 16) * scale.float().unsqueeze(-1)
             ).to(torch.float8_e4m3fn)
             torch.testing.assert_close(
                 pool.kv_nope_codebook_buffer[0][loc],
@@ -819,11 +1053,105 @@ class TestTurboQuantGPU(unittest.TestCase):
             fused_pool.kv_nope_codebook_buffer[0][dst], expected_codebook
         )
 
+    def test_mla_e2m1_fused_and_fallback_writers_match(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.kv_turboquant import batched_quantize
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        torch.manual_seed(20260723)
+        tokens = 11
+        pool_size = 32
+        lora_rank = 512
+        rope_dim = 64
+        loc = torch.tensor([1, 2, 4, 7, 8, 11, 16, 20, 21, 27, 30], device=self.device)
+        cache = torch.randn(
+            tokens,
+            1,
+            lora_rank + rope_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        layer = SimpleNamespace(layer_id=0)
+
+        def make_pool():
+            return MLATokenToKVPoolTurboQuant(
+                size=pool_size,
+                page_size=0,
+                dtype=torch.bfloat16,
+                kv_lora_rank=lora_rank,
+                qk_rope_head_dim=rope_dim,
+                layer_num=1,
+                device=self.device,
+                enable_memory_saver=False,
+                turboquant_bits=4,
+                turboquant_e2m1=True,
+                enable_fp8_codebook=True,
+                start_layer=0,
+                end_layer=0,
+            )
+
+        fallback_pool = make_pool()
+        fused_pool = make_pool()
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            fallback_pool.set_kv_buffer(layer, loc, cache, cache)
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
+            with envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.override(True):
+                fused_pool.set_kv_buffer(layer, loc, cache, cache)
+
+        cfg = fallback_pool.tq_config
+        expected_packed, norms, quant_norms = batched_quantize(
+            cache[..., :lora_rank].contiguous(),
+            cfg.signs1,
+            cfg.signs2,
+            cfg.k_quant_centroids,
+            cfg.k_boundaries,
+            4,
+            storage_code_lut=cfg.k_storage_code_lut,
+        )
+        safe_quant_norms = torch.where(
+            quant_norms > 1e-10, quant_norms, torch.ones_like(quant_norms)
+        )
+        expected_scale = (
+            (norms / safe_quant_norms) * cfg.k_dequant_scale_multiplier
+        ).to(torch.bfloat16)
+        expected_codebook = (
+            cfg.k_centroids.view(1, 1, 16) * expected_scale.float().unsqueeze(-1)
+        ).to(torch.float8_e4m3fn)
+
+        for pool in (fallback_pool, fused_pool):
+            torch.testing.assert_close(
+                pool.kv_nope_packed_buffer[0][loc], expected_packed
+            )
+            torch.testing.assert_close(
+                pool.kv_nope_scale_buffer[0][loc].float(),
+                expected_scale.float(),
+                rtol=1e-2,
+                atol=1e-2,
+            )
+            torch.testing.assert_close(
+                pool.kv_nope_codebook_buffer[0][loc],
+                expected_codebook.view(torch.uint8),
+            )
+            reconstructed = pool._dequant_nope(
+                pool.kv_nope_packed_buffer[0][loc],
+                pool.kv_nope_scale_buffer[0][loc],
+            )
+            cosine = torch.nn.functional.cosine_similarity(
+                cache[..., :lora_rank].float().flatten(),
+                reconstructed.float().flatten(),
+                dim=0,
+            ).item()
+            self.assertGreater(cosine, 0.99)
+
     def test_non_128_head_dim(self):
         """Verify TurboQuant works with head_dim=64 and head_dim=256."""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            TurboQuantConfig, batched_quantize, batched_dequantize, batched_dequantize_rotspace,
+            TurboQuantConfig,
+            batched_dequantize,
+            batched_dequantize_rotspace,
+            batched_quantize,
         )
+
         for dim in [64, 256]:
             for bits in [2, 4]:
                 cfg = TurboQuantConfig(bit_width=bits, head_dim=dim, device=self.device)
@@ -831,25 +1159,33 @@ class TestTurboQuantGPU(unittest.TestCase):
                 x = torch.randn(8, 4, dim, device=self.device, dtype=torch.bfloat16)
 
                 packed, norms, qnorms = batched_quantize(
-                    x, cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, bits)
+                    x, cfg.signs1, cfg.signs2, cfg.k_centroids, cfg.k_boundaries, bits
+                )
 
                 # Full dequant roundtrip
                 x_hat = batched_dequantize(
-                    packed, norms, cfg.k_centroids, bits, cfg.signs1, cfg.signs2)
-                self.assertEqual(x_hat.shape, x.shape,
-                    f"dim={dim} bits={bits}: shape mismatch {x_hat.shape} vs {x.shape}")
+                    packed, norms, cfg.k_centroids, bits, cfg.signs1, cfg.signs2
+                )
+                self.assertEqual(
+                    x_hat.shape,
+                    x.shape,
+                    f"dim={dim} bits={bits}: shape mismatch {x_hat.shape} vs {x.shape}",
+                )
 
                 cos = torch.nn.functional.cosine_similarity(
-                    x.float().reshape(-1), x_hat.float().reshape(-1), dim=0).item()
+                    x.float().reshape(-1), x_hat.float().reshape(-1), dim=0
+                ).item()
                 min_cos = 0.5 if bits == 2 else 0.93
-                self.assertGreater(cos, min_cos,
-                    f"dim={dim} bits={bits}: cos={cos:.4f} < {min_cos}")
+                self.assertGreater(
+                    cos, min_cos, f"dim={dim} bits={bits}: cos={cos:.4f} < {min_cos}"
+                )
 
                 # Rotspace dequant
                 safe_qn = torch.where(qnorms > 1e-10, qnorms, torch.ones_like(qnorms))
                 ds = (norms / safe_qn).to(torch.bfloat16)
                 rs = batched_dequantize_rotspace(
-                    packed, ds, cfg.k_centroids, bits, head_dim=dim)
+                    packed, ds, cfg.k_centroids, bits, head_dim=dim
+                )
                 self.assertEqual(rs.shape[-1], dim)
 
 

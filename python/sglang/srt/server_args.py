@@ -576,6 +576,7 @@ class ServerArgs:
                 "turboquant_2bit",
                 "turboquant_4bit",
                 "turboquant_4bit_uniform",
+                "turboquant_4bit_e2m1",
                 "turboquant_k4v2",
             ],
             resolvable=True,
@@ -6603,9 +6604,9 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert self.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
+            assert (
+                self.disable_overlap_schedule
+            ), "Pipeline parallelism is not compatible with overlap schedule"
             if self.speculative_algorithm is not None:
                 assert self._supports_pipeline_parallel_speculative_decoding(), (
                     "Pipeline parallel speculative decoding is currently supported "

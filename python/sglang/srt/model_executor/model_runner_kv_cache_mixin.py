@@ -887,9 +887,9 @@ class ModelRunnerKVCacheMixin:
                     turboquant_k_bits=getattr(self, "turboquant_k_bits", 0),
                     turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
                     turboquant_uniform=getattr(self, "turboquant_uniform", False),
+                    turboquant_e2m1=getattr(self, "turboquant_e2m1", False),
                     enable_fp8_codebook=(
-                        self.server_args.get_attention_backends()[1]
-                        == "tokenspeed_mla"
+                        self.server_args.get_attention_backends()[1] == "tokenspeed_mla"
                     ),
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
@@ -1061,9 +1061,9 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 if hasattr(self, "turboquant_bits"):
-                    assert not enable_page_major, (
-                        "page-major KV layout is not supported with TurboQuant KV cache"
-                    )
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with TurboQuant KV cache"
                     from sglang.srt.mem_cache.memory_pool import (
                         MHATokenToKVPoolTurboQuant,
                     )
@@ -1087,9 +1087,9 @@ class ModelRunnerKVCacheMixin:
                         end_layer=self.end_layer,
                     )
                 elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert not enable_page_major, (
-                        "page-major KV layout is not supported with fp4 KV cache"
-                    )
+                    assert (
+                        not enable_page_major
+                    ), "page-major KV layout is not supported with fp4 KV cache"
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,

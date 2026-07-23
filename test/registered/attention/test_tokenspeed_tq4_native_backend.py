@@ -4,12 +4,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required"),
     pytest.mark.skipif(
-        not torch.cuda.is_available()
-        or torch.cuda.get_device_capability()[0] != 10,
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
         reason="native TQ4 decode requires SM100",
     ),
 ]
@@ -19,10 +17,12 @@ pytestmark = [
     ("context", "query_length"),
     ((128, 1), (129, 5)),
 )
+@pytest.mark.parametrize("e2m1", (False, True), ids=("lloyd", "e2m1"))
 def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
-    context, query_length
+    context, query_length, e2m1
 ):
     import tokenspeed_mla
+    from tokenspeed_mla.tq4_contract import dequantize_tq4_reference
 
     from sglang.srt.layers.attention.tokenspeed_mla_backend import (
         TokenspeedMLABackend,
@@ -32,7 +32,6 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         TurboQuantConfig,
         batched_quantize,
     )
-    from tokenspeed_mla.tq4_contract import dequantize_tq4_reference
 
     if not hasattr(tokenspeed_mla, "tokenspeed_mla_decode_tq4"):
         pytest.skip("installed tokenspeed_mla has no native TQ4 entry point")
@@ -48,7 +47,7 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
     latent = 512
     rope_dim = 64
 
-    config = TurboQuantConfig(4, latent, str(device))
+    config = TurboQuantConfig(4, latent, str(device), e2m1=e2m1)
     config.mla_absorb_rotation_fused = True
     latent_original = torch.randn(
         tokens, 1, latent, device=device, dtype=torch.bfloat16
@@ -57,21 +56,21 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         latent_original,
         config.signs1,
         config.signs2,
-        config.k_centroids,
+        config.k_quant_centroids,
         config.k_boundaries,
         4,
+        storage_code_lut=config.k_storage_code_lut,
     )
     safe_quant_norms = torch.where(
         quant_norms > 1e-10, quant_norms, torch.ones_like(quant_norms)
     )
-    dequant_scale = (norms / safe_quant_norms).to(torch.bfloat16)
-    codebook = (
-        config.k_centroids.float().view(1, 1, 16)
-        * dequant_scale.float().unsqueeze(-1)
-    ).to(torch.float8_e4m3fn)
-    rope = torch.randn(
-        tokens, 1, rope_dim, device=device, dtype=torch.bfloat16
+    dequant_scale = ((norms / safe_quant_norms) * config.k_dequant_scale_multiplier).to(
+        torch.bfloat16
     )
+    codebook = (
+        config.k_centroids.float().view(1, 1, 16) * dequant_scale.float().unsqueeze(-1)
+    ).to(torch.float8_e4m3fn)
+    rope = torch.randn(tokens, 1, rope_dim, device=device, dtype=torch.bfloat16)
 
     pool = SimpleNamespace(
         start_layer=0,
@@ -104,9 +103,7 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
     query_rope = torch.randn(
         1, query_length, heads, rope_dim, device=device, dtype=torch.bfloat16
     )
-    query_rotated = torch.cat(
-        (config.rotate_query(query_original), query_rope), dim=-1
-    )
+    query_rotated = torch.cat((config.rotate_query(query_original), query_rope), dim=-1)
     page_table = torch.randperm(pages, device=device, dtype=torch.int32).view(1, -1)
     seq_lens = torch.tensor([context], device=device, dtype=torch.int32)
 
@@ -125,9 +122,7 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         config.k_centroids,
         dtype=torch.float32,
     )
-    dense_cache = torch.cat((latent_rotated, rope), dim=-1).to(
-        torch.float8_e4m3fn
-    )
+    dense_cache = torch.cat((latent_rotated, rope), dim=-1).to(torch.float8_e4m3fn)
     expected = tokenspeed_mla.tokenspeed_mla_decode(
         query=_quantize_tq4_query(query_rotated, latent, enable_pdl=True),
         kv_cache=dense_cache.view(pages, page_size, latent + rope_dim),
@@ -151,9 +146,7 @@ def test_tq4_query_quantization_fuses_latent_and_rope_casts(query_length):
     )
 
     torch.manual_seed(20260723)
-    query = torch.randn(
-        1, query_length, 8, 576, device="cuda", dtype=torch.bfloat16
-    )
+    query = torch.randn(1, query_length, 8, 576, device="cuda", dtype=torch.bfloat16)
     expected = torch.empty_like(query, dtype=torch.float8_e4m3fn)
     fp8_quantize(query[..., :512], out=expected[..., :512], enable_pdl=True)
     fp8_quantize(query[..., 512:], out=expected[..., 512:], enable_pdl=True)

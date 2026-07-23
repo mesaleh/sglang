@@ -19,7 +19,37 @@ import math
 import numpy as np
 import torch
 
+E2M1_GAUSSIAN_SCALE = 0.48707925311412725
+"""MSE-optimal E2M1 grid scale for a standard normal distribution."""
 
+E2M1_VALUES_BY_CODE = np.array(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        -0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=np.float32,
+)
+"""Numeric E2M1 values indexed by the SM100 four-bit storage encoding."""
+
+E2M1_SORTED_CODE_LUT = np.array(
+    [15, 14, 13, 12, 11, 10, 9, 8, 0, 1, 2, 3, 4, 5, 6, 7],
+    dtype=np.uint8,
+)
+"""Map a sorted quantization-bin index to the corresponding E2M1 code."""
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +117,39 @@ def build_codebook(bit_width: int, head_dim: int, uniform: bool = False):
     return centroids.astype(np.float32), boundaries.astype(np.float32)
 
 
+def build_e2m1_codebook(head_dim: int):
+    """Build the quantization and storage tables for native E2M1 cache values.
+
+    TurboQuant rotates a unit vector whose coordinates are approximately
+    ``N(0, 1 / head_dim)``. Bin selection therefore uses a scaled, sorted E2M1
+    grid. Persistent nibbles use the hardware encoding instead of sorted-bin
+    numbers, and the stored token scale absorbs the grid scale so native MMA
+    observes ``E2M1_VALUES_BY_CODE[code] * token_scale``.
+
+    Returns:
+        quant_centroids: sorted and Gaussian-scaled values used for binning.
+        boundaries: midpoints between sorted quantization centroids.
+        decode_centroids: raw E2M1 values indexed by persistent nibble code.
+        storage_code_lut: sorted-bin index to persistent nibble code.
+        dequant_scale_multiplier: factor applied to the ordinary norm-correction
+            scale before it is stored.
+    """
+    if head_dim <= 0:
+        raise ValueError(f"head_dim must be positive, got {head_dim}")
+
+    grid_scale = E2M1_GAUSSIAN_SCALE / math.sqrt(head_dim)
+    sorted_values = E2M1_VALUES_BY_CODE[E2M1_SORTED_CODE_LUT]
+    quant_centroids = sorted_values * grid_scale
+    boundaries = (quant_centroids[:-1] + quant_centroids[1:]) / 2.0
+    return (
+        quant_centroids.astype(np.float32),
+        boundaries.astype(np.float32),
+        E2M1_VALUES_BY_CODE.copy(),
+        E2M1_SORTED_CODE_LUT.copy(),
+        grid_scale,
+    )
+
+
 # ---------------------------------------------------------------------------
 # GPU quantize / dequantize
 # ---------------------------------------------------------------------------
@@ -103,6 +166,7 @@ def batched_quantize(
     centroids: torch.Tensor,
     boundaries: torch.Tensor,
     bit_width: int,
+    storage_code_lut: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize KV tensors to packed uint8 + norms + quant_norms.
 
@@ -113,6 +177,9 @@ def batched_quantize(
         centroids: (2^b,) float32.
         boundaries: (2^b - 1,) float32.
         bit_width: 2 or 4.
+        storage_code_lut: optional uint8 table mapping sorted quantization-bin
+            indices to persistent nibble encodings. Native E2M1 uses this to
+            store hardware codes instead of sorted-bin numbers.
 
     Returns:
         packed: (tokens, heads, packed_dim) uint8.
@@ -146,14 +213,20 @@ def batched_quantize(
     quant_norms = torch.linalg.norm(centroid_vals, dim=-1)  # (tokens, heads)
 
     # 6. Pack indices
-    indices_u8 = indices.to(torch.uint8)
+    if storage_code_lut is not None:
+        if bit_width != 4:
+            raise ValueError("storage_code_lut is supported only for 4-bit packing")
+        if storage_code_lut.shape != (16,) or storage_code_lut.dtype != torch.uint8:
+            raise ValueError("storage_code_lut must be a uint8 tensor with shape (16,)")
+        if storage_code_lut.device != indices.device:
+            raise ValueError("storage_code_lut must share the quantized tensor device")
+        indices_u8 = storage_code_lut[indices.long()]
+    else:
+        indices_u8 = indices.to(torch.uint8)
     if bit_width == 2:
         idx = indices_u8.view(tokens, heads, dim // 4, 4)
         packed = (
-            (idx[..., 3] << 6)
-            | (idx[..., 2] << 4)
-            | (idx[..., 1] << 2)
-            | idx[..., 0]
+            (idx[..., 3] << 6) | (idx[..., 2] << 4) | (idx[..., 1] << 2) | idx[..., 0]
         )
     elif bit_width == 4:
         idx = indices_u8.view(tokens, heads, dim // 2, 2)
@@ -213,7 +286,9 @@ def batched_dequantize(
 
     # 3. Norm correction: normalize y_hat back to unit norm
     y_hat_norm = torch.linalg.norm(y_hat, dim=-1, keepdim=True)
-    y_hat_norm = torch.where(y_hat_norm > 1e-10, y_hat_norm, torch.ones_like(y_hat_norm))
+    y_hat_norm = torch.where(
+        y_hat_norm > 1e-10, y_hat_norm, torch.ones_like(y_hat_norm)
+    )
     y_hat = y_hat / y_hat_norm
 
     # 4. Inverse WHT rotation: D1 @ H_norm @ D2 (reverse order, scale=1/√d)
@@ -294,26 +369,62 @@ class TurboQuantConfig:
         k_bit_width: int = 0,
         v_bit_width: int = 0,
         uniform: bool = False,
+        e2m1: bool = False,
     ):
         self.head_dim = head_dim
         self.k_bit_width = k_bit_width or bit_width
         self.v_bit_width = v_bit_width or bit_width
         self.bit_width = bit_width  # backwards compat (= k_bit_width)
         self.uniform = uniform
+        self.e2m1 = e2m1
+
+        if e2m1 and uniform:
+            raise ValueError(
+                "native E2M1 and uniform TurboQuant are mutually exclusive"
+            )
+        if e2m1 and (self.k_bit_width != 4 or self.v_bit_width != 4):
+            raise ValueError("native E2M1 TurboQuant requires symmetric 4-bit K/V")
 
         # K codebook
-        k_c_np, k_b_np = build_codebook(self.k_bit_width, head_dim, uniform=uniform)
+        if e2m1:
+            (
+                k_qc_np,
+                k_b_np,
+                k_c_np,
+                k_lut_np,
+                k_scale_multiplier,
+            ) = build_e2m1_codebook(head_dim)
+        else:
+            k_c_np, k_b_np = build_codebook(self.k_bit_width, head_dim, uniform=uniform)
+            k_qc_np = k_c_np
+            k_lut_np = None
+            k_scale_multiplier = 1.0
         self.k_centroids = torch.tensor(k_c_np, dtype=torch.float32, device=device)
+        self.k_quant_centroids = torch.tensor(
+            k_qc_np, dtype=torch.float32, device=device
+        )
         self.k_boundaries = torch.tensor(k_b_np, dtype=torch.float32, device=device)
+        self.k_storage_code_lut = (
+            torch.tensor(k_lut_np, dtype=torch.uint8, device=device)
+            if k_lut_np is not None
+            else None
+        )
+        self.k_dequant_scale_multiplier = k_scale_multiplier
 
         # V codebook (may differ from K)
         if self.v_bit_width == self.k_bit_width:
             self.v_centroids = self.k_centroids
+            self.v_quant_centroids = self.k_quant_centroids
             self.v_boundaries = self.k_boundaries
+            self.v_storage_code_lut = self.k_storage_code_lut
+            self.v_dequant_scale_multiplier = self.k_dequant_scale_multiplier
         else:
             v_c_np, v_b_np = build_codebook(self.v_bit_width, head_dim, uniform=uniform)
             self.v_centroids = torch.tensor(v_c_np, dtype=torch.float32, device=device)
+            self.v_quant_centroids = self.v_centroids
             self.v_boundaries = torch.tensor(v_b_np, dtype=torch.float32, device=device)
+            self.v_storage_code_lut = None
+            self.v_dequant_scale_multiplier = 1.0
 
         # WHT sign vectors (shared for K and V)
         rng = np.random.default_rng(seed)
@@ -329,17 +440,25 @@ class TurboQuantConfig:
         )
 
         # K packed dim/dtype
-        self.k_packed_dim, self.k_packed_dtype = self._packed_params(self.k_bit_width, head_dim)
+        self.k_packed_dim, self.k_packed_dtype = self._packed_params(
+            self.k_bit_width, head_dim
+        )
         # V packed dim/dtype
-        self.v_packed_dim, self.v_packed_dtype = self._packed_params(self.v_bit_width, head_dim)
+        self.v_packed_dim, self.v_packed_dtype = self._packed_params(
+            self.v_bit_width, head_dim
+        )
 
     @staticmethod
     def _packed_params(bits, head_dim):
         if bits == 2:
-            assert head_dim % 4 == 0, f"2-bit requires head_dim divisible by 4, got {head_dim}"
+            assert (
+                head_dim % 4 == 0
+            ), f"2-bit requires head_dim divisible by 4, got {head_dim}"
             return head_dim // 4, torch.uint8
         elif bits == 4:
-            assert head_dim % 2 == 0, f"4-bit requires head_dim divisible by 2, got {head_dim}"
+            assert (
+                head_dim % 2 == 0
+            ), f"4-bit requires head_dim divisible by 2, got {head_dim}"
             return head_dim // 2, torch.uint8
         else:
             raise ValueError(f"Unsupported bit_width: {bits}. Use 2 or 4.")
@@ -354,8 +473,11 @@ class TurboQuantConfig:
             q_rot: same shape and dtype as q, in WHT-rotated domain.
         """
         from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+
         wht_scale = 1.0 / math.sqrt(self.head_dim)
-        return hadamard_transform_with_signs(q, self.signs1, self.signs2, scale=wht_scale)
+        return hadamard_transform_with_signs(
+            q, self.signs1, self.signs2, scale=wht_scale
+        )
 
     def inverse_rotate_output(self, o: torch.Tensor) -> torch.Tensor:
         """Apply inverse WHT rotation to attention output: O = D1 @ H_norm @ D2 @ O_rot.
@@ -367,8 +489,11 @@ class TurboQuantConfig:
             o_orig: same shape and dtype as o, in original domain.
         """
         from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+
         wht_scale = 1.0 / math.sqrt(self.head_dim)
-        return hadamard_transform_with_signs(o, self.signs2, self.signs1, scale=wht_scale)
+        return hadamard_transform_with_signs(
+            o, self.signs2, self.signs1, scale=wht_scale
+        )
 
     def fuse_mla_absorb_rotations(
         self,
@@ -409,12 +534,16 @@ class TurboQuantConfig:
             )
 
         w_kc_rotated = self.rotate_query(w_kc.contiguous())
-        w_vc_rotated = self.rotate_query(
-            w_vc.transpose(-2, -1).contiguous()
-        ).transpose(-2, -1).contiguous()
+        w_vc_rotated = (
+            self.rotate_query(w_vc.transpose(-2, -1).contiguous())
+            .transpose(-2, -1)
+            .contiguous()
+        )
         return w_kc_rotated, w_vc_rotated
 
-    def fuse_inverse_rotation_into_o_proj(self, o_proj_weight: torch.Tensor, num_heads: int) -> torch.Tensor:
+    def fuse_inverse_rotation_into_o_proj(
+        self, o_proj_weight: torch.Tensor, num_heads: int
+    ) -> torch.Tensor:
         """Absorb inverse WHT rotation into o_proj weight matrix.
 
         Pre-computes W_O_rot so that: o_rot @ W_O_rot = inv_WHT(o_rot) @ W_O
@@ -428,6 +557,7 @@ class TurboQuantConfig:
             Transformed weight with inverse rotation baked in.
         """
         from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+
         device = o_proj_weight.device
         dtype = o_proj_weight.dtype
         dim = self.head_dim
@@ -442,7 +572,9 @@ class TurboQuantConfig:
         # Reshape to (num_heads * hidden, dim), apply WHT, reshape back
         w_t = w.permute(0, 2, 1).contiguous().reshape(-1, dim)  # (heads*hidden, dim)
         wht_scale = 1.0 / math.sqrt(dim)
-        w_rot = hadamard_transform_with_signs(w_t, self.signs1, self.signs2, scale=wht_scale)
+        w_rot = hadamard_transform_with_signs(
+            w_t, self.signs1, self.signs2, scale=wht_scale
+        )
         w_rot = w_rot.reshape(num_heads, hidden, dim).permute(0, 2, 1).contiguous()
         return w_rot.reshape(num_heads * dim, hidden).to(dtype)
 
