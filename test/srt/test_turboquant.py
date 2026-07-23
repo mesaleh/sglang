@@ -114,6 +114,17 @@ class TestTurboQuantCLI(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "requires an MLA model"):
             ModelRunner.configure_kv_cache_dtype(runner)
 
+    @patch("sglang.srt.arg_groups.overrides.is_blackwell_supported", return_value=True)
+    def test_native_e2m1_is_allowed_by_tokenspeed_backend(self, _):
+        from sglang.srt.arg_groups.overrides import _mla_kv_cache_dtype_checks
+
+        view = SimpleNamespace(
+            attention_backend="tokenspeed_mla",
+            decode_attention_backend="tokenspeed_mla",
+            kv_cache_dtype="turboquant_4bit_e2m1",
+        )
+        self.assertEqual(_mla_kv_cache_dtype_checks(view), {})
+
 
 class TestCodebook(unittest.TestCase):
 
