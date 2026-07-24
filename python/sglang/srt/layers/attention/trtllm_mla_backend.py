@@ -1218,7 +1218,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
-        if self.data_type == torch.float8_e4m3fn:
+        use_fp8_frontend = self.data_type == torch.float8_e4m3fn
+        if not use_fp8_frontend and getattr(
+            self, "_tq4_hotcold_cache", False
+        ):
+            use_fp8_frontend = self.should_use_hot_fp8_frontend(forward_batch)
+        if use_fp8_frontend:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
@@ -1261,7 +1266,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
             query = query.to(self.q_data_type) * llama_4_scaling
-            query = query.to(self.data_type)
+            query = query.to(
+                torch.float8_e4m3fn if use_fp8_frontend else self.data_type
+            )
 
         # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
         if query.dim() == 3:
@@ -1346,8 +1353,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
+        use_fp8_frontend = self.data_type == torch.float8_e4m3fn
+        if not use_fp8_frontend and getattr(
+            self, "_tq4_hotcold_cache", False
+        ):
+            use_fp8_frontend = self.should_use_hot_fp8_frontend(forward_batch)
         if (
-            self.data_type == torch.float8_e4m3fn
+            use_fp8_frontend
         ) and forward_batch.forward_mode.is_target_verify():
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -1391,7 +1403,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Apply llama 4 scaling if provided
         if llama_4_scaling is not None:
             q = q.to(self.q_data_type) * llama_4_scaling
-            q = q.to(self.data_type)
+            # The hot/cold TurboQuant pool uses BF16 as its carrier dtype, but
+            # its hot tier intentionally reuses the incumbent fused FP8
+            # frontend and FP8 TokenSpeed kernel.  Casting that query back to
+            # the carrier dtype here would add a BF16 cast plus a second FP8
+            # quantization in every target-verify layer.
+            q = q.to(
+                torch.float8_e4m3fn if use_fp8_frontend else self.data_type
+            )
 
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -1416,7 +1435,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
             kv_cache = self._get_decode_kv_cache(layer)
 
-            q = q.to(self.data_type)
+            # Keep the fused FP8 query in FP8 for the hot TurboQuant tier.
+            # Its pool carrier dtype is BF16, so using self.data_type here
+            # would undo the fused frontend and force the TokenSpeed override
+            # to quantize the query a second time in every layer.
+            q = q.to(
+                torch.float8_e4m3fn if use_fp8_frontend else self.data_type
+            )
 
             if forward_batch.forward_mode.is_target_verify():
                 max_seq_len = (

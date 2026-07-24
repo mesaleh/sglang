@@ -290,3 +290,139 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(
             kv_cache_cpu, indices, mamba_indices=mamba_indices
         )
+
+
+class StaticTieredPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
+    """Single-request allocator for a statically tiered paged KV cache.
+
+    The hot/cold TurboQuant pool maps logical pages ``[0, hot_pages)`` to the
+    FP8 store and the remaining logical pages to the compact store.  That
+    mapping is only valid when physical pages are allocated in logical order.
+    The stock allocator deliberately reuses freed pages in queue order when
+    radix caching is disabled, so a completed or retracted request can
+    otherwise make a later logical hot page land in the cold physical range.
+
+    This allocator restores and checks the stronger invariant required by the
+    static single-owner pool:
+
+    * exactly one request may allocate at a time;
+    * every allocation consumes the globally lowest free physical pages;
+    * newly allocated page IDs must equal their one-based logical page IDs.
+
+    The invariant checks use ``torch._assert_async`` so page-boundary decode
+    does not introduce a device-to-host synchronization.  A violation traps
+    before the allocation kernel and therefore before any layer can mutate KV.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+        need_sort: bool,
+        hot_capacity_tokens: int,
+    ):
+        if hot_capacity_tokens <= 0 or hot_capacity_tokens >= size:
+            raise ValueError(
+                "static tiered allocator requires 0 < hot_capacity_tokens < size; "
+                f"got hot={hot_capacity_tokens}, size={size}"
+            )
+        if hot_capacity_tokens % page_size:
+            raise ValueError(
+                "static tiered allocator hot capacity must be page aligned; "
+                f"got hot={hot_capacity_tokens}, page_size={page_size}"
+            )
+        self.hot_capacity_tokens = hot_capacity_tokens
+        self.hot_page_count = hot_capacity_tokens // page_size
+        # Always defer frees through release_pages and merge them in sorted
+        # order before the next allocation.  The caller's disaggregation sort
+        # setting is irrelevant because this allocator rejects disaggregation.
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kvcache,
+            need_sort=True,
+        )
+
+    def _merge_all_free_pages(self) -> None:
+        if len(self.release_pages) > 0:
+            self.free_pages = torch.cat((self.free_pages, self.release_pages))
+            self.release_pages = torch.empty(
+                (0,), dtype=torch.int64, device=self.device
+            )
+            if len(self.free_pages) > 1:
+                self.free_pages, _ = torch.sort(self.free_pages)
+
+    def _assert_next_pages(
+        self, first_physical_page: int, num_new_pages: int
+    ) -> None:
+        if num_new_pages <= 0:
+            return
+        if num_new_pages > len(self.free_pages):
+            return
+        expected = torch.arange(
+            first_physical_page,
+            first_physical_page + num_new_pages,
+            dtype=self.free_pages.dtype,
+            device=self.free_pages.device,
+        )
+        torch._assert_async(
+            (self.free_pages[:num_new_pages] == expected).all(),
+            "static hot/cold TurboQuant page ownership invariant violated",
+        )
+
+    def alloc(self, need_size: int):
+        self._merge_all_free_pages()
+        return super().alloc(need_size)
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+        num_new_pages: int = None,
+    ):
+        if len(prefix_lens_cpu) != 1 or len(seq_lens_cpu) != 1:
+            raise RuntimeError(
+                "static hot/cold TurboQuant allocator requires batch_size=1"
+            )
+        self._merge_all_free_pages()
+        prefix_len = int(prefix_lens_cpu[0])
+        seq_len = int(seq_lens_cpu[0])
+        pages_before = (prefix_len + self.page_size - 1) // self.page_size
+        pages_after = (seq_len + self.page_size - 1) // self.page_size
+        expected_new_pages = pages_after - pages_before
+        self._assert_next_pages(pages_before + 1, expected_new_pages)
+        return super().alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+            num_new_pages=expected_new_pages,
+        )
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+    ):
+        if len(seq_lens_cpu) != 1:
+            raise RuntimeError(
+                "static hot/cold TurboQuant allocator requires batch_size=1"
+            )
+        self._merge_all_free_pages()
+        seq_len = int(seq_lens_cpu[0])
+        pages_before = (seq_len - 1 + self.page_size - 1) // self.page_size
+        pages_after = (seq_len + self.page_size - 1) // self.page_size
+        self._assert_next_pages(pages_before + 1, pages_after - pages_before)
+        return super().alloc_decode(seq_lens, seq_lens_cpu, last_loc)

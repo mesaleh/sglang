@@ -2763,6 +2763,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             _, decode_attention_backend = self.server_args.get_attention_backends()
             uses_native_tq_mla = decode_attention_backend == "tokenspeed_mla"
             if uses_native_tq_mla and not self.server_args.enable_lora:
+                if getattr(kvcache, "is_mla_turboquant_hotcold_pool", False):
+                    # The FP8 tier stores the original latent and uses the
+                    # ordinary dense TokenSpeed decoder. Rotating w_kc/w_vc
+                    # globally would put its queries and outputs in the TQ4
+                    # tier's basis and corrupt every hot-only request. Keep
+                    # runtime rotations confined to segmented cold decode.
+                    logger.info(
+                        "TurboQuant hot/cold MLA: keeping runtime rotations "
+                        "for the cold TQ4 segment."
+                    )
+                    return
                 self._maybe_fuse_tq_mla_absorb_rotations(tq_cfg, logger)
                 return
 

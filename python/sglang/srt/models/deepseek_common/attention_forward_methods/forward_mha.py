@@ -478,7 +478,10 @@ class DeepseekMHAForwardMixin:
             kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
             kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, kv_a_dtype, forward_batch
+                kv_indices,
+                kv_a_dtype,
+                forward_batch,
+                logical_start=int(forward_batch.prefix_chunk_starts_cpu[i, 0]),
             )
             kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
                 kv_a_normed,
@@ -526,9 +529,46 @@ class DeepseekMHAForwardMixin:
     ):
         if _is_cuda or _use_aiter_gfx95:
             # Save latent cache
-            get_token_to_kv_pool().set_mla_kv_buffer(
-                self.attn_mha, forward_batch.out_cache_loc, kv_a.unsqueeze(1), k_pe
-            )
+            token_to_kv_pool = get_token_to_kv_pool()
+            if getattr(
+                token_to_kv_pool,
+                "is_mla_turboquant_hotcold_pool",
+                False,
+            ):
+                logical_start = None
+                if forward_batch.batch_size == 1:
+                    if (
+                        forward_batch.forward_mode.is_target_verify()
+                        and forward_batch.seq_lens_cpu is not None
+                    ):
+                        # Target verify appends its q_len speculative tokens to
+                        # the request prefix represented by seq_lens_cpu.
+                        logical_start = int(forward_batch.seq_lens_cpu[0])
+                    elif (
+                        forward_batch.forward_mode.is_decode()
+                        and forward_batch.seq_lens_cpu is not None
+                    ):
+                        # Ordinary q1 decode's sequence length already includes
+                        # the token written by this forward.
+                        logical_start = int(forward_batch.seq_lens_cpu[0]) - 1
+                    elif forward_batch.extend_prefix_lens_cpu is not None:
+                        logical_start = int(
+                            forward_batch.extend_prefix_lens_cpu[0]
+                        )
+                token_to_kv_pool.set_mla_kv_buffer(
+                    self.attn_mha,
+                    forward_batch.out_cache_loc,
+                    kv_a.unsqueeze(1),
+                    k_pe,
+                    logical_start=logical_start,
+                )
+            else:
+                token_to_kv_pool.set_mla_kv_buffer(
+                    self.attn_mha,
+                    forward_batch.out_cache_loc,
+                    kv_a.unsqueeze(1),
+                    k_pe,
+                )
         elif _is_npu:
             # To reduce a time-costing split operation
             get_token_to_kv_pool().set_kv_buffer(
@@ -548,12 +588,29 @@ class DeepseekMHAForwardMixin:
         kv_indices: torch.Tensor,
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
+        logical_start: Optional[int] = None,
     ):
         if _is_cuda or _use_aiter_gfx95:
             kv_indices = filter_dcp_local_kv_indices(kv_indices=kv_indices)
-            kv_a, k_pe = get_token_to_kv_pool().get_mla_kv_buffer(
-                self.attn_mha, kv_indices, dst_dtype
-            )
+            token_to_kv_pool = get_token_to_kv_pool()
+            if (
+                logical_start is not None
+                and getattr(
+                    token_to_kv_pool,
+                    "is_mla_turboquant_hotcold_pool",
+                    False,
+                )
+            ):
+                kv_a, k_pe = token_to_kv_pool.get_mla_kv_buffer(
+                    self.attn_mha,
+                    kv_indices,
+                    dst_dtype,
+                    logical_start=logical_start,
+                )
+            else:
+                kv_a, k_pe = token_to_kv_pool.get_mla_kv_buffer(
+                    self.attn_mha, kv_indices, dst_dtype
+                )
             kv_a = kv_a.squeeze(1)
         else:
             latent_cache_buf = get_token_to_kv_pool().get_key_buffer(

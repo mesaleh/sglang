@@ -4047,6 +4047,385 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         torch.cuda.synchronize()
 
 
+class MLATokenToKVPoolTurboQuantHotCold(MLATokenToKVPoolTurboQuant):
+    """Static single-owner FP8/TurboQuant MLA cache.
+
+    The first ``hot_capacity_tokens`` logical slots are backed only by a
+    compact FP8 MLA buffer. Remaining logical slots are backed only by the
+    packed TurboQuant buffers inherited from :class:`MLATokenToKVPoolTurboQuant`.
+    No token has both representations.
+
+    This first implementation intentionally models a static hot prefix. It is
+    an experimental lifecycle primitive, not yet a production hot-tail policy:
+    cross-tier relocation, arbitrary radix reuse, host offload, and
+    disaggregation fail closed.
+    """
+
+    is_mla_turboquant_hotcold_pool = True
+
+    def __init__(self, *args, hot_capacity_tokens: int, **kwargs):
+        size = int(kwargs.get("size", args[0] if args else 0))
+        page_size = int(kwargs.get("page_size", args[1] if len(args) > 1 else 0))
+        if page_size <= 0:
+            raise ValueError("hot/cold TurboQuant requires a positive page size")
+        if hot_capacity_tokens <= 0 or hot_capacity_tokens >= size:
+            raise ValueError(
+                "hot/cold TurboQuant requires 0 < hot_capacity_tokens < size; "
+                f"got hot={hot_capacity_tokens}, size={size}"
+            )
+        if hot_capacity_tokens % page_size:
+            raise ValueError(
+                "hot/cold TurboQuant hot capacity must be page aligned; "
+                f"got hot={hot_capacity_tokens}, page_size={page_size}"
+            )
+        if size % page_size:
+            raise ValueError(
+                "hot/cold TurboQuant total capacity must be page aligned; "
+                f"got size={size}, page_size={page_size}"
+            )
+        self.hot_capacity_tokens = hot_capacity_tokens
+        self.cold_capacity_tokens = size - hot_capacity_tokens
+        self.cold_logical_start = hot_capacity_tokens + page_size
+        super().__init__(*args, **kwargs)
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                hot_rows = self.hot_capacity_tokens + self.page_size
+                cold_rows = self.cold_capacity_tokens + self.page_size
+                lora = self.kv_lora_rank
+                rope = self.qk_rope_head_dim
+
+                self.kv_hot_buffer = [
+                    torch.zeros(
+                        (hot_rows, 1, lora + rope),
+                        dtype=fp8_dtype,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_nope_packed_buffer = [
+                    torch.zeros(
+                        (cold_rows, 1, lora // 2),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_nope_scale_buffer = [
+                    torch.zeros(
+                        (cold_rows, 1),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_nope_codebook_buffer = (
+                    [
+                        torch.zeros(
+                            (cold_rows, 1, 16),
+                            dtype=torch.uint8,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    if self.enable_fp8_codebook
+                    else None
+                )
+                self._kv_nope_codebook_fp8_buffer = (
+                    [
+                        buffer.view(torch.float8_e4m3fn)
+                        for buffer in self.kv_nope_codebook_buffer
+                    ]
+                    if self.kv_nope_codebook_buffer is not None
+                    else None
+                )
+                self.kv_rope_buffer = [
+                    torch.zeros(
+                        (cold_rows, 1, rope),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        workspace_tokens = max(1, envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.get())
+        self._tq_mla_kv_write_unit = torch.empty(
+            (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
+        )
+        self._tq_mla_kv_write_norms = torch.empty(
+            (workspace_tokens, 1), dtype=torch.float32, device=self.device
+        )
+        self._tq_mla_kv_write_y = torch.empty(
+            (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
+        )
+
+        # Preserve the parent initialization contract. Native users of this
+        # class access the explicit hot/cold buffers, never this alias.
+        self.kv_buffer = self.kv_nope_packed_buffer
+        if envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get():
+            self._warmup_mla_fused_kv_write()
+
+    def _clear_buffers(self):
+        if hasattr(self, "kv_buffer"):
+            del self.kv_buffer
+        del self.kv_hot_buffer
+        del self.kv_nope_packed_buffer
+        del self.kv_nope_scale_buffer
+        del self.kv_nope_codebook_buffer
+        del self._kv_nope_codebook_fp8_buffer
+        del self.kv_rope_buffer
+        del self._tq_mla_kv_write_unit
+        del self._tq_mla_kv_write_norms
+        del self._tq_mla_kv_write_y
+
+    def get_kv_size_bytes(self):
+        total = sum(buffer.nbytes for buffer in self.kv_hot_buffer)
+        for layer_id in range(self.layer_num):
+            total += self.kv_nope_packed_buffer[layer_id].nbytes
+            total += self.kv_nope_scale_buffer[layer_id].nbytes
+            total += self.kv_rope_buffer[layer_id].nbytes
+            if self.kv_nope_codebook_buffer is not None:
+                total += self.kv_nope_codebook_buffer[layer_id].nbytes
+        return total
+
+    def get_hot_key_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.kv_hot_buffer[layer_id - self.start_layer]
+
+    def _set_hot_mla_kv_buffer(
+        self,
+        layer_id_rel: int,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        if (
+            cache_k_nope.dtype == fp8_dtype
+            and cache_k_rope.dtype == fp8_dtype
+        ):
+            set_mla_kv_buffer_triton(
+                self.kv_hot_buffer[layer_id_rel],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
+        else:
+            set_mla_kv_buffer_triton_fp8_quant(
+                self.kv_hot_buffer[layer_id_rel],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                fp8_dtype,
+            )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+        logical_start: Optional[int] = None,
+    ):
+        maybe_detect_oob(
+            loc,
+            0,
+            self.size + self.page_size,
+            "set_mla_kv_buffer (MLA-TQ-hotcold)",
+        )
+        if cache_k_nope.dim() == 2:
+            cache_k_nope = cache_k_nope.unsqueeze(1)
+        if cache_k_rope.dim() == 2:
+            cache_k_rope = cache_k_rope.unsqueeze(1)
+        layer_id_rel = layer.layer_id - self.start_layer
+
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            # Captured graphs are bounded to the FP8 capacity by the attention
+            # backend. Replay therefore uses this same pointer-stable writer.
+            self._set_hot_mla_kv_buffer(
+                layer_id_rel, loc, cache_k_nope, cache_k_rope
+            )
+            return
+
+        if logical_start is None:
+            # Generic callers may provide arbitrary rows. The static
+            # single-request model path supplies its CPU-known token position
+            # and avoids this synchronization in prefill and eager decode.
+            hot_mask = loc < self.cold_logical_start
+            hot_count = int(hot_mask.sum().item())
+            hot_loc = loc[hot_mask]
+            cold_loc = loc[~hot_mask]
+            hot_input_slice = hot_mask
+            cold_input_slice = ~hot_mask
+        else:
+            if logical_start < 0:
+                raise ValueError(
+                    "hot/cold TurboQuant logical_start must be non-negative; "
+                    f"got {logical_start}"
+                )
+            hot_count = max(
+                0,
+                min(loc.numel(), self.hot_capacity_tokens - logical_start),
+            )
+            hot_loc = loc[:hot_count]
+            cold_loc = loc[hot_count:]
+            hot_input_slice = slice(0, hot_count)
+            cold_input_slice = slice(hot_count, loc.numel())
+
+        if hot_count:
+            self._set_hot_mla_kv_buffer(
+                layer_id_rel,
+                hot_loc,
+                cache_k_nope[hot_input_slice],
+                cache_k_rope[hot_input_slice],
+            )
+        if hot_count != loc.numel():
+            super().set_mla_kv_buffer(
+                layer,
+                cold_loc - self.hot_capacity_tokens,
+                cache_k_nope[cold_input_slice],
+                cache_k_rope[cold_input_slice],
+            )
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        if tgt_loc.numel() == 0:
+            return
+        tgt_hot = tgt_loc < self.cold_logical_start
+        src_hot = src_loc < self.cold_logical_start
+        if not torch.equal(tgt_hot, src_hot):
+            raise RuntimeError(
+                "hot/cold TurboQuant cross-tier move requires explicit "
+                "quantize/dequantize migration"
+            )
+        if bool(tgt_hot.any().item()):
+            hot_tgt = tgt_loc[tgt_hot].view(-1).long()
+            hot_src = src_loc[src_hot].view(-1).long()
+            for cache in self.kv_hot_buffer:
+                cache[hot_tgt] = cache[hot_src]
+        if not bool(tgt_hot.all().item()):
+            cold_mask = ~tgt_hot
+            super().move_kv_cache(
+                tgt_loc[cold_mask] - self.hot_capacity_tokens,
+                src_loc[cold_mask] - self.hot_capacity_tokens,
+            )
+
+    def get_key_buffer(self, layer_id: int):
+        raise RuntimeError(
+            "hot/cold TurboQuant has no full-width logical shadow; use the "
+            "native segmented TokenSpeed reader"
+        )
+
+    get_value_buffer = get_key_buffer
+    get_kv_buffer = get_key_buffer
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+        logical_start: Optional[int] = None,
+    ):
+        """Reconstruct only the requested rows for chunked-prefill consumers.
+
+        Hot rows are cast from their sole FP8 representation. Cold rows are
+        dequantized from their sole TurboQuant representation by the parent
+        implementation. The returned tensors are transient gathered rows, not
+        a persistent full-width shadow of the cache.
+        """
+        if loc.dim() != 1:
+            raise ValueError(
+                "hot/cold TurboQuant row reconstruction requires 1-D loc; "
+                f"got shape={tuple(loc.shape)}"
+            )
+        maybe_detect_oob(
+            loc,
+            0,
+            self.size + self.page_size,
+            "get_mla_kv_buffer (MLA-TQ-hotcold)",
+        )
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer.layer_id - self.start_layer)
+
+        dst_dtype = dst_dtype or self.dtype
+        layer_id_rel = layer.layer_id - self.start_layer
+        cache_k_nope = torch.empty(
+            (loc.shape[0], 1, self.kv_lora_rank),
+            dtype=dst_dtype,
+            device=loc.device,
+        )
+        cache_k_rope = torch.empty(
+            (loc.shape[0], 1, self.qk_rope_head_dim),
+            dtype=dst_dtype,
+            device=loc.device,
+        )
+
+        if logical_start is None:
+            # Generic callers may provide arbitrary logical rows. This path
+            # synchronizes once to discover the split; chunked prefill passes
+            # its CPU-known logical start below and avoids that synchronization.
+            hot_mask = loc < self.cold_logical_start
+            hot_count = int(hot_mask.sum().item())
+            hot_loc = loc[hot_mask]
+            cold_loc = loc[~hot_mask]
+            hot_output_slice = hot_mask
+            cold_output_slice = ~hot_mask
+        else:
+            if logical_start < 0:
+                raise ValueError(
+                    "hot/cold TurboQuant logical_start must be non-negative; "
+                    f"got {logical_start}"
+                )
+            hot_count = max(
+                0,
+                min(loc.numel(), self.hot_capacity_tokens - logical_start),
+            )
+            hot_loc = loc[:hot_count]
+            cold_loc = loc[hot_count:]
+            hot_output_slice = slice(0, hot_count)
+            cold_output_slice = slice(hot_count, loc.numel())
+
+        if hot_count:
+            hot_rows = self.kv_hot_buffer[layer_id_rel][hot_loc]
+            cache_k_nope[hot_output_slice] = hot_rows[
+                ..., : self.kv_lora_rank
+            ].to(
+                dst_dtype
+            )
+            cache_k_rope[hot_output_slice] = hot_rows[
+                ..., self.kv_lora_rank :
+            ].to(
+                dst_dtype
+            )
+
+        if hot_count != loc.numel():
+            cold_nope, cold_rope = super().get_mla_kv_buffer(
+                layer,
+                cold_loc - self.hot_capacity_tokens,
+                dst_dtype,
+            )
+            cache_k_nope[cold_output_slice] = cold_nope
+            cache_k_rope[cold_output_slice] = cold_rope
+
+        return cache_k_nope, cache_k_rope
+
+    def get_cpu_copy(self, *args, **kwargs):
+        raise RuntimeError("hot/cold TurboQuant host offload is not implemented")
+
+    load_cpu_copy = get_cpu_copy
+
+    def get_contiguous_buf_infos(self):
+        raise RuntimeError(
+            "hot/cold TurboQuant disaggregated transfer is not implemented"
+        )
+
+
 class NSATokenToKVPool(MLATokenToKVPool):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8

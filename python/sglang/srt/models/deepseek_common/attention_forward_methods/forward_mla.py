@@ -1006,23 +1006,34 @@ class DeepseekMLAForwardMixin:
                 or get_global_server_args().dsa_prefill_backend == "trtllm"
             ) and get_attn_backend().kv_cache_dtype == torch.float8_e4m3fn
 
-        return (
-            self.current_attention_backend
-            in ("trtllm_mla", "tokenspeed_mla", "cutedsl_mla")
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-            )
-            # Omniva: older batches may carry a per-call backend when a separate
-            # speculative_draft_attention_backend is used. Newer upstream stores
-            # the active backend in the forward context instead.
-            and getattr(
-                getattr(forward_batch, "attn_backend", get_attn_backend()),
-                "data_type",
-                None,
-            )
+        if self.current_attention_backend not in (
+            "trtllm_mla",
+            "tokenspeed_mla",
+            "cutedsl_mla",
+        ) or not (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        ):
+            return False
+
+        active_backend = getattr(forward_batch, "attn_backend", None)
+        if active_backend is None:
+            active_backend = get_attn_backend()
+        backend_uses_fp8 = (
+            getattr(active_backend, "data_type", None)
             == torch.float8_e4m3fn
         )
+        use_hot_fp8_frontend = False
+        if not backend_uses_fp8 and getattr(
+            active_backend, "_tq4_hotcold_cache", False
+        ):
+            use_hot_fp8_frontend = active_backend.should_use_hot_fp8_frontend(
+                forward_batch
+            )
+        # Omniva: older batches may carry a per-call backend when a separate
+        # speculative_draft_attention_backend is used. Newer upstream stores
+        # the active backend in the forward context instead.
+        return backend_uses_fp8 or use_hot_fp8_frontend
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """

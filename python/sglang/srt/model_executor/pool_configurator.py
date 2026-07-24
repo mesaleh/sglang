@@ -122,7 +122,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """Configurator for standard models: MHA, MLA, DSA, FP4.
 
     coeff = cell_size (bytes per token across all layers)
-    bias = 0
+    bias = fixed_size (zero except for statically tiered hot/cold caches)
     """
 
     def __init__(self, mr: ModelRunner):
@@ -137,6 +137,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         else:
             num_layers = mr.num_effective_layers
 
+        self._fixed_size = 0
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -217,6 +218,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 per_layer_per_token = (
                     nope_packed_bytes + scale_bytes + rope_bytes + codebook_bytes
                 )
+                hot_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
+                if hot_tokens > 0:
+                    configured_tokens = mr.server_args.max_total_tokens
+                    if configured_tokens is None or configured_tokens <= hot_tokens:
+                        raise ValueError(
+                            "SGLANG_TQ_MLA_HOT_TOKENS requires an explicit "
+                            "--max-total-tokens larger than the hot capacity"
+                        )
+                    fp8_bytes = lora + rope
+                    # Model the tiered allocation exactly as an affine cost:
+                    # every token first pays the cold TQ4 cost, while the
+                    # fixed hot prefix pays the FP8-minus-TQ4 premium. An
+                    # average computed at configured_tokens is only exact
+                    # when that full cap fits and otherwise overestimates
+                    # capacity under constrained memory.
+                    self._fixed_size = (
+                        hot_tokens
+                        * (fp8_bytes - per_layer_per_token)
+                        * num_layers
+                    )
                 cell_size = per_layer_per_token * num_layers
             else:
                 cell_size = (
@@ -327,7 +348,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
-        max_total_num_tokens = available_bytes // self._cell_size
+        variable_bytes = max(0, available_bytes - self._fixed_size)
+        max_total_num_tokens = variable_bytes // self._cell_size
         max_total_num_tokens = max_total_num_tokens // page_size * page_size
         return MemoryPoolConfig(max_total_num_tokens=max_total_num_tokens)
 

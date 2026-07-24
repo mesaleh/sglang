@@ -48,6 +48,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     MLATokenToKVPoolTurboQuant,
+    MLATokenToKVPoolTurboQuantHotCold,
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
     ReqToTokenPool,
@@ -102,6 +103,54 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
 
 _is_npu = is_npu()
 _is_hip = is_hip()
+
+
+def _validate_tq_hotcold_server_args(
+    server_args,
+    *,
+    use_mla_backend: Optional[bool] = None,
+    turboquant_k_bits: Optional[int] = None,
+    turboquant_v_bits: Optional[int] = None,
+) -> None:
+    """Fail closed around the static single-request ownership prototype."""
+    if envs.SGLANG_TQ_MLA_HOT_TOKENS.get() <= 0:
+        return
+
+    violations = []
+    kv_cache_dtype = str(server_args.kv_cache_dtype)
+    if not kv_cache_dtype.startswith("turboquant_4bit"):
+        violations.append("--kv-cache-dtype turboquant_4bit{,_uniform,_e2m1}")
+    if use_mla_backend is False:
+        violations.append("an MLA target model")
+    if turboquant_k_bits is not None and turboquant_k_bits != 4:
+        violations.append("symmetric TurboQuant K=4")
+    if turboquant_v_bits is not None and turboquant_v_bits != 4:
+        violations.append("symmetric TurboQuant V=4")
+    _, decode_backend = server_args.get_attention_backends()
+    if decode_backend != "tokenspeed_mla":
+        violations.append("--decode-attention-backend tokenspeed_mla")
+    if server_args.page_size != 32:
+        violations.append("--page-size 32")
+    if not server_args.disable_radix_cache:
+        violations.append("--disable-radix-cache")
+    if server_args.max_running_requests != 1:
+        violations.append("--max-running-requests 1")
+    if server_args.dcp_size != 1:
+        violations.append("--dcp-size 1")
+    if server_args.enable_hierarchical_cache:
+        violations.append("hierarchical cache disabled")
+    if server_args.disaggregation_mode != "null":
+        violations.append("--disaggregation-mode null")
+    if server_args.attn_cp_size != 1:
+        violations.append("--attention-context-parallel-size 1")
+    if server_args.enable_dp_attention:
+        violations.append("DP attention disabled")
+    if violations:
+        raise ValueError(
+            "SGLANG_TQ_MLA_HOT_TOKENS enables the experimental static "
+            "single-owner cache and currently requires: "
+            + ", ".join(violations)
+        )
 
 
 class ModelRunnerKVCacheMixin:
@@ -508,6 +557,17 @@ class ModelRunnerKVCacheMixin:
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
 
+        # Validate the env gate before choosing any pool family.  In
+        # particular, do not silently ignore it on a non-TQ/non-MLA target or
+        # let an unsupported attention backend reach the first request.
+        if not self.is_draft_worker:
+            _validate_tq_hotcold_server_args(
+                self.server_args,
+                use_mla_backend=self.use_mla_backend,
+                turboquant_k_bits=getattr(self, "turboquant_k_bits", None),
+                turboquant_v_bits=getattr(self, "turboquant_v_bits", None),
+            )
+
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
         # from one byte buffer, then return. Gated to the target worker
         # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
@@ -877,7 +937,18 @@ class ModelRunnerKVCacheMixin:
                 # MLA + TurboQuant: compressed nope + raw rope + per-token scale.
                 # The pool class itself enforces k_bits == 4 (raises otherwise),
                 # matching the sizing assumption in pool_configurator.py.
-                self.token_to_kv_pool = MLATokenToKVPoolTurboQuant(
+                hot_capacity_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
+                PoolCls = (
+                    MLATokenToKVPoolTurboQuantHotCold
+                    if hot_capacity_tokens > 0
+                    else MLATokenToKVPoolTurboQuant
+                )
+                hot_kwargs = (
+                    {"hot_capacity_tokens": hot_capacity_tokens}
+                    if hot_capacity_tokens > 0
+                    else {}
+                )
+                self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
@@ -897,6 +968,7 @@ class ModelRunnerKVCacheMixin:
                     ),
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
+                    **hot_kwargs,
                 )
             elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
@@ -1237,14 +1309,38 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
                     else:
-                        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                            self.max_total_num_tokens * self.dcp_size,
-                            page_size=self.page_size * self.dcp_size,
-                            dtype=self.kv_cache_dtype,
-                            device=self.device,
-                            kvcache=self.token_to_kv_pool,
-                            need_sort=need_sort,
-                        )
+                        if isinstance(
+                            self.token_to_kv_pool,
+                            MLATokenToKVPoolTurboQuantHotCold,
+                        ):
+                            from sglang.srt.mem_cache.allocator import (
+                                StaticTieredPagedTokenToKVPoolAllocator,
+                            )
+
+                            self.token_to_kv_pool_allocator = (
+                                StaticTieredPagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens,
+                                    page_size=self.page_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                    hot_capacity_tokens=(
+                                        self.token_to_kv_pool.hot_capacity_tokens
+                                    ),
+                                )
+                            )
+                        else:
+                            self.token_to_kv_pool_allocator = (
+                                PagedTokenToKVPoolAllocator(
+                                    self.max_total_num_tokens * self.dcp_size,
+                                    page_size=self.page_size * self.dcp_size,
+                                    dtype=self.kv_cache_dtype,
+                                    device=self.device,
+                                    kvcache=self.token_to_kv_pool,
+                                    need_sort=need_sort,
+                                )
+                            )
 
             if self.enable_hisparse and is_dsv4_model:
                 assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
