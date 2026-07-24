@@ -63,6 +63,13 @@ DEFAULT_WORKSPACE_SIZE_MB = 150  # Memory workspace size in MB
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 
+def _capture_block_table(
+    block_table: torch.Tensor, batch_size: int, width: int
+) -> torch.Tensor:
+    """Return stable contiguous storage for CUDA-graph page metadata."""
+    return block_table[:batch_size, :width].contiguous()
+
+
 @triton.jit
 def pad_draft_extend_query_kernel(
     q_ptr,  # Input query tensor [total_seq_len, num_heads, head_dim]
@@ -779,7 +786,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # than max_context_len must reject longer replay via can_run_cuda_graph.
         graph_max_seq_len = self.get_cuda_graph_max_seq_len()
         max_blocks_per_seq = self._calc_padded_blocks(graph_max_seq_len)
-        block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
+        block_kv_indices = _capture_block_table(
+            self.decode_cuda_graph_kv_indices, bs, max_blocks_per_seq
+        )
         metadata.block_kv_indices = block_kv_indices
         metadata.max_seq_len_k = graph_max_seq_len
         metadata.batch_size = bs

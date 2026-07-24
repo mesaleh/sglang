@@ -15,7 +15,10 @@ from sglang.srt.layers.attention.tokenspeed_mla_backend import (
     _tq4_split_override,
     _tq4_workspace_bytes,
 )
-from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+from sglang.srt.layers.attention.trtllm_mla_backend import (
+    TRTLLMMLABackend,
+    _capture_block_table,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -74,6 +77,16 @@ def test_tq4_codebook_graph_bound_and_verifier_accounting():
     assert not _tq4_codebook_cuda_graph_eligible(
         torch.empty(0, dtype=torch.int32), 0, 32_768
     )
+
+
+def test_bounded_graph_block_table_has_contiguous_stable_storage():
+    backing = torch.arange(8 * 8000, dtype=torch.int32).reshape(8, 8000)
+    captured = _capture_block_table(backing, batch_size=5, width=1024)
+
+    assert captured.shape == (5, 1024)
+    assert captured.is_contiguous()
+    assert captured.data_ptr() != backing.data_ptr()
+    assert torch.equal(captured, backing[:5, :1024])
 
 
 def test_tq4_codebook_backend_fails_closed_above_graph_bound():
