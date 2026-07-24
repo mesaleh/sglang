@@ -20,6 +20,9 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.kv_turboquant import (
+    should_allocate_mla_tq_fp8_codebook,
+)
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
@@ -888,8 +891,9 @@ class ModelRunnerKVCacheMixin:
                     turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
                     turboquant_uniform=getattr(self, "turboquant_uniform", False),
                     turboquant_e2m1=getattr(self, "turboquant_e2m1", False),
-                    enable_fp8_codebook=(
-                        self.server_args.get_attention_backends()[1] == "tokenspeed_mla"
+                    enable_fp8_codebook=should_allocate_mla_tq_fp8_codebook(
+                        self.server_args.get_attention_backends()[1],
+                        getattr(self, "turboquant_e2m1", False),
                     ),
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,

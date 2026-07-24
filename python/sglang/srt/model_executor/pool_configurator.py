@@ -30,6 +30,9 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.kv_turboquant import (
+    should_allocate_mla_tq_fp8_codebook,
+)
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -189,7 +192,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 #   nope_packed:  (lora_rank // 2) bytes    (4-bit: 2 values/byte)
                 #   scale:        2 bytes                   (bf16, one per token)
                 #   rope_raw:     qk_rope_head_dim * 2 bytes (bf16 unmodified)
-                #   fp8_codebook: 16 bytes for TokenSpeed MLA decode only
+                #   fp8_codebook: 16 bytes for TokenSpeed Lloyd decode only;
+                #                 native E2M1 consumes packed codes directly
                 # Only 4-bit is supported for MLA in this first implementation
                 # (the pool class raises on k_bits != 4). We assert here so the
                 # sizing math cannot silently diverge from what the pool creates.
@@ -206,11 +210,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 scale_bytes = 2
                 # Raw rope (bf16).
                 rope_bytes = rope * 2
-                codebook_bytes = (
-                    16
-                    if mr.server_args.get_attention_backends()[1]
-                    == "tokenspeed_mla"
-                    else 0
+                codebook_bytes = 16 * should_allocate_mla_tq_fp8_codebook(
+                    mr.server_args.get_attention_backends()[1],
+                    getattr(mr, "turboquant_e2m1", False),
                 )
                 per_layer_per_token = (
                     nope_packed_bytes + scale_bytes + rope_bytes + codebook_bytes
@@ -306,7 +308,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         return n * (d // 2)  # uint8, 2 values/byte
 
                 per_layer_per_token = (
-                    _packed_bytes(k_bits, n, d) + _packed_bytes(v_bits, n, d)
+                    _packed_bytes(k_bits, n, d)
+                    + _packed_bytes(v_bits, n, d)
                     + 2 * n * 2  # k_dequant_scale + v_dequant_scale (bf16)
                 )
                 cell_size = per_layer_per_token * num_layers

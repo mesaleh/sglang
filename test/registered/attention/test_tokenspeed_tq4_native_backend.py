@@ -77,7 +77,9 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
         tq_config=config,
         kv_nope_packed_buffer=[packed],
         kv_nope_scale_buffer=[dequant_scale],
-        kv_nope_codebook_buffer=[codebook.view(torch.uint8).contiguous()],
+        kv_nope_codebook_buffer=(
+            None if e2m1 else [codebook.view(torch.uint8).contiguous()]
+        ),
         kv_rope_buffer=[rope],
     )
     backend = object.__new__(TokenspeedMLABackend)

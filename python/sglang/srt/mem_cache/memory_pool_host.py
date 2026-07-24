@@ -42,7 +42,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     MLATokenToKVPool,
     MLATokenToKVPoolTurboQuant,
-    NSATokenToKVPool,
 )
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
@@ -1720,7 +1719,8 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
 
     Total per-token-per-layer bytes (Kimi K2.6, lora=512, rope=64, k=4):
       packed_nope (256) + scale (2) + rope (128) = 386 bytes, plus an
-      optional TokenSpeed codebook (16) = 402 bytes.
+      optional TokenSpeed Lloyd codebook (16) = 402 bytes. Native E2M1 does
+      not allocate the codebook and remains at 386 bytes.
 
     We mirror this on pinned CPU memory as separate contiguous pinned tensors
     (one per layer per sub-buffer). Three or four small transfers

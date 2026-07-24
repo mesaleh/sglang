@@ -3370,10 +3370,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
       = (512 * 0.5 + 64 * 2 + 2) B  /  (576 * 2 B)
       = 386 / 1152  ≈  0.335  → ~3x compression vs bf16, ~1.5x vs fp8.
 
-    TokenSpeed MLA decode additionally stores a 16-byte FP8 codebook per token
-    so its SM100 reader can replace indexed scalar lookups with register
-    permutations. That backend-specific layout is 402 bytes/token/layer,
-    still 30.2% smaller than the 576-byte FP8 baseline.
+    TokenSpeed's Lloyd-codebook MLA decode additionally stores a 16-byte FP8
+    lookup row per token so its SM100 reader can replace indexed scalar lookups
+    with register permutations. That optional layout is 402 bytes/token/layer.
+    Native E2M1 consumes the canonical packed codes directly and remains at
+    386 bytes/token/layer.
 
     Storage layout (per layer):
       - kv_nope_packed_buffer: (size+page, 1, lora_rank // 2) uint8
@@ -3384,7 +3385,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
       - kv_rope_buffer: (size+page, 1, qk_rope_head_dim) bfloat16
           raw rope values
       - kv_nope_codebook_buffer: optional (size+page, 1, 16) uint8
-          raw E4M3FN codebook bytes, enabled only for TokenSpeed MLA decode
+          raw E4M3FN codebook bytes, enabled only for TokenSpeed Lloyd decode
 
     Correctness approach:
       This class overrides get_key_buffer / get_value_buffer / get_mla_kv_buffer
@@ -3524,9 +3525,10 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
-                # TokenSpeed's SM100 TQ4 reader consumes exact E4M3FN bytes.
-                # Keep uint8 as the canonical storage/lifecycle representation;
-                # the FP8 views below alias it without allocating a shadow copy.
+                # TokenSpeed's Lloyd TQ4 reader consumes exact E4M3FN bytes.
+                # Native E2M1 does not allocate this optional lookup row.  When
+                # present, uint8 is the canonical lifecycle representation and
+                # the FP8 views below alias it without another allocation.
                 self.kv_nope_codebook_buffer = (
                     [
                         torch.zeros(

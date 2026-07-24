@@ -136,9 +136,7 @@ def _fp8_quantize_tq4_query_kernel(
     x_row = m_idx[:, None] * x_row_stride
     out_row = m_idx[:, None] * out_row_stride
     latent = tl.load(x_ptr + x_row + latent_idx[None, :], mask=m_mask[:, None])
-    rope = tl.load(
-        x_ptr + x_row + LATENT_N + rope_idx[None, :], mask=m_mask[:, None]
-    )
+    rope = tl.load(x_ptr + x_row + LATENT_N + rope_idx[None, :], mask=m_mask[:, None])
     tl.store(
         out_ptr + out_row + latent_idx[None, :],
         latent.to(tl.float8e4nv),
@@ -180,14 +178,10 @@ def _quantize_tq4_query(
                 f"dimension {dim}: got stride {query.stride(dim)}, expected "
                 f"{expected_stride} for shape {tuple(query.shape)}"
             )
-    query_fp8 = torch.empty(
-        query.shape, dtype=torch.float8_e4m3fn, device=query.device
-    )
+    query_fp8 = torch.empty(query.shape, dtype=torch.float8_e4m3fn, device=query.device)
     rows = query.numel() // query.shape[-1]
     row_stride = query.stride(-2) if query.ndim > 1 else query.shape[-1]
-    out_row_stride = (
-        query_fp8.stride(-2) if query_fp8.ndim > 1 else query_fp8.shape[-1]
-    )
+    out_row_stride = query_fp8.stride(-2) if query_fp8.ndim > 1 else query_fp8.shape[-1]
     block_m = 4 if rows <= 2048 else 16 if rows <= 16384 else 32
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _fp8_quantize_tq4_query_kernel[(triton.cdiv(rows, block_m),)](
@@ -256,6 +250,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         self._tq4_cache = self._tq_pool is not None
         self._tq_config = self._tq_pool.tq_config if self._tq4_cache else None
 
+        if (
+            self._tq4_cache
+            and bool(getattr(self._tq_config, "e2m1", False))
+            and self._tq_pool.kv_nope_codebook_buffer is not None
+        ):
+            raise RuntimeError(
+                "TokenSpeed E2M1 must not allocate the redundant FP8 lookup row"
+            )
         if not self._tq4_cache and self.data_type != torch.float8_e4m3fn:
             raise ValueError(
                 "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
@@ -273,9 +275,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 "tokenspeed_mla backend requires page_size in {32, 64}, "
                 f"got page_size={self.page_size}."
             )
-        if self._tq4_cache and not hasattr(
-            tokenspeed_mla, "tokenspeed_mla_decode_tq4"
-        ):
+        if self._tq4_cache and not hasattr(tokenspeed_mla, "tokenspeed_mla_decode_tq4"):
             raise RuntimeError(
                 "installed tokenspeed_mla does not provide native TQ4 decode"
             )
@@ -570,18 +570,21 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             rope = self._tq_pool.kv_rope_buffer[layer_id_rel].view(
                 -1, self.page_size, self.qk_rope_head_dim
             )
+            e2m1_cache = bool(getattr(self._tq_config, "e2m1", False))
             codebook_buffer = self._tq_pool.kv_nope_codebook_buffer
-            if codebook_buffer is None:
-                raise RuntimeError(
-                    "native TokenSpeed TQ4 decode requires its FP8 codebook buffer"
-                )
-            codebook = codebook_buffer[layer_id_rel].view(
-                -1, self.page_size, 16
-            )
+            if e2m1_cache:
+                # Canonical E2M1 codes can be expanded from the packed cache
+                # and per-token BF16 scale. Keeping a 16-byte FP8 lookup row
+                # would add a redundant shadow representation.
+                codebook = None
+            else:
+                if codebook_buffer is None:
+                    raise RuntimeError(
+                        "TokenSpeed Lloyd TQ4 decode requires its FP8 codebook buffer"
+                    )
+                codebook = codebook_buffer[layer_id_rel].view(-1, self.page_size, 16)
             seq_lens_i32 = (
-                seq_lens
-                if seq_lens.dtype == torch.int32
-                else seq_lens.to(torch.int32)
+                seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
             )
             split_kv = _tq4_split_override(
                 query.shape[0],

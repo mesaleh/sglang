@@ -52,6 +52,11 @@ E2M1_SORTED_CODE_LUT = np.array(
 """Map a sorted quantization-bin index to the corresponding E2M1 code."""
 
 
+def should_allocate_mla_tq_fp8_codebook(decode_backend: str, e2m1: bool) -> bool:
+    """Whether MLA TurboQuant needs the optional per-token FP8 lookup row."""
+    return decode_backend == "tokenspeed_mla" and not e2m1
+
+
 # ---------------------------------------------------------------------------
 # Codebook construction (one-time, at init)
 # ---------------------------------------------------------------------------
