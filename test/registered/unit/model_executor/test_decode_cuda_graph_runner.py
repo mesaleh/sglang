@@ -33,6 +33,9 @@ class TestDecodeCudaGraphRunner(unittest.TestCase):
         runner.enable_two_batch_overlap = False
         runner.record_nolora_graph = False
         runner.backend = _RecordingBackend()
+        runner.attn_backend = SimpleNamespace(
+            can_run_cuda_graph=lambda forward_batch: True
+        )
         runner.model_runner = SimpleNamespace(
             spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
         )
@@ -46,6 +49,60 @@ class TestDecodeCudaGraphRunner(unittest.TestCase):
 
         self.assertTrue(runner.can_run_graph(forward_batch))
         self.assertEqual(runner.backend.shape_key, ShapeKey(size=3))
+
+    def test_attention_backend_can_reject_graph_replay(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.require_mlp_tp_gather = False
+        runner.enable_pdmux = False
+        runner.disable_padding = True
+        runner.max_bs = 8
+        runner.require_mlp_sync = False
+        runner.is_encoder_decoder = False
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        runner.enable_two_batch_overlap = False
+        runner.record_nolora_graph = False
+        runner.backend = _RecordingBackend()
+        runner.attn_backend = SimpleNamespace(
+            can_run_cuda_graph=lambda forward_batch: False
+        )
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+        )
+
+        forward_batch = SimpleNamespace(
+            replace_embeds=None,
+            batch_size=3,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            spec_info=SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL),
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
+    def test_backend_without_graph_policy_preserves_default_behavior(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.require_mlp_tp_gather = False
+        runner.enable_pdmux = False
+        runner.disable_padding = True
+        runner.max_bs = 8
+        runner.require_mlp_sync = False
+        runner.is_encoder_decoder = False
+        runner.capture_hidden_mode = CaptureHiddenMode.FULL
+        runner.enable_two_batch_overlap = False
+        runner.record_nolora_graph = False
+        runner.backend = _RecordingBackend()
+        runner.attn_backend = SimpleNamespace()
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
+        )
+
+        forward_batch = SimpleNamespace(
+            replace_embeds=None,
+            batch_size=3,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            spec_info=SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL),
+        )
+
+        self.assertTrue(runner.can_run_graph(forward_batch))
 
 
 if __name__ == "__main__":

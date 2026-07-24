@@ -510,12 +510,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             else True
         )
 
+        attention_graph_policy = getattr(
+            self.attn_backend, "can_run_cuda_graph", None
+        )
+        is_attention_supported = (
+            attention_graph_policy(forward_batch)
+            if attention_graph_policy is not None
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_attention_supported
         )
 
     def _init_profile_context_and_memory_record(self):

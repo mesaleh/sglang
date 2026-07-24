@@ -63,6 +63,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
+_TQ4_CODEBOOK_CUDA_GRAPH_MAX_SEQ_LEN = 32_768
 
 
 def _supports_custom_decode_mask(decode_fn) -> bool:
@@ -97,6 +98,26 @@ def _tq4_kernel_max_seq_len(requested: int, configured: int) -> int:
             f"got {configured}"
         )
     return min(requested, configured)
+
+
+def _tq4_codebook_cuda_graph_max_seq_len(
+    configured: int, has_codebook: bool
+) -> int:
+    return (
+        min(configured, _TQ4_CODEBOOK_CUDA_GRAPH_MAX_SEQ_LEN)
+        if has_codebook
+        else configured
+    )
+
+
+def _tq4_codebook_cuda_graph_eligible(
+    seq_lens_cpu: Optional[torch.Tensor],
+    extra_kv_tokens: int,
+    graph_max_seq_len: int,
+) -> bool:
+    if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+        return False
+    return int(seq_lens_cpu.max().item()) + extra_kv_tokens <= graph_max_seq_len
 
 
 def _tq4_workspace_bytes(
@@ -510,6 +531,33 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             0
             if getattr(self, "_tq4_cache", False)
             else super()._page_table_padding_value()
+        )
+
+    def get_cuda_graph_max_seq_len(self) -> int:
+        if not self._tq4_cache:
+            return super().get_cuda_graph_max_seq_len()
+        return _tq4_codebook_cuda_graph_max_seq_len(
+            self.max_context_len,
+            self._tq_pool.kv_nope_codebook_buffer is not None,
+        )
+
+    def can_run_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        graph_max_seq_len = self.get_cuda_graph_max_seq_len()
+        if graph_max_seq_len >= self.max_context_len:
+            return True
+
+        extra_kv_tokens = (
+            self.num_draft_tokens
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                or forward_batch.forward_mode.is_draft_extend_v2()
+            )
+            else 0
+        )
+        return _tq4_codebook_cuda_graph_eligible(
+            getattr(forward_batch, "seq_lens_cpu", None),
+            extra_kv_tokens,
+            graph_max_seq_len,
         )
 
     def _get_decode_kv_cache(self, layer: RadixAttention) -> torch.Tensor:

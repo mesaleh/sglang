@@ -2,15 +2,21 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
+from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import (
     TokenspeedMLABackend,
     _supports_custom_decode_mask,
+    _tq4_codebook_cuda_graph_eligible,
+    _tq4_codebook_cuda_graph_max_seq_len,
     _tq4_kernel_max_seq_len,
     _tq4_split_override,
     _tq4_workspace_bytes,
 )
 from sglang.srt.layers.attention.trtllm_mla_backend import TRTLLMMLABackend
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 
@@ -51,6 +57,67 @@ def test_tq4_kernel_max_seq_len_clamps_capture_padding_only():
 def test_tq4_workspace_tracks_fixed_split_graph_shape():
     assert _tq4_workspace_bytes(8, 8, 512, 5, 64) == 42_024_960
     assert _tq4_workspace_bytes(1, 8, 512, 5, 1) == 0
+
+
+def test_tq4_codebook_graph_bound_and_verifier_accounting():
+    assert _tq4_codebook_cuda_graph_max_seq_len(256_000, True) == 32_768
+    assert _tq4_codebook_cuda_graph_max_seq_len(256_000, False) == 256_000
+    assert _tq4_codebook_cuda_graph_max_seq_len(16_384, True) == 16_384
+
+    assert _tq4_codebook_cuda_graph_eligible(
+        torch.tensor([32_763], dtype=torch.int32), 5, 32_768
+    )
+    assert not _tq4_codebook_cuda_graph_eligible(
+        torch.tensor([32_764], dtype=torch.int32), 5, 32_768
+    )
+    assert not _tq4_codebook_cuda_graph_eligible(None, 0, 32_768)
+    assert not _tq4_codebook_cuda_graph_eligible(
+        torch.empty(0, dtype=torch.int32), 0, 32_768
+    )
+
+
+def test_tq4_codebook_backend_fails_closed_above_graph_bound():
+    backend = object.__new__(TokenspeedMLABackend)
+    backend._tq4_cache = True
+    backend._tq_pool = SimpleNamespace(kv_nope_codebook_buffer=object())
+    backend.max_context_len = 256_000
+    backend.num_draft_tokens = 5
+
+    exact_boundary = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens_cpu=torch.tensor([32_763], dtype=torch.int32),
+    )
+    one_token_over = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        seq_lens_cpu=torch.tensor([32_764], dtype=torch.int32),
+    )
+    missing_host_lengths = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        seq_lens_cpu=None,
+    )
+
+    assert backend.get_cuda_graph_max_seq_len() == 32_768
+    assert backend.can_run_cuda_graph(exact_boundary)
+    assert not backend.can_run_cuda_graph(one_token_over)
+    assert not backend.can_run_cuda_graph(missing_host_lengths)
+
+    backend._tq_pool.kv_nope_codebook_buffer = None
+    assert backend.get_cuda_graph_max_seq_len() == 256_000
+    assert backend.can_run_cuda_graph(missing_host_lengths)
+
+
+def test_attention_graph_policy_defaults_true_and_hybrid_delegates():
+    assert AttentionBackend().can_run_cuda_graph(SimpleNamespace())
+
+    hybrid = object.__new__(HybridAttnBackend)
+    hybrid.model_runner = SimpleNamespace(
+        server_args=SimpleNamespace(speculative_attention_mode="decode")
+    )
+    hybrid.decode_backend = SimpleNamespace(can_run_cuda_graph=lambda batch: False)
+    hybrid.prefill_backend = SimpleNamespace(can_run_cuda_graph=lambda batch: True)
+    decode_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+    assert not hybrid.can_run_cuda_graph(decode_batch)
 
 
 def test_tq4_absorb_rotation_does_not_override_mha_prefill():

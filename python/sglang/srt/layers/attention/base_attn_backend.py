@@ -127,6 +127,15 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
+    def can_run_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this batch is safe to replay with captured attention state.
+
+        Backends whose graph metadata covers only a bounded subset of their
+        eager-mode shapes can override this hook and fail closed to eager
+        execution. The default preserves existing behavior.
+        """
+        return True
+
     def on_after_cuda_graph_warmup(self):
         """Hook between cuda graph warmup pass and the actual capture.
 
