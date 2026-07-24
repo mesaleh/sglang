@@ -541,6 +541,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             self._tq_pool.kv_nope_codebook_buffer is not None,
         )
 
+    def get_cuda_graph_max_prefix_len(self, forward_mode: ForwardMode) -> int:
+        graph_max_seq_len = self.get_cuda_graph_max_seq_len()
+        if self._tq4_cache and (
+            forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
+        ):
+            return graph_max_seq_len - self.num_draft_tokens
+        return graph_max_seq_len
+
     def can_run_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
         graph_max_seq_len = self.get_cuda_graph_max_seq_len()
         if graph_max_seq_len >= self.max_context_len:

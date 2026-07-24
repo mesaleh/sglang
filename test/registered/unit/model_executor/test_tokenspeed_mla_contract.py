@@ -110,6 +110,10 @@ def test_tq4_codebook_backend_fails_closed_above_graph_bound():
     )
 
     assert backend.get_cuda_graph_max_seq_len() == 32_768
+    assert (
+        backend.get_cuda_graph_max_prefix_len(ForwardMode.TARGET_VERIFY) == 32_763
+    )
+    assert backend.get_cuda_graph_max_prefix_len(ForwardMode.DECODE) == 32_768
     assert backend.can_run_cuda_graph(exact_boundary)
     assert not backend.can_run_cuda_graph(one_token_over)
     assert not backend.can_run_cuda_graph(missing_host_lengths)

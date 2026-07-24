@@ -785,12 +785,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Capture the width admitted by this backend. Backends that return less
         # than max_context_len must reject longer replay via can_run_cuda_graph.
         graph_max_seq_len = self.get_cuda_graph_max_seq_len()
+        graph_max_prefix_len = self.get_cuda_graph_max_prefix_len(forward_mode)
         max_blocks_per_seq = self._calc_padded_blocks(graph_max_seq_len)
         block_kv_indices = _capture_block_table(
             self.decode_cuda_graph_kv_indices, bs, max_blocks_per_seq
         )
         metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = graph_max_seq_len
+        metadata.max_seq_len_k = graph_max_prefix_len
         metadata.batch_size = bs
 
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -868,6 +869,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def get_cuda_graph_max_seq_len(self) -> int:
         """Maximum KV length represented by captured decode metadata."""
         return self.max_context_len
+
+    def get_cuda_graph_max_prefix_len(self, forward_mode: ForwardMode) -> int:
+        """Prefix bound before a speculative backend appends query tokens."""
+        return self.get_cuda_graph_max_seq_len()
 
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
