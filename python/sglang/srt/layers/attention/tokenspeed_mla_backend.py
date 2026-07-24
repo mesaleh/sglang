@@ -81,20 +81,19 @@ def _find_mla_turboquant_pool(token_to_kv_pool):
 
 def _tq4_split_override(batch_size: int, max_seq_len: int, num_sms: int) -> int:
     # Keep graph-capture shapes on one compact CuTe specialization.  The
-    # packed conversion loop is specialized by tiles-per-split, so scaling
-    # the split count down with batch size creates a different, increasingly
-    # large unrolled kernel for every captured batch.  Sixty-four splits is
-    # already the c1 decode choice on GB200 and bounds the 32K conversion loop
-    # at four 128-token tiles for every graph shape.
+    # split count stays fixed across graph batch sizes; packed tile traversal
+    # is runtime-rolled when a configured context assigns more than four
+    # 128-token tiles to each split. Sixty-four splits is already the c1
+    # decode choice on GB200.
     del batch_size, num_sms
     tiles = (max_seq_len + 127) // 128
     return min(tiles, 64)
 
 
 def _tq4_kernel_max_seq_len(requested: int, configured: int) -> int:
-    if configured > 32768:
+    if configured > 262144:
         raise ValueError(
-            "native TurboQuant MLA requires context_length <= 32768; "
+            "native TurboQuant MLA requires context_length <= 262144; "
             f"got {configured}"
         )
     return min(requested, configured)

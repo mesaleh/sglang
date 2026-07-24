@@ -34,14 +34,18 @@ def test_tq4_split_override_keeps_one_compact_graph_specialization():
     assert _tq4_split_override(batch_size=1, max_seq_len=129, num_sms=148) == 2
     assert _tq4_split_override(batch_size=1, max_seq_len=10_000, num_sms=148) == 64
     assert _tq4_split_override(batch_size=8, max_seq_len=10_000, num_sms=148) == 64
+    assert _tq4_split_override(batch_size=1, max_seq_len=256_000, num_sms=148) == 64
+    assert _tq4_split_override(batch_size=8, max_seq_len=262_144, num_sms=148) == 64
 
 
 def test_tq4_kernel_max_seq_len_clamps_capture_padding_only():
     assert _tq4_kernel_max_seq_len(32_768, 32_768) == 32_768
     assert _tq4_kernel_max_seq_len(32_773, 32_768) == 32_768
+    assert _tq4_kernel_max_seq_len(256_005, 256_000) == 256_000
+    assert _tq4_kernel_max_seq_len(262_144, 262_144) == 262_144
 
-    with pytest.raises(ValueError, match="context_length <= 32768"):
-        _tq4_kernel_max_seq_len(32_769, 32_769)
+    with pytest.raises(ValueError, match="context_length <= 262144"):
+        _tq4_kernel_max_seq_len(262_145, 262_145)
 
 
 def test_tq4_workspace_tracks_fixed_split_graph_shape():
