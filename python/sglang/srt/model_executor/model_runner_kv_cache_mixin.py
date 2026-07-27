@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -145,6 +146,13 @@ def _validate_tq_hotcold_server_args(
         violations.append("--attention-context-parallel-size 1")
     if server_args.enable_dp_attention:
         violations.append("DP attention disabled")
+    if envs.SGLANG_TQ_MLA_STAGED_FLASHMLA.get():
+        violations.append("SGLANG_TQ_MLA_STAGED_FLASHMLA disabled")
+    legacy_active_shadow = os.getenv(
+        "SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW", ""
+    ).strip().lower()
+    if legacy_active_shadow not in ("", "0", "false", "no", "off"):
+        violations.append("SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW disabled")
     if violations:
         raise ValueError(
             "SGLANG_TQ_MLA_HOT_TOKENS enables the experimental static "

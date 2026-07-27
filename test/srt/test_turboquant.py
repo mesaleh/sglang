@@ -377,6 +377,54 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
         with envs.SGLANG_TQ_MLA_HOT_TOKENS.override(0):
             _validate_tq_hotcold_server_args(SimpleNamespace())
 
+    def test_hotcold_gate_rejects_conflicting_shadow_and_staging_modes(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            _validate_tq_hotcold_server_args,
+        )
+
+        valid = SimpleNamespace(
+            kv_cache_dtype="turboquant_4bit",
+            get_attention_backends=lambda: ("tokenspeed_mla", "tokenspeed_mla"),
+            page_size=32,
+            disable_radix_cache=True,
+            max_running_requests=1,
+            dcp_size=1,
+            enable_hierarchical_cache=False,
+            disaggregation_mode="null",
+            attn_cp_size=1,
+            enable_dp_attention=False,
+        )
+        with (
+            envs.SGLANG_TQ_MLA_HOT_TOKENS.override(16_384),
+            envs.SGLANG_TQ_MLA_STAGED_FLASHMLA.override(True),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_TQ_MLA_STAGED_FLASHMLA disabled"
+            ):
+                _validate_tq_hotcold_server_args(valid)
+
+        with (
+            envs.SGLANG_TQ_MLA_HOT_TOKENS.override(16_384),
+            patch.dict(
+                os.environ,
+                {"SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW": "1"},
+            ),
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW disabled"
+            ):
+                _validate_tq_hotcold_server_args(valid)
+
+        with (
+            envs.SGLANG_TQ_MLA_HOT_TOKENS.override(16_384),
+            patch.dict(
+                os.environ,
+                {"SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW": "0"},
+            ),
+        ):
+            _validate_tq_hotcold_server_args(valid)
+
     def test_hotcold_pool_sizing_uses_fixed_hot_tier_premium(self):
         import torch
 
