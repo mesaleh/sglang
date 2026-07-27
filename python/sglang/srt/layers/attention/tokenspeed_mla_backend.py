@@ -71,6 +71,10 @@ def _supports_custom_decode_mask(decode_fn) -> bool:
     return "custom_mask" in parameters and "cmask_off" in parameters
 
 
+def _supports_decode_lse(decode_fn) -> bool:
+    return "return_lse" in signature(decode_fn).parameters
+
+
 def _find_mla_turboquant_pool(token_to_kv_pool):
     if getattr(token_to_kv_pool, "is_mla_turboquant_pool", False):
         return token_to_kv_pool
@@ -251,6 +255,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
     supports_custom_decode_mask: bool = is_tokenspeed_mla_available() and (
         _supports_custom_decode_mask(tokenspeed_mla.tokenspeed_mla_decode)
     )
+    supports_decode_lse: bool = is_tokenspeed_mla_available() and (
+        _supports_decode_lse(tokenspeed_mla.tokenspeed_mla_decode)
+    )
 
     def __init__(
         self,
@@ -302,6 +309,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         if self._tq4_cache and not hasattr(tokenspeed_mla, "tokenspeed_mla_decode_tq4"):
             raise RuntimeError(
                 "installed tokenspeed_mla does not provide native TQ4 decode"
+            )
+        if self._tq4_hotcold_cache and not self.supports_custom_decode_mask:
+            raise RuntimeError(
+                "static hot/cold TurboQuant requires a TokenSpeed decode "
+                "kernel with custom_mask and cmask_off support"
+            )
+        if self._tq4_hotcold_cache and not self.supports_decode_lse:
+            raise RuntimeError(
+                "static hot/cold TurboQuant requires a TokenSpeed decode "
+                "kernel with return_lse support"
             )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
@@ -500,6 +517,46 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         if mode.is_target_verify():
             max_seq_len += self.num_draft_tokens
         return max_seq_len <= self._tq_pool.hot_capacity_tokens
+
+    def hotcold_kv_write_logical_start(self, forward_batch: ForwardBatch) -> int:
+        """Return the CPU-known logical position of the first KV write."""
+        if not self._tq4_hotcold_cache or forward_batch.batch_size != 1:
+            raise RuntimeError(
+                "static hot/cold TurboQuant KV writes require batch_size=1"
+            )
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify():
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None or len(seq_lens_cpu) != 1:
+                raise RuntimeError(
+                    "static hot/cold target verification requires one CPU "
+                    "sequence length"
+                )
+            logical_start = int(seq_lens_cpu[0])
+        elif mode.is_decode_or_idle():
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is None or len(seq_lens_cpu) != 1:
+                raise RuntimeError(
+                    "static hot/cold decode requires one CPU sequence length"
+                )
+            logical_start = int(seq_lens_cpu[0]) - int(
+                forward_batch.out_cache_loc.numel()
+            )
+        else:
+            prefix_lens_cpu = getattr(
+                forward_batch, "extend_prefix_lens_cpu", None
+            )
+            if prefix_lens_cpu is None or len(prefix_lens_cpu) != 1:
+                raise RuntimeError(
+                    "static hot/cold extend requires one CPU prefix length"
+                )
+            logical_start = int(prefix_lens_cpu[0])
+        if logical_start < 0:
+            raise RuntimeError(
+                "static hot/cold TurboQuant computed a negative KV write "
+                f"position: {logical_start}"
+            )
+        return logical_start
 
     def _validate_hotcold_forward_batch(self, forward_batch: ForwardBatch) -> None:
         """Reject unsupported speculative crossing before any layer writes KV."""
@@ -843,10 +900,18 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 seq_lens=hot_seq_lens,
                 max_seq_len=hot_seq_len,
                 causal_mask=False,
-                custom_mask=hot_custom_mask,
-                cmask_off=zero_mask_offset,
                 return_lse=True,
             )
+            if self.supports_custom_decode_mask:
+                hot_decode_kwargs.update(
+                    custom_mask=hot_custom_mask,
+                    cmask_off=zero_mask_offset,
+                )
+            elif hot_custom_mask is not None:
+                raise RuntimeError(
+                    "segmented hot/cold decode requires TokenSpeed custom-mask "
+                    "support for this query shape"
+                )
             hot_output, hot_lse = tokenspeed_mla.tokenspeed_mla_decode(
                 **hot_decode_kwargs
             )

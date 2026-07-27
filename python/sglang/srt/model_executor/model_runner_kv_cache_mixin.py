@@ -20,6 +20,7 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.kv_turboquant import (
     should_allocate_mla_tq_fp8_codebook,
@@ -146,6 +147,20 @@ def _validate_tq_hotcold_server_args(
         violations.append("--attention-context-parallel-size 1")
     if server_args.enable_dp_attention:
         violations.append("DP attention disabled")
+    speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
+    if speculative_algorithm not in (None, "DFLASH"):
+        violations.append("speculative decoding disabled or DFLASH")
+    cuda_graph_config = getattr(server_args, "cuda_graph_config", None)
+    prefill_graph_backend = getattr(
+        getattr(cuda_graph_config, "prefill", None),
+        "backend",
+        Backend.DISABLED,
+    )
+    if prefill_graph_backend != Backend.DISABLED:
+        violations.append("prefill CUDA graphs disabled")
+    hot_capacity_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
+    if hot_capacity_tokens % 128:
+        violations.append("SGLANG_TQ_MLA_HOT_TOKENS aligned to 128 tokens")
     if envs.SGLANG_TQ_MLA_STAGED_FLASHMLA.get():
         violations.append("SGLANG_TQ_MLA_STAGED_FLASHMLA disabled")
     legacy_active_shadow = os.getenv(
@@ -946,6 +961,11 @@ class ModelRunnerKVCacheMixin:
                 # The pool class itself enforces k_bits == 4 (raises otherwise),
                 # matching the sizing assumption in pool_configurator.py.
                 hot_capacity_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
+                if hot_capacity_tokens > 0 and self.is_draft_worker:
+                    raise ValueError(
+                        "static hot/cold TurboQuant must not be constructed "
+                        "for a speculative draft worker"
+                    )
                 PoolCls = (
                     MLATokenToKVPoolTurboQuantHotCold
                     if hot_capacity_tokens > 0

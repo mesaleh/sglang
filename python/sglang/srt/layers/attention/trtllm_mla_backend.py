@@ -1247,8 +1247,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            write_kwargs = (
+                {
+                    "logical_start": self.hotcold_kv_write_logical_start(
+                        forward_batch
+                    )
+                }
+                if getattr(self, "_tq4_hotcold_cache", False)
+                else {}
+            )
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+                layer, forward_batch.out_cache_loc, k, k_rope, **write_kwargs
             )
 
         # Prepare query tensor inline
@@ -1384,8 +1393,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert (
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
+            write_kwargs = (
+                {
+                    "logical_start": self.hotcold_kv_write_logical_start(
+                        forward_batch
+                    )
+                }
+                if getattr(self, "_tq4_hotcold_cache", False)
+                else {}
+            )
             self.token_to_kv_pool.set_mla_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, k_rope
+                layer, forward_batch.out_cache_loc, k, k_rope, **write_kwargs
             )
 
         # TODO refactor to avoid code duplication

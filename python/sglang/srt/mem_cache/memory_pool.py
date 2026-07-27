@@ -4078,6 +4078,12 @@ class MLATokenToKVPoolTurboQuantHotCold(MLATokenToKVPoolTurboQuant):
                 "hot/cold TurboQuant hot capacity must be page aligned; "
                 f"got hot={hot_capacity_tokens}, page_size={page_size}"
             )
+        if hot_capacity_tokens % 128:
+            raise ValueError(
+                "hot/cold TurboQuant hot capacity must be aligned to the "
+                "128-token native-reader tile; "
+                f"got hot={hot_capacity_tokens}"
+            )
         if size % page_size:
             raise ValueError(
                 "hot/cold TurboQuant total capacity must be page aligned; "

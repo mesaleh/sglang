@@ -425,6 +425,70 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
         ):
             _validate_tq_hotcold_server_args(valid)
 
+    def test_hotcold_gate_rejects_unsafe_graph_spec_and_tile_modes(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
+            _validate_tq_hotcold_server_args,
+        )
+
+        base = dict(
+            kv_cache_dtype="turboquant_4bit_e2m1",
+            get_attention_backends=lambda: ("tokenspeed_mla", "tokenspeed_mla"),
+            page_size=32,
+            disable_radix_cache=True,
+            max_running_requests=1,
+            dcp_size=1,
+            enable_hierarchical_cache=False,
+            disaggregation_mode="null",
+            attn_cp_size=1,
+            enable_dp_attention=False,
+            speculative_algorithm=None,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled")
+            ),
+        )
+        with envs.SGLANG_TQ_MLA_HOT_TOKENS.override(16_384):
+            _validate_tq_hotcold_server_args(SimpleNamespace(**base))
+            _validate_tq_hotcold_server_args(
+                SimpleNamespace(**(base | {"speculative_algorithm": "DFLASH"}))
+            )
+            with self.assertRaisesRegex(
+                ValueError, "speculative decoding disabled or DFLASH"
+            ):
+                _validate_tq_hotcold_server_args(
+                    SimpleNamespace(
+                        **(base | {"speculative_algorithm": "EAGLE3"})
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "prefill CUDA graphs disabled"):
+                _validate_tq_hotcold_server_args(
+                    SimpleNamespace(
+                        **(
+                            base
+                            | {
+                                "cuda_graph_config": SimpleNamespace(
+                                    prefill=SimpleNamespace(backend="breakable")
+                                )
+                            }
+                        )
+                    )
+                )
+        with envs.SGLANG_TQ_MLA_HOT_TOKENS.override(16_352):
+            with self.assertRaisesRegex(ValueError, "aligned to 128 tokens"):
+                _validate_tq_hotcold_server_args(SimpleNamespace(**base))
+
+    def test_hotcold_pool_rejects_page_aligned_partial_reader_tile(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolTurboQuantHotCold,
+        )
+
+        with self.assertRaisesRegex(ValueError, "128-token native-reader tile"):
+            MLATokenToKVPoolTurboQuantHotCold(
+                256,
+                page_size=32,
+                hot_capacity_tokens=160,
+            )
+
     def test_hotcold_pool_sizing_uses_fixed_hot_tier_premium(self):
         import torch
 
@@ -1518,12 +1582,12 @@ class TestTurboQuantGPU(unittest.TestCase):
             MLATokenToKVPoolTurboQuantHotCold,
         )
 
-        size = 128
+        size = 256
         page_size = 32
-        hot_tokens = 64
+        hot_tokens = 128
         layer = SimpleNamespace(layer_id=0)
-        hot_loc = torch.tensor([32, 95], device=self.device)
-        cold_loc = torch.tensor([96, 159], device=self.device)
+        hot_loc = torch.tensor([32, 159], device=self.device)
+        cold_loc = torch.tensor([160, 287], device=self.device)
         hot_cache = torch.randn(
             2, 1, 576, dtype=torch.bfloat16, device=self.device
         )
@@ -1714,8 +1778,8 @@ class TestTurboQuantGPU(unittest.TestCase):
             pool.kv_hot_buffer[0][64], pool.kv_hot_buffer[0][32]
         )
         pool.move_kv_cache(
-            torch.tensor([128], device=self.device),
-            torch.tensor([96], device=self.device),
+            torch.tensor([192], device=self.device),
+            torch.tensor([160], device=self.device),
         )
         torch.testing.assert_close(
             pool.kv_nope_packed_buffer[0][64],
@@ -1723,7 +1787,7 @@ class TestTurboQuantGPU(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "cross-tier move"):
             pool.move_kv_cache(
-                torch.tensor([96], device=self.device),
+                torch.tensor([160], device=self.device),
                 torch.tensor([32], device=self.device),
             )
 
@@ -2037,6 +2101,12 @@ class TestTurboQuantGPU(unittest.TestCase):
                 ),
             )
         fused_frontend.assert_called_once()
+        self.assertEqual(
+            backend.token_to_kv_pool.set_mla_kv_buffer.call_args.kwargs[
+                "logical_start"
+            ],
+            63,
+        )
         parent_query = backend._run_decode_kernel.call_args.kwargs["query"]
         self.assertIs(parent_query.dtype, torch.float8_e4m3fn)
         torch.testing.assert_close(
@@ -2137,6 +2207,12 @@ class TestTurboQuantGPU(unittest.TestCase):
                 cos_sin_cache=torch.empty(0, device=self.device),
             )
         fused_frontend.assert_called_once()
+        self.assertEqual(
+            backend.token_to_kv_pool.set_mla_kv_buffer.call_args.kwargs[
+                "logical_start"
+            ],
+            64,
+        )
         parent_query = backend._run_decode_kernel.call_args.kwargs["query"]
         self.assertIs(parent_query.dtype, torch.float8_e4m3fn)
         torch.testing.assert_close(
