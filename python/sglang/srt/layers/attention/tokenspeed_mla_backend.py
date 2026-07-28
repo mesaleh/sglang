@@ -320,6 +320,13 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 "static hot/cold TurboQuant requires a TokenSpeed decode "
                 "kernel with return_lse support"
             )
+        if self._tq4_hotcold_cache and not hasattr(
+            tokenspeed_mla, "merge_attention_outputs_base2"
+        ):
+            raise RuntimeError(
+                "static hot/cold TurboQuant requires TokenSpeed "
+                "merge_attention_outputs_base2 support"
+            )
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
@@ -479,10 +486,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
 
-        # k_pe is shared across heads (RoPE is position-only), so head 0
-        # reproduces the original [tokens, 1, qk_rope] latent layout.
-        kv_a_fp8 = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl())
-        k_pe_fp8 = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
         logical_start = None
         if (
             self._tq4_hotcold_cache
@@ -490,11 +493,33 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             and forward_batch.extend_prefix_lens_cpu is not None
         ):
             logical_start = int(forward_batch.extend_prefix_lens_cpu[0])
+
+        # Attention consumes FP8 Q/K/V, but persistent TQ rows must quantize
+        # the original BF16 latent rather than an already FP8-rounded copy.
+        # Preserve the established direct-FP8 writer for an entirely hot
+        # prefill; when any row reaches the cold tier, compute BF16 RoPE and
+        # let the disjoint pool quantize its own hot subset.
+        writes_cold_tq = self._tq4_cache and (
+            not self._tq4_hotcold_cache
+            or logical_start is None
+            or logical_start + forward_batch.out_cache_loc.numel()
+            > self._tq_pool.hot_capacity_tokens
+        )
+        if writes_cold_tq:
+            _, cache_k_pe = layer.rotary_emb(positions, q_pe, k_pe)
+            cache_kv_a = kv_a.unsqueeze(1)
+        else:
+            # k_pe is shared across heads (RoPE is position-only), so head 0
+            # reproduces the original [tokens, 1, qk_rope] latent layout.
+            cache_kv_a = fp8_quantize(
+                kv_a, enable_pdl=is_arch_support_pdl()
+            ).unsqueeze(1)
+            cache_k_pe = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
             forward_batch.out_cache_loc,
-            kv_a_fp8.unsqueeze(1),
-            k_pe_fp8,
+            cache_kv_a,
+            cache_k_pe,
             **(
                 {"logical_start": logical_start}
                 if self._tq4_hotcold_cache

@@ -171,6 +171,34 @@ def test_tq4_rotation_fusion_uses_resolved_decode_backend():
     explicit_native_decode._maybe_fuse_tq_mla_absorb_rotations.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "disable_chunked_prefix_cache,prefill_graph_backend",
+    [(True, "disabled"), (False, "tc_piecewise")],
+)
+def test_tq4_rotation_fusion_skips_generic_extend_fallbacks(
+    disable_chunked_prefix_cache, prefill_graph_backend
+):
+    runner = object.__new__(ModelRunner)
+    runner.turboquant_bits = 4
+    runner.token_to_kv_pool_allocator = SimpleNamespace(
+        get_kvcache=lambda: SimpleNamespace(tq_config=SimpleNamespace())
+    )
+    runner.use_mla_backend = True
+    runner.server_args = SimpleNamespace(
+        enable_lora=False,
+        disable_chunked_prefix_cache=disable_chunked_prefix_cache,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend=prefill_graph_backend)
+        ),
+        get_attention_backends=lambda: ("tokenspeed_mla", "tokenspeed_mla"),
+    )
+    runner._maybe_fuse_tq_mla_absorb_rotations = Mock()
+
+    ModelRunner._maybe_fuse_tq_output_rotation(runner)
+
+    runner._maybe_fuse_tq_mla_absorb_rotations.assert_not_called()
+
+
 def test_tq4_rotation_fusion_is_idempotent():
     runner = object.__new__(ModelRunner)
     runner.model = SimpleNamespace(

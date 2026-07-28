@@ -2774,6 +2774,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "for the cold TQ4 segment."
                     )
                     return
+                prefill_graph_backend = getattr(
+                    getattr(
+                        getattr(self.server_args, "cuda_graph_config", None),
+                        "prefill",
+                        None,
+                    ),
+                    "backend",
+                    Backend.DISABLED,
+                )
+                if getattr(
+                    self.server_args, "disable_chunked_prefix_cache", False
+                ) or prefill_graph_backend == Backend.TC_PIECEWISE:
+                    # These extend modes can fall back to the generic MLA
+                    # reader, which reconstructs keys in the original basis.
+                    # Keep the absorb weights in that same basis and rotate
+                    # only inside the native TQ4 decode kernel.
+                    logger.info(
+                        "TurboQuant native MLA: keeping runtime rotations "
+                        "because an extend fallback is enabled."
+                    )
+                    return
                 self._maybe_fuse_tq_mla_absorb_rotations(tq_cfg, logger)
                 return
 

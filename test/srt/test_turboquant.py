@@ -565,6 +565,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
         )
 
         backend = object.__new__(TokenspeedMLABackend)
+        backend._tq4_cache = True
         backend._tq4_hotcold_cache = True
         backend._tq_pool = SimpleNamespace(hot_capacity_tokens=128)
         backend.num_draft_tokens = 5
@@ -1946,7 +1947,9 @@ class TestTurboQuantGPU(unittest.TestCase):
         )
 
         backend = object.__new__(TokenspeedMLABackend)
+        backend._tq4_cache = True
         backend._tq4_hotcold_cache = True
+        backend._tq_pool = SimpleNamespace(hot_capacity_tokens=128)
         backend.token_to_kv_pool = Mock()
         backend._fused_rope_fp8_quantize = Mock(
             return_value=(
@@ -1958,6 +1961,11 @@ class TestTurboQuantGPU(unittest.TestCase):
                 ),
             )
         )
+        rotary_emb = Mock(
+            side_effect=lambda _positions, q_pe, k_pe: (q_pe + 1, k_pe + 2)
+        )
+        rotary_emb.cos_sin_cache = torch.empty(0, device=self.device)
+        rotary_emb.is_neox_style = True
         layer = SimpleNamespace(
             kv_b_proj=Mock(
                 return_value=(
@@ -1970,15 +1978,12 @@ class TestTurboQuantGPU(unittest.TestCase):
             qk_nope_head_dim=512,
             v_head_dim=512,
             qk_rope_head_dim=64,
-            rotary_emb=SimpleNamespace(
-                cos_sin_cache=torch.empty(0, device=self.device),
-                is_neox_style=True,
-            ),
+            rotary_emb=rotary_emb,
             attn_mha=SimpleNamespace(layer_id=0),
         )
         batch = SimpleNamespace(
             batch_size=1,
-            extend_prefix_lens_cpu=[123],
+            extend_prefix_lens_cpu=[127],
             out_cache_loc=torch.tensor(
                 [160, 161], dtype=torch.int64, device=self.device
             ),
@@ -2009,8 +2014,39 @@ class TestTurboQuantGPU(unittest.TestCase):
             backend.token_to_kv_pool.set_mla_kv_buffer.call_args.kwargs[
                 "logical_start"
             ],
-            123,
+            127,
         )
+        cache_write = backend.token_to_kv_pool.set_mla_kv_buffer.call_args.args
+        self.assertIs(cache_write[2].dtype, torch.bfloat16)
+        self.assertIs(cache_write[3].dtype, torch.bfloat16)
+        torch.testing.assert_close(cache_write[2], kv_a.unsqueeze(1))
+        torch.testing.assert_close(cache_write[3], k_pe + 2)
+
+        # An entirely hot prefill keeps the incumbent direct-FP8 writer and
+        # avoids the extra BF16 RoPE pass used to protect cold TQ rows.
+        rotary_emb.reset_mock()
+        backend.token_to_kv_pool.reset_mock()
+        batch.extend_prefix_lens_cpu = [0]
+        batch.out_cache_loc = torch.tensor(
+            [32, 33], dtype=torch.int64, device=self.device
+        )
+        with patch(
+            "sglang.srt.layers.attention.tokenspeed_mla_backend.fp8_quantize",
+            side_effect=lambda tensor, **_: tensor.to(torch.float8_e4m3fn),
+        ):
+            backend.prepare_prefill_qkv(
+                q=q,
+                q_pe=q[..., 512:],
+                kv_a=kv_a,
+                k_pe=k_pe,
+                positions=torch.arange(2, device=self.device),
+                layer=layer,
+                forward_batch=batch,
+            )
+        rotary_emb.assert_not_called()
+        hot_write = backend.token_to_kv_pool.set_mla_kv_buffer.call_args.args
+        self.assertIs(hot_write[2].dtype, torch.float8_e4m3fn)
+        self.assertIs(hot_write[3].dtype, torch.float8_e4m3fn)
 
     def test_hotcold_parent_decode_uses_incumbent_fp8_frontend(self):
         from sglang.srt.layers.attention.tokenspeed_mla_backend import (
