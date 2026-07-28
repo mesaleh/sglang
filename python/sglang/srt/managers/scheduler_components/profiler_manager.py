@@ -111,6 +111,12 @@ class SchedulerProfilerManager:
                 profile_stages=profile_stages,
             )
 
+        if profile_by_stage and (num_steps is None or num_steps <= 0):
+            return ProfileReqOutput(
+                success=False,
+                message="profile_by_stage requires a positive num_steps",
+            )
+
         if self.profile_in_progress:
             return ProfileReqOutput(
                 success=False,
