@@ -358,7 +358,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             # Pre-JIT the prefill kernel variants. Each cute.compile takes 1-2
             # min; without warm-up the first request trips the 300 s scheduler
             # watchdog.
-            if not self._tq4_cache:
+            # Plain TQ4 delegates prefill to the TRT-LLM parent; FP8 and the
+            # hot/cold pool both dispatch to TokenSpeed prefill below.
+            if not (self._tq4_cache and not self._tq4_hotcold_cache):
                 _compile_prefill_kernel = (
                     tokenspeed_mla.mla_prefill._compile_prefill_kernel
                 )
