@@ -84,6 +84,7 @@ def test_tokenspeed_tq4_backend_reads_token_major_packed_pool(
     )
     backend = object.__new__(TokenspeedMLABackend)
     backend._tq4_cache = True
+    backend._tq4_hotcold_cache = False
     backend._tq_pool = pool
     backend._tq_config = config
     backend.page_size = page_size
