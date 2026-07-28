@@ -218,8 +218,27 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 per_layer_per_token = (
                     nope_packed_bytes + scale_bytes + rope_bytes + codebook_bytes
                 )
+                selected_layer_ids = getattr(mr, "turboquant_mla_layer_ids", None)
+                if selected_layer_ids is None:
+                    tq_num_layers = num_layers
+                else:
+                    tq_num_layers = sum(
+                        mr.start_layer <= layer_id < mr.end_layer
+                        for layer_id in selected_layer_ids
+                    )
+                    if tq_num_layers > num_layers:
+                        raise ValueError(
+                            "Local TurboQuant MLA layer count exceeds effective layers: "
+                            f"{tq_num_layers} > {num_layers}"
+                        )
+                fp8_num_layers = num_layers - tq_num_layers
                 hot_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
                 if hot_tokens > 0:
+                    if selected_layer_ids is not None:
+                        raise ValueError(
+                            "layer-wise MLA TurboQuant is incompatible with the static "
+                            "hot/cold cache"
+                        )
                     configured_tokens = mr.server_args.max_total_tokens
                     if configured_tokens is None or configured_tokens <= hot_tokens:
                         raise ValueError(
@@ -234,11 +253,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # when that full cap fits and otherwise overestimates
                     # capacity under constrained memory.
                     self._fixed_size = (
-                        hot_tokens
-                        * (fp8_bytes - per_layer_per_token)
-                        * num_layers
+                        hot_tokens * (fp8_bytes - per_layer_per_token) * num_layers
                     )
-                cell_size = per_layer_per_token * num_layers
+                cell_size = (
+                    per_layer_per_token * tq_num_layers + (lora + rope) * fp8_num_layers
+                )
             else:
                 cell_size = (
                     (model_config.kv_lora_rank + model_config.qk_rope_head_dim)

@@ -2463,6 +2463,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.kv_cache_dtype = resolved
 
     def configure_kv_cache_dtype(self):
+        turboquant_mla_layer_spec = getattr(
+            self.server_args, "turboquant_mla_layer_ids", None
+        )
+        if (
+            turboquant_mla_layer_spec is not None
+            and not self.server_args.kv_cache_dtype.startswith("turboquant_")
+        ):
+            raise ValueError(
+                "--turboquant-mla-layer-ids requires --kv-cache-dtype turboquant_*"
+            )
         # The DFlash draft owns an independent MHA cache. A target-level
         # TurboQuant setting must not leak into that cache: FA4 consumes the
         # draft model's compute dtype, and treating the draft as TurboQuant
@@ -2521,6 +2531,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype.startswith("turboquant_"):
             import re
 
+            from sglang.srt.layers.quantization.kv_turboquant import (
+                parse_mla_turboquant_layer_ids,
+            )
+
             tq_str = self.server_args.kv_cache_dtype.split("_", 1)[1]
             # Native E2M1 uses TurboQuant's rotation and norm correction, but
             # persists actual SM100 FP4 nibble encodings instead of Lloyd bins.
@@ -2552,6 +2566,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "turboquant_4bit_e2m1 currently requires an MLA model "
                     "with symmetric 4-bit latent storage"
                 )
+            if turboquant_mla_layer_spec is not None:
+                if not self.use_mla_backend:
+                    raise ValueError(
+                        "--turboquant-mla-layer-ids is supported only for MLA models"
+                    )
+                self.turboquant_mla_layer_ids = parse_mla_turboquant_layer_ids(
+                    turboquant_mla_layer_spec,
+                    self.model_config.num_hidden_layers,
+                )
+                self.server_args.turboquant_mla_layer_ids = ",".join(
+                    str(layer_id) for layer_id in self.turboquant_mla_layer_ids
+                )
+                logger.info(
+                    "MLA TurboQuant selected %d/%d global layers: %s",
+                    len(self.turboquant_mla_layer_ids),
+                    self.model_config.num_hidden_layers,
+                    self.server_args.turboquant_mla_layer_ids,
+                )
+            else:
+                self.turboquant_mla_layer_ids = None
             self.kv_cache_dtype = torch.bfloat16
             # TurboQuant fused decode kernel is Triton-only and MHA-only (from PR #23135).
             # On the MLA path (e.g. Kimi K2.6, DeepSeek-V2), MLATokenToKVPoolTurboQuant
@@ -2774,6 +2808,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "for the cold TQ4 segment."
                     )
                     return
+                if getattr(kvcache, "has_mixed_layer_storage", False):
+                    # Dense layers keep the original FP8 latent and use the
+                    # ordinary TokenSpeed reader. A model-wide w_kc/w_vc
+                    # rotation would therefore corrupt every dense layer.
+                    # Keep query/output rotation inside selected TQ readers.
+                    logger.info(
+                        "TurboQuant layer-wise MLA: keeping runtime rotations "
+                        "for selected compressed layers."
+                    )
+                    return
                 prefill_graph_backend = getattr(
                     getattr(
                         getattr(self.server_args, "cuda_graph_config", None),
@@ -2783,9 +2827,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "backend",
                     Backend.DISABLED,
                 )
-                if getattr(
-                    self.server_args, "disable_chunked_prefix_cache", False
-                ) or prefill_graph_backend == Backend.TC_PIECEWISE:
+                if (
+                    getattr(self.server_args, "disable_chunked_prefix_cache", False)
+                    or prefill_graph_backend == Backend.TC_PIECEWISE
+                ):
                     # These extend modes can fall back to the generic MLA
                     # reader, which reconstructs keys in the original basis.
                     # Keep the absorb weights in that same basis and rotate

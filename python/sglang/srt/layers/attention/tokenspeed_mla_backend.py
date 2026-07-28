@@ -98,15 +98,12 @@ def _tq4_split_override(batch_size: int, max_seq_len: int, num_sms: int) -> int:
 def _tq4_kernel_max_seq_len(requested: int, configured: int) -> int:
     if configured > 262144:
         raise ValueError(
-            "native TurboQuant MLA requires context_length <= 262144; "
-            f"got {configured}"
+            f"native TurboQuant MLA requires context_length <= 262144; got {configured}"
         )
     return min(requested, configured)
 
 
-def _tq4_codebook_cuda_graph_max_seq_len(
-    configured: int, has_codebook: bool
-) -> int:
+def _tq4_codebook_cuda_graph_max_seq_len(configured: int, has_codebook: bool) -> int:
     return (
         min(configured, _TQ4_CODEBOOK_CUDA_GRAPH_MAX_SEQ_LEN)
         if has_codebook
@@ -275,6 +272,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
 
         self._tq_pool = _find_mla_turboquant_pool(self.token_to_kv_pool)
         self._tq4_cache = self._tq_pool is not None
+        self._tq4_all_layers = bool(
+            self._tq4_cache and getattr(self._tq_pool, "all_layers_turboquant", True)
+        )
         self._tq4_hotcold_cache = bool(
             self._tq4_cache
             and getattr(self._tq_pool, "is_mla_turboquant_hotcold_pool", False)
@@ -360,7 +360,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             # watchdog.
             # Plain TQ4 delegates prefill to the TRT-LLM parent; FP8 and the
             # hot/cold pool both dispatch to TokenSpeed prefill below.
-            if not (self._tq4_cache and not self._tq4_hotcold_cache):
+            if not (self._tq4_all_layers and not self._tq4_hotcold_cache):
                 _compile_prefill_kernel = (
                     tokenspeed_mla.mla_prefill._compile_prefill_kernel
                 )
@@ -397,6 +397,29 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                             use_pdl=use_pdl,
                             enable_ex2_emulation=enable_ex2_emulation,
                         )
+
+    def _is_turboquant_layer(self, layer: RadixAttention) -> bool:
+        tq4_cache = getattr(
+            self, "_tq4_cache", getattr(self, "_tq_pool", None) is not None
+        )
+        if not tq4_cache:
+            return False
+        predicate = getattr(
+            getattr(self, "_tq_pool", None), "is_turboquant_layer", None
+        )
+        return predicate(layer.layer_id) if callable(predicate) else True
+
+    def uses_fp8_frontend(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        tq4_cache = getattr(
+            self, "_tq4_cache", getattr(self, "_tq_pool", None) is not None
+        )
+        if not tq4_cache:
+            return self.data_type == torch.float8_e4m3fn
+        if getattr(self, "_tq4_hotcold_cache", False):
+            return self.should_use_hot_fp8_frontend(forward_batch)
+        return not self._is_turboquant_layer(layer)
 
     def _fused_rope_fp8_quantize(
         self,
@@ -501,7 +524,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         # Preserve the established direct-FP8 writer for an entirely hot
         # prefill; when any row reaches the cold tier, compute BF16 RoPE and
         # let the disjoint pool quantize its own hot subset.
-        writes_cold_tq = self._tq4_cache and (
+        writes_cold_tq = self._is_turboquant_layer(layer.attn_mha) and (
             not self._tq4_hotcold_cache
             or logical_start is None
             or logical_start + forward_batch.out_cache_loc.numel()
@@ -513,20 +536,16 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         else:
             # k_pe is shared across heads (RoPE is position-only), so head 0
             # reproduces the original [tokens, 1, qk_rope] latent layout.
-            cache_kv_a = fp8_quantize(
-                kv_a, enable_pdl=is_arch_support_pdl()
-            ).unsqueeze(1)
+            cache_kv_a = fp8_quantize(kv_a, enable_pdl=is_arch_support_pdl()).unsqueeze(
+                1
+            )
             cache_k_pe = k_fp8[:, 0:1, layer.qk_nope_head_dim :]
         self.token_to_kv_pool.set_mla_kv_buffer(
             layer.attn_mha,
             forward_batch.out_cache_loc,
             cache_kv_a,
             cache_k_pe,
-            **(
-                {"logical_start": logical_start}
-                if self._tq4_hotcold_cache
-                else {}
-            ),
+            **({"logical_start": logical_start} if self._tq4_hotcold_cache else {}),
         )
         return q_fp8, k_fp8, v_fp8
 
@@ -570,9 +589,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 forward_batch.out_cache_loc.numel()
             )
         else:
-            prefix_lens_cpu = getattr(
-                forward_batch, "extend_prefix_lens_cpu", None
-            )
+            prefix_lens_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
             if prefix_lens_cpu is None or len(prefix_lens_cpu) != 1:
                 raise RuntimeError(
                     "static hot/cold extend requires one CPU prefix length"
@@ -590,9 +607,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         if not self._tq4_hotcold_cache:
             return
         if forward_batch.batch_size != 1:
-            raise RuntimeError(
-                "static hot/cold TurboQuant requires batch_size=1"
-            )
+            raise RuntimeError("static hot/cold TurboQuant requires batch_size=1")
         mode = forward_batch.forward_mode
         if not (mode.is_target_verify() or mode.is_draft_extend_v2()):
             return
@@ -620,9 +635,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 "without speculative decoding"
             )
 
-    def init_forward_metadata(
-        self, forward_batch: ForwardBatch
-    ):
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
         self._validate_hotcold_forward_batch(forward_batch)
         return super().init_forward_metadata(forward_batch)
 
@@ -753,7 +766,17 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     f"got {hot.shape[0]} tokens for page_size={self.page_size}"
                 )
             return hot.view(-1, self.page_size, hot.shape[-1]).unsqueeze(1)
+        if not self._is_turboquant_layer(layer):
+            fp8 = self._tq_pool.kv_fp8_buffer[layer_id_rel]
+            assert fp8 is not None
+            if fp8.shape[0] % self.page_size != 0:
+                raise RuntimeError(
+                    "FP8 MLA pool token count must be page aligned; "
+                    f"got {fp8.shape[0]} tokens for page_size={self.page_size}"
+                )
+            return fp8.view(-1, self.page_size, fp8.shape[-1]).unsqueeze(1)
         packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+        assert packed is not None
         if packed.shape[0] % self.page_size != 0:
             raise RuntimeError(
                 "TurboQuant pool token count must be page aligned; "
@@ -766,7 +789,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             assert kv_cache.dtype == torch.float8_e4m3fn
             return
         if self._tq4_cache:
-            assert kv_cache.dtype == torch.uint8
+            expected_dtypes = (
+                {torch.uint8, torch.float8_e4m3fn}
+                if not getattr(self, "_tq4_all_layers", True)
+                else {torch.uint8}
+            )
+            assert kv_cache.dtype in expected_dtypes
             return
         super()._validate_decode_kv_cache(kv_cache)
 
@@ -795,16 +823,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             if k_scale is None:
                 k_scale = 1.0
             seq_lens_i32 = (
-                seq_lens
-                if seq_lens.dtype == torch.int32
-                else seq_lens.to(torch.int32)
+                seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
             )
             decode_kwargs = dict(
                 query=query_fp8,
                 kv_cache=kv_cache,
-                workspace_buffer=self._ensure_workspace(
-                    query.device, query.shape[1]
-                ),
+                workspace_buffer=self._ensure_workspace(query.device, query.shape[1]),
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 block_tables=block_tables,
@@ -865,9 +889,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 )
             hot_block_tables = block_tables[:, :hot_page_count]
             cold_actual_block_tables = (
-                block_tables[
-                    :, hot_page_count : hot_page_count + cold_page_count
-                ]
+                block_tables[:, hot_page_count : hot_page_count + cold_page_count]
                 - hot_page_count
             )
             # Static single-request allocation plus disabled radix reuse makes
@@ -886,9 +908,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             cold_block_tables[:, :cold_page_count] = cold_actual_block_tables
 
             q_len = query.shape[1]
-            zero_mask_offset = torch.zeros(
-                1, dtype=torch.int32, device=query.device
-            )
+            zero_mask_offset = torch.zeros(1, dtype=torch.int32, device=query.device)
             hot_custom_mask = None
             cold_custom_mask = None
             if custom_mask is not None:
@@ -897,10 +917,13 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     if custom_mask_offsets is not None
                     else 0
                 )
-                full_mask = custom_mask.view(torch.bool).view(-1)[
-                    custom_mask_offset : custom_mask_offset
-                    + q_len * full_seq_len
-                ].view(q_len, full_seq_len)
+                full_mask = (
+                    custom_mask.view(torch.bool)
+                    .view(-1)[
+                        custom_mask_offset : custom_mask_offset + q_len * full_seq_len
+                    ]
+                    .view(q_len, full_seq_len)
+                )
                 cold_custom_mask = full_mask[:, hot_seq_len:].contiguous()
                 if cold_seq_len < q_len:
                     hot_custom_mask = full_mask[:, :hot_seq_len].contiguous()
@@ -979,9 +1002,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             codebook = (
                 None
                 if e2m1_cache
-                else codebook_buffer[layer_id_rel].view(
-                    -1, self.page_size, 16
-                )
+                else codebook_buffer[layer_id_rel].view(-1, self.page_size, 16)
             )
             split_kv = _tq4_split_override(
                 1,
@@ -1029,7 +1050,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             )
             return merged_output
 
-        if self._tq4_cache:
+        if self._is_turboquant_layer(layer):
             kernel_max_seq_len = _tq4_kernel_max_seq_len(
                 int(max_seq_len), self.max_context_len
             )
@@ -1051,12 +1072,11 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 is_arch_support_pdl(),
             )
             layer_id_rel = layer.layer_id - self._tq_pool.start_layer
-            scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel].view(
-                -1, self.page_size
-            )
-            rope = self._tq_pool.kv_rope_buffer[layer_id_rel].view(
-                -1, self.page_size, self.qk_rope_head_dim
-            )
+            scale_buffer = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
+            rope_buffer = self._tq_pool.kv_rope_buffer[layer_id_rel]
+            assert scale_buffer is not None and rope_buffer is not None
+            scale = scale_buffer.view(-1, self.page_size)
+            rope = rope_buffer.view(-1, self.page_size, self.qk_rope_head_dim)
             e2m1_cache = bool(getattr(self._tq_config, "e2m1", False))
             codebook_buffer = self._tq_pool.kv_nope_codebook_buffer
             if e2m1_cache:
@@ -1069,7 +1089,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                     raise RuntimeError(
                         "TokenSpeed Lloyd TQ4 decode requires its FP8 codebook buffer"
                     )
-                codebook = codebook_buffer[layer_id_rel].view(-1, self.page_size, 16)
+                codebook_layer = codebook_buffer[layer_id_rel]
+                assert codebook_layer is not None
+                codebook = codebook_layer.view(-1, self.page_size, 16)
             seq_lens_i32 = (
                 seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
             )
@@ -1153,7 +1175,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
         # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
-        if self._tq4_cache and not self._tq4_hotcold_cache:
+        if self._is_turboquant_layer(layer) and not self._tq4_hotcold_cache:
             return TRTLLMMLABackend._run_prefill_kernel(
                 self,
                 q,

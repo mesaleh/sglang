@@ -1020,11 +1020,13 @@ class DeepseekMLAForwardMixin:
         if active_backend is None:
             active_backend = get_attn_backend()
         backend_uses_fp8 = (
-            getattr(active_backend, "data_type", None)
-            == torch.float8_e4m3fn
+            getattr(active_backend, "data_type", None) == torch.float8_e4m3fn
         )
         use_hot_fp8_frontend = False
-        if not backend_uses_fp8 and getattr(
+        layer_frontend = getattr(active_backend, "uses_fp8_frontend", None)
+        if callable(layer_frontend):
+            use_hot_fp8_frontend = layer_frontend(self.attn_mha, forward_batch)
+        elif not backend_uses_fp8 and getattr(
             active_backend, "_tq4_hotcold_cache", False
         ):
             use_hot_fp8_frontend = active_backend.should_use_hot_fp8_frontend(

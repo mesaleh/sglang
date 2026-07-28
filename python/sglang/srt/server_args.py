@@ -582,6 +582,18 @@ class ServerArgs:
             resolvable=True,
         ),
     ] = "auto"
+    turboquant_mla_layer_ids: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Optional comma-separated global MLA layer IDs or inclusive ranges "
+                "to store with TurboQuant (for example, '8,12-15,20'). Omit to "
+                "compress every MLA layer. Valid only with --kv-cache-dtype "
+                "turboquant_*."
+            ),
+            type_parser=nullable_str,
+        ),
+    ] = None
     enable_fp32_lm_head: A[
         bool, "If set, the LM head outputs (logits) are in FP32."
     ] = False
@@ -3303,8 +3315,10 @@ class ServerArgs:
             ),
             (
                 "OOT platform without piecewise support",
-                lambda: current_platform.is_out_of_tree()
-                and not current_platform.support_piecewise_cuda_graph(),
+                lambda: (
+                    current_platform.is_out_of_tree()
+                    and not current_platform.support_piecewise_cuda_graph()
+                ),
             ),
             (
                 "MoE A2A backend",
@@ -3335,8 +3349,10 @@ class ServerArgs:
             ("symmetric memory", lambda: self.enable_symm_mem),
             (
                 "expert distribution recorder",
-                lambda: self.enable_eplb
-                or self.expert_distribution_recorder_mode is not None,
+                lambda: (
+                    self.enable_eplb
+                    or self.expert_distribution_recorder_mode is not None
+                ),
             ),
             (
                 "context parallel (attn_cp_size > 1)",
@@ -5917,13 +5933,12 @@ class ServerArgs:
     def _handle_unified_memory_pool(self):
         if not self.enable_unified_memory:
             return
-        assert self.disaggregation_mode == "null", (
-            "--enable-unified-memory is not yet compatible with PD " "disaggregation."
-        )
-        assert self.speculative_algorithm is None, (
-            "--enable-unified-memory is not yet compatible with speculative "
-            "decoding."
-        )
+        assert (
+            self.disaggregation_mode == "null"
+        ), "--enable-unified-memory is not yet compatible with PD disaggregation."
+        assert (
+            self.speculative_algorithm is None
+        ), "--enable-unified-memory is not yet compatible with speculative decoding."
         assert not (self.enable_hierarchical_cache or self.enable_lmcache), (
             "--enable-unified-memory is not yet compatible with hierarchical / "
             "host-tiered KV cache (--enable-hierarchical-cache / --enable-lmcache): "

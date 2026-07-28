@@ -249,9 +249,7 @@ def build_draft_frontier_page_table_kernel(
     last_page_len = prefix_len - full_prefix_pages * page_size
     branch_pages = tl.cdiv(last_page_len + draft_len, page_size)
 
-    num_new_pages_per_topk = tl.cdiv(
-        last_page_len + speculative_num_steps, page_size
-    )
+    num_new_pages_per_topk = tl.cdiv(last_page_len + speculative_num_steps, page_size)
     prefix_base = full_prefix_pages * page_size
     branch_base = prefix_base + topk_id * num_new_pages_per_topk * page_size
 
@@ -1219,9 +1217,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
         use_fp8_frontend = self.data_type == torch.float8_e4m3fn
-        if not use_fp8_frontend and getattr(
-            self, "_tq4_hotcold_cache", False
-        ):
+        layer_frontend = getattr(self, "uses_fp8_frontend", None)
+        if callable(layer_frontend):
+            use_fp8_frontend = layer_frontend(layer, forward_batch)
+        elif not use_fp8_frontend and getattr(self, "_tq4_hotcold_cache", False):
             use_fp8_frontend = self.should_use_hot_fp8_frontend(forward_batch)
         if use_fp8_frontend:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
@@ -1248,11 +1247,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             write_kwargs = (
-                {
-                    "logical_start": self.hotcold_kv_write_logical_start(
-                        forward_batch
-                    )
-                }
+                {"logical_start": self.hotcold_kv_write_logical_start(forward_batch)}
                 if getattr(self, "_tq4_hotcold_cache", False)
                 else {}
             )
@@ -1363,13 +1358,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         use_fp8_frontend = self.data_type == torch.float8_e4m3fn
-        if not use_fp8_frontend and getattr(
-            self, "_tq4_hotcold_cache", False
-        ):
+        layer_frontend = getattr(self, "uses_fp8_frontend", None)
+        if callable(layer_frontend):
+            use_fp8_frontend = layer_frontend(layer, forward_batch)
+        elif not use_fp8_frontend and getattr(self, "_tq4_hotcold_cache", False):
             use_fp8_frontend = self.should_use_hot_fp8_frontend(forward_batch)
-        if (
-            use_fp8_frontend
-        ) and forward_batch.forward_mode.is_target_verify():
+        if (use_fp8_frontend) and forward_batch.forward_mode.is_target_verify():
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
@@ -1394,11 +1388,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 k is not None and k_rope is not None
             ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             write_kwargs = (
-                {
-                    "logical_start": self.hotcold_kv_write_logical_start(
-                        forward_batch
-                    )
-                }
+                {"logical_start": self.hotcold_kv_write_logical_start(forward_batch)}
                 if getattr(self, "_tq4_hotcold_cache", False)
                 else {}
             )
@@ -1426,9 +1416,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # frontend and FP8 TokenSpeed kernel.  Casting that query back to
             # the carrier dtype here would add a BF16 cast plus a second FP8
             # quantization in every target-verify layer.
-            q = q.to(
-                torch.float8_e4m3fn if use_fp8_frontend else self.data_type
-            )
+            q = q.to(torch.float8_e4m3fn if use_fp8_frontend else self.data_type)
 
         if (
             forward_batch.forward_mode.is_target_verify()
@@ -1457,9 +1445,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Its pool carrier dtype is BF16, so using self.data_type here
             # would undo the fused frontend and force the TokenSpeed override
             # to quantize the query a second time in every layer.
-            q = q.to(
-                torch.float8_e4m3fn if use_fp8_frontend else self.data_type
-            )
+            q = q.to(torch.float8_e4m3fn if use_fp8_frontend else self.data_type)
 
             if forward_batch.forward_mode.is_target_verify():
                 max_seq_len = (
@@ -1688,6 +1674,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         if self.topk > 1 and getattr(
             self.attn_backends[0], "supports_custom_decode_mask", False
         ):
+
             def call_fn(i, _forward_batch):
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     _forward_batch, in_capture=in_capture

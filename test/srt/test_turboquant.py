@@ -25,7 +25,6 @@ import numpy as np
 
 
 class TestTurboQuantCLI(unittest.TestCase):
-
     def test_preserved_kv_cache_dtype_choices_parse(self):
         from sglang.srt.server_args import ServerArgs
 
@@ -43,6 +42,23 @@ class TestTurboQuantCLI(unittest.TestCase):
                 ["--model-path", "test-model", "--kv-cache-dtype", dtype]
             )
             self.assertEqual(args.kv_cache_dtype, dtype)
+
+    def test_mla_layer_selection_cli_parse(self):
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "test-model",
+                "--kv-cache-dtype",
+                "turboquant_4bit_e2m1",
+                "--turboquant-mla-layer-ids",
+                "8,12-15,20",
+            ]
+        )
+        self.assertEqual(args.turboquant_mla_layer_ids, "8,12-15,20")
 
     def test_dflash_fa4_draft_does_not_inherit_target_turboquant(self):
         import torch
@@ -78,9 +94,32 @@ class TestTurboQuantCLI(unittest.TestCase):
         fuse = Mock()
         runner = SimpleNamespace(
             turboquant_bits=4,
-            token_to_kv_pool_allocator=SimpleNamespace(
-                get_kvcache=lambda: pool
+            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
+            use_mla_backend=True,
+            server_args=SimpleNamespace(
+                get_attention_backends=lambda: (None, "tokenspeed_mla"),
+                enable_lora=False,
             ),
+            _maybe_fuse_tq_mla_absorb_rotations=fuse,
+        )
+
+        ModelRunner._maybe_fuse_tq_output_rotation(runner)
+
+        fuse.assert_not_called()
+        self.assertFalse(tq_config.mla_absorb_rotation_fused)
+
+    def test_layerwise_mla_does_not_globally_rotate_absorb_weights(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        tq_config = SimpleNamespace(mla_absorb_rotation_fused=False)
+        pool = SimpleNamespace(
+            tq_config=tq_config,
+            has_mixed_layer_storage=True,
+        )
+        fuse = Mock()
+        runner = SimpleNamespace(
+            turboquant_bits=4,
+            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
             use_mla_backend=True,
             server_args=SimpleNamespace(
                 get_attention_backends=lambda: (None, "tokenspeed_mla"),
@@ -155,7 +194,6 @@ class TestTurboQuantCLI(unittest.TestCase):
 
 
 class TestCodebook(unittest.TestCase):
-
     def test_1bit_centroids(self):
         from sglang.srt.layers.quantization.kv_turboquant import build_codebook
 
@@ -207,7 +245,6 @@ class TestCodebook(unittest.TestCase):
 
 
 class TestTurboQuantConfig(unittest.TestCase):
-
     def test_config_creation_cpu(self):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 
@@ -302,7 +339,6 @@ class TestTurboQuantConfig(unittest.TestCase):
 
 
 class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
-
     def test_hotcold_static_ownership_requires_single_uncached_request(self):
         from sglang.srt.environ import envs
         from sglang.srt.model_executor.model_runner_kv_cache_mixin import (
@@ -368,9 +404,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
             with self.assertRaisesRegex(
                 ValueError, "turboquant_4bit.*an MLA target model.*tokenspeed_mla"
             ):
-                _validate_tq_hotcold_server_args(
-                    invalid, use_mla_backend=False
-                )
+                _validate_tq_hotcold_server_args(invalid, use_mla_backend=False)
 
         # The default-off path must remain a true no-op and must not inspect
         # unrelated ServerArgs fields.
@@ -457,9 +491,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
                 ValueError, "speculative decoding disabled or DFLASH"
             ):
                 _validate_tq_hotcold_server_args(
-                    SimpleNamespace(
-                        **(base | {"speculative_algorithm": "EAGLE3"})
-                    )
+                    SimpleNamespace(**(base | {"speculative_algorithm": "EAGLE3"}))
                 )
             with self.assertRaisesRegex(
                 ValueError, "speculative-draft-attention-backend fa4"
@@ -577,9 +609,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
         available_bytes = configurator._fixed_size + (
             configured_tokens * configurator._cell_size
         )
-        pool_config = configurator.calculate_pool_sizes(
-            available_bytes, page_size=32
-        )
+        pool_config = configurator.calculate_pool_sizes(available_bytes, page_size=32)
         self.assertEqual(
             pool_config.max_total_num_tokens,
             configured_tokens,
@@ -609,9 +639,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
             forward_mode=mode,
             seq_lens_cpu=torch.tensor([126], dtype=torch.int64),
         )
-        with patch.object(
-            TRTLLMMLABackend, "init_forward_metadata"
-        ) as parent_init:
+        with patch.object(TRTLLMMLABackend, "init_forward_metadata") as parent_init:
             with self.assertRaisesRegex(RuntimeError, "not quality-safe"):
                 backend.init_forward_metadata(batch)
         parent_init.assert_not_called()
@@ -785,9 +813,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
             is_target_verify=lambda: True,
             is_draft_extend_v2=lambda: False,
         )
-        self.assertEqual(
-            backend.get_cuda_graph_max_prefix_len(target_verify), 16_379
-        )
+        self.assertEqual(backend.get_cuda_graph_max_prefix_len(target_verify), 16_379)
         backend._tq_pool.hot_capacity_tokens = 65_536
         self.assertEqual(backend.get_cuda_graph_max_seq_len(), 65_536)
 
@@ -897,7 +923,6 @@ except ImportError:
 
 @unittest.skipUnless(HAS_CUDA, "CUDA not available")
 class TestTurboQuantGPU(unittest.TestCase):
-
     @classmethod
     def setUpClass(cls):
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
@@ -1747,12 +1772,8 @@ class TestTurboQuantGPU(unittest.TestCase):
         layer = SimpleNamespace(layer_id=0)
         hot_loc = torch.tensor([32, 159], device=self.device)
         cold_loc = torch.tensor([160, 287], device=self.device)
-        hot_cache = torch.randn(
-            2, 1, 576, dtype=torch.bfloat16, device=self.device
-        )
-        cold_cache = torch.randn(
-            2, 1, 576, dtype=torch.bfloat16, device=self.device
-        )
+        hot_cache = torch.randn(2, 1, 576, dtype=torch.bfloat16, device=self.device)
+        cold_cache = torch.randn(2, 1, 576, dtype=torch.bfloat16, device=self.device)
 
         with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
             pool = MLATokenToKVPoolTurboQuantHotCold(
@@ -1792,9 +1813,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             self.assertEqual(
                 int(torch.count_nonzero(pool.kv_nope_scale_buffer[0]).item()), 0
             )
-            self.assertEqual(
-                int(torch.count_nonzero(pool.kv_rope_buffer[0]).item()), 0
-            )
+            self.assertEqual(int(torch.count_nonzero(pool.kv_rope_buffer[0]).item()), 0)
             expected_hot = hot_cache.to(torch.float8_e4m3fn)
             torch.testing.assert_close(
                 pool.kv_hot_buffer[0][hot_loc], expected_hot, rtol=0, atol=0
@@ -1849,12 +1868,8 @@ class TestTurboQuantGPU(unittest.TestCase):
                     torch.bfloat16,
                 )
             )
-            torch.testing.assert_close(
-                boundary_cold_nope, reference_boundary_nope
-            )
-            torch.testing.assert_close(
-                boundary_cold_rope, reference_boundary_rope
-            )
+            torch.testing.assert_close(boundary_cold_nope, reference_boundary_nope)
+            torch.testing.assert_close(boundary_cold_rope, reference_boundary_rope)
 
             # Chunked prefill gathers only the requested rows. Verify mixed
             # tier ordering and that the operation creates no persistent
@@ -1864,9 +1879,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             scale_ptr = pool.kv_nope_scale_buffer[0].data_ptr()
             rope_ptr = pool.kv_rope_buffer[0].data_ptr()
             codebook_ptr = pool.kv_nope_codebook_buffer[0].data_ptr()
-            mixed_loc = torch.stack(
-                (cold_loc[1], hot_loc[0], cold_loc[0], hot_loc[1])
-            )
+            mixed_loc = torch.stack((cold_loc[1], hot_loc[0], cold_loc[0], hot_loc[1]))
             gathered_nope, gathered_rope = pool.get_mla_kv_buffer(
                 layer, mixed_loc, torch.bfloat16
             )
@@ -1920,9 +1933,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             self.assertEqual(pool.kv_nope_packed_buffer[0].data_ptr(), packed_ptr)
             self.assertEqual(pool.kv_nope_scale_buffer[0].data_ptr(), scale_ptr)
             self.assertEqual(pool.kv_rope_buffer[0].data_ptr(), rope_ptr)
-            self.assertEqual(
-                pool.kv_nope_codebook_buffer[0].data_ptr(), codebook_ptr
-            )
+            self.assertEqual(pool.kv_nope_codebook_buffer[0].data_ptr(), codebook_ptr)
 
         expected_bytes = (hot_tokens + page_size) * 576 + (
             size - hot_tokens + page_size
@@ -1933,9 +1944,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             torch.tensor([64], device=self.device),
             torch.tensor([32], device=self.device),
         )
-        torch.testing.assert_close(
-            pool.kv_hot_buffer[0][64], pool.kv_hot_buffer[0][32]
-        )
+        torch.testing.assert_close(pool.kv_hot_buffer[0][64], pool.kv_hot_buffer[0][32])
         pool.move_kv_cache(
             torch.tensor([192], device=self.device),
             torch.tensor([160], device=self.device),
@@ -2111,12 +2120,8 @@ class TestTurboQuantGPU(unittest.TestCase):
         backend.token_to_kv_pool = Mock()
         backend._fused_rope_fp8_quantize = Mock(
             return_value=(
-                torch.zeros(
-                    2, 1, 576, dtype=torch.float8_e4m3fn, device=self.device
-                ),
-                torch.zeros(
-                    2, 1, 576, dtype=torch.float8_e4m3fn, device=self.device
-                ),
+                torch.zeros(2, 1, 576, dtype=torch.float8_e4m3fn, device=self.device),
+                torch.zeros(2, 1, 576, dtype=torch.float8_e4m3fn, device=self.device),
             )
         )
         rotary_emb = Mock(
@@ -2127,9 +2132,7 @@ class TestTurboQuantGPU(unittest.TestCase):
         layer = SimpleNamespace(
             kv_b_proj=Mock(
                 return_value=(
-                    torch.zeros(
-                        2, 1, 1024, dtype=torch.bfloat16, device=self.device
-                    ),
+                    torch.zeros(2, 1, 1024, dtype=torch.bfloat16, device=self.device),
                 )
             ),
             num_local_heads=1,
@@ -2146,15 +2149,9 @@ class TestTurboQuantGPU(unittest.TestCase):
                 [160, 161], dtype=torch.int64, device=self.device
             ),
         )
-        q = torch.zeros(
-            2, 1, 576, dtype=torch.bfloat16, device=self.device
-        )
-        kv_a = torch.zeros(
-            2, 512, dtype=torch.bfloat16, device=self.device
-        )
-        k_pe = torch.zeros(
-            2, 1, 64, dtype=torch.bfloat16, device=self.device
-        )
+        q = torch.zeros(2, 1, 576, dtype=torch.bfloat16, device=self.device)
+        kv_a = torch.zeros(2, 512, dtype=torch.bfloat16, device=self.device)
+        k_pe = torch.zeros(2, 1, 64, dtype=torch.bfloat16, device=self.device)
         with patch(
             "sglang.srt.layers.attention.tokenspeed_mla_backend.fp8_quantize",
             side_effect=lambda tensor, **_: tensor.to(torch.float8_e4m3fn),
@@ -2229,21 +2226,15 @@ class TestTurboQuantGPU(unittest.TestCase):
         fp8_query = torch.zeros(
             1, 1, 1, 576, dtype=torch.float8_e4m3fn, device=self.device
         )
-        fp8_k = torch.zeros(
-            1, 1, 512, dtype=torch.float8_e4m3fn, device=self.device
-        )
-        fp8_rope = torch.zeros(
-            1, 1, 64, dtype=torch.float8_e4m3fn, device=self.device
-        )
+        fp8_k = torch.zeros(1, 1, 512, dtype=torch.float8_e4m3fn, device=self.device)
+        fp8_rope = torch.zeros(1, 1, 64, dtype=torch.float8_e4m3fn, device=self.device)
         backend._run_decode_kernel = Mock(
             return_value=torch.zeros(
                 1, 1, 1, 512, dtype=torch.bfloat16, device=self.device
             )
         )
         backend.forward_decode_metadata = SimpleNamespace(
-            block_kv_indices=torch.tensor(
-                [[1]], dtype=torch.int32, device=self.device
-            ),
+            block_kv_indices=torch.tensor([[1]], dtype=torch.int32, device=self.device),
             max_seq_len_k=64,
             batch_size=1,
         )
@@ -2257,9 +2248,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             seq_lens_cpu=torch.tensor([64], dtype=torch.int64),
             seq_lens=torch.tensor([64], dtype=torch.int32, device=self.device),
             positions=torch.tensor([63], dtype=torch.int64, device=self.device),
-            out_cache_loc=torch.tensor(
-                [95], dtype=torch.int64, device=self.device
-            ),
+            out_cache_loc=torch.tensor([95], dtype=torch.int64, device=self.device),
             decode_trtllm_mla_metadata=None,
             batch_size=1,
         )
@@ -2268,12 +2257,8 @@ class TestTurboQuantGPU(unittest.TestCase):
             v_head_dim=512,
             head_dim=576,
         )
-        q = torch.zeros(
-            1, 1, 512, dtype=torch.bfloat16, device=self.device
-        )
-        q_rope = torch.zeros(
-            1, 1, 64, dtype=torch.bfloat16, device=self.device
-        )
+        q = torch.zeros(1, 1, 512, dtype=torch.bfloat16, device=self.device)
+        q_rope = torch.zeros(1, 1, 64, dtype=torch.bfloat16, device=self.device)
         k = torch.zeros_like(q)
         k_rope = torch.zeros_like(q_rope)
         with patch(
@@ -2290,9 +2275,7 @@ class TestTurboQuantGPU(unittest.TestCase):
                 q_rope=q_rope,
                 k_rope=k_rope,
                 cos_sin_cache=torch.empty(0, device=self.device),
-                llama_4_scaling=torch.ones(
-                    1, dtype=torch.bfloat16, device=self.device
-                ),
+                llama_4_scaling=torch.ones(1, dtype=torch.bfloat16, device=self.device),
             )
         fused_frontend.assert_called_once()
         self.assertEqual(
@@ -2326,32 +2309,22 @@ class TestTurboQuantGPU(unittest.TestCase):
         backend.token_to_kv_pool = Mock()
         backend.forward_prefill_metadata = None
         backend._get_decode_kv_cache = Mock(
-            return_value=torch.empty(
-                1, dtype=torch.float8_e4m3fn, device=self.device
-            )
+            return_value=torch.empty(1, dtype=torch.float8_e4m3fn, device=self.device)
         )
         fp8_query = torch.zeros(
             5, 1, 576, dtype=torch.float8_e4m3fn, device=self.device
         )
-        fp8_k = torch.zeros(
-            5, 1, 512, dtype=torch.float8_e4m3fn, device=self.device
-        )
-        fp8_rope = torch.zeros(
-            5, 1, 64, dtype=torch.float8_e4m3fn, device=self.device
-        )
+        fp8_k = torch.zeros(5, 1, 512, dtype=torch.float8_e4m3fn, device=self.device)
+        fp8_rope = torch.zeros(5, 1, 64, dtype=torch.float8_e4m3fn, device=self.device)
         backend._run_decode_kernel = Mock(
             return_value=torch.zeros(
                 1, 5, 1, 512, dtype=torch.bfloat16, device=self.device
             )
         )
         metadata = SimpleNamespace(
-            block_kv_indices=torch.tensor(
-                [[1]], dtype=torch.int32, device=self.device
-            ),
+            block_kv_indices=torch.tensor([[1]], dtype=torch.int32, device=self.device),
             max_seq_len_k=64,
-            seq_lens_k=torch.tensor(
-                [69], dtype=torch.int32, device=self.device
-            ),
+            seq_lens_k=torch.tensor([69], dtype=torch.int32, device=self.device),
             batch_size=1,
         )
         backend.forward_decode_metadata = metadata
@@ -2365,9 +2338,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             seq_lens_cpu=torch.tensor([64], dtype=torch.int64),
             seq_lens=torch.tensor([64], dtype=torch.int32, device=self.device),
             positions=torch.arange(5, dtype=torch.int64, device=self.device),
-            out_cache_loc=torch.arange(
-                5, dtype=torch.int64, device=self.device
-            ),
+            out_cache_loc=torch.arange(5, dtype=torch.int64, device=self.device),
             decode_trtllm_mla_metadata=metadata,
             spec_info=SimpleNamespace(draft_token_num=5, topk=1),
             batch_size=1,
@@ -2377,12 +2348,8 @@ class TestTurboQuantGPU(unittest.TestCase):
             v_head_dim=512,
             head_dim=576,
         )
-        q = torch.zeros(
-            5, 1, 512, dtype=torch.bfloat16, device=self.device
-        )
-        q_rope = torch.zeros(
-            5, 1, 64, dtype=torch.bfloat16, device=self.device
-        )
+        q = torch.zeros(5, 1, 512, dtype=torch.bfloat16, device=self.device)
+        q_rope = torch.zeros(5, 1, 64, dtype=torch.bfloat16, device=self.device)
         k = torch.zeros_like(q)
         k_rope = torch.zeros_like(q_rope)
         with patch(
@@ -2486,9 +2453,9 @@ class TestTurboQuantGPU(unittest.TestCase):
             pool.kv_nope_packed_buffer[0],
             pool.kv_nope_scale_buffer[0],
         )
-        cold_dense = torch.cat(
-            (cold_nope, pool.kv_rope_buffer[0]), dim=-1
-        ).to(torch.float8_e4m3fn)
+        cold_dense = torch.cat((cold_nope, pool.kv_rope_buffer[0]), dim=-1).to(
+            torch.float8_e4m3fn
+        )
         dense_flat = torch.zeros(
             size + page_size,
             576,
@@ -2511,9 +2478,7 @@ class TestTurboQuantGPU(unittest.TestCase):
             )
             * 0.1
         )
-        query_fp8 = _quantize_tq4_query(
-            query, 512, is_arch_support_pdl()
-        )
+        query_fp8 = _quantize_tq4_query(query, 512, is_arch_support_pdl())
 
         def dense_oracle(seq_len, custom_mask=None):
             pages = (seq_len + page_size - 1) // page_size
@@ -2526,16 +2491,12 @@ class TestTurboQuantGPU(unittest.TestCase):
                 block_tables=torch.arange(
                     1, pages + 1, dtype=torch.int32, device=self.device
                 ).view(1, -1),
-                seq_lens=torch.tensor(
-                    [seq_len], dtype=torch.int32, device=self.device
-                ),
+                seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=self.device),
                 max_seq_len=seq_len,
                 softmax_scale=layer.scaling,
                 causal_mask=True,
                 custom_mask=custom_mask,
-                cmask_off=torch.zeros(
-                    1, dtype=torch.int32, device=self.device
-                ),
+                cmask_off=torch.zeros(1, dtype=torch.int32, device=self.device),
                 enable_pdl=is_arch_support_pdl(),
             )
 
@@ -2547,9 +2508,7 @@ class TestTurboQuantGPU(unittest.TestCase):
                 block_tables=torch.arange(
                     1, pages + 1, dtype=torch.int32, device=self.device
                 ).view(1, -1),
-                seq_lens=torch.tensor(
-                    [seq_len], dtype=torch.int32, device=self.device
-                ),
+                seq_lens=torch.tensor([seq_len], dtype=torch.int32, device=self.device),
                 max_seq_len=seq_len,
                 layer=layer,
                 custom_mask=custom_mask,
@@ -2560,9 +2519,7 @@ class TestTurboQuantGPU(unittest.TestCase):
 
         # The winning exact-context branch must remain the ordinary FP8
         # TokenSpeed decode with byte-identical output.
-        torch.testing.assert_close(
-            run_backend(100), dense_oracle(100), rtol=0, atol=0
-        )
+        torch.testing.assert_close(run_backend(100), dense_oracle(100), rtol=0, atol=0)
 
         # The boundary case has query tokens on both sides of the ownership
         # split and exercises the synthesized segmented causal masks.
@@ -2596,6 +2553,91 @@ class TestTurboQuantGPU(unittest.TestCase):
         backend.num_draft_tokens = q_len
         with self.assertRaisesRegex(RuntimeError, "admission guard was bypassed"):
             run_backend(full_seq_len, tree_mask)
+
+    def test_mla_layerwise_pool_has_one_representation_per_layer(self):
+        import torch
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        size = 64
+        lora_rank = 512
+        rope_dim = 64
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            pool = MLATokenToKVPoolTurboQuant(
+                size=size,
+                page_size=0,
+                dtype=torch.bfloat16,
+                kv_lora_rank=lora_rank,
+                qk_rope_head_dim=rope_dim,
+                layer_num=3,
+                device=self.device,
+                enable_memory_saver=False,
+                turboquant_bits=4,
+                turboquant_e2m1=True,
+                start_layer=10,
+                end_layer=13,
+                turboquant_layer_ids=(11,),
+            )
+
+        self.assertFalse(pool.is_turboquant_layer(10))
+        self.assertTrue(pool.is_turboquant_layer(11))
+        self.assertFalse(pool.is_turboquant_layer(12))
+        self.assertEqual(pool.get_per_token_all_layer_bytes(), 386 + 2 * 576)
+        self.assertEqual(pool.get_kv_size_bytes(), size * (386 + 2 * 576))
+
+        for layer_id_rel in (0, 2):
+            self.assertIsNone(pool.kv_nope_packed_buffer[layer_id_rel])
+            self.assertIsNone(pool.kv_nope_scale_buffer[layer_id_rel])
+            self.assertIsNone(pool.kv_rope_buffer[layer_id_rel])
+            self.assertIsNotNone(pool.kv_fp8_buffer[layer_id_rel])
+        self.assertIsNotNone(pool.kv_nope_packed_buffer[1])
+        self.assertIsNotNone(pool.kv_nope_scale_buffer[1])
+        self.assertIsNotNone(pool.kv_rope_buffer[1])
+        self.assertIsNone(pool.kv_fp8_buffer[1])
+
+        loc = torch.tensor([1, 7, 12], device=self.device)
+        nope = torch.randn(
+            loc.numel(), 1, lora_rank, device=self.device, dtype=torch.bfloat16
+        )
+        rope = torch.randn(
+            loc.numel(), 1, rope_dim, device=self.device, dtype=torch.bfloat16
+        )
+        dense_layer = SimpleNamespace(layer_id=10)
+        tq_layer = SimpleNamespace(layer_id=11)
+        pool.set_mla_kv_buffer(dense_layer, loc, nope, rope)
+        pool.set_mla_kv_buffer(tq_layer, loc, nope, rope)
+
+        dense_nope, dense_rope = pool.get_mla_kv_buffer(dense_layer, loc)
+        self.assertIs(dense_nope.dtype, torch.bfloat16)
+        self.assertIs(dense_rope.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            dense_nope, nope.to(torch.float8_e4m3fn).to(torch.bfloat16)
+        )
+        torch.testing.assert_close(
+            dense_rope, rope.to(torch.float8_e4m3fn).to(torch.bfloat16)
+        )
+        dense_key = pool.get_key_buffer(dense_layer.layer_id)
+        dense_value = pool.get_value_buffer(dense_layer.layer_id)
+        self.assertIs(dense_key.dtype, torch.bfloat16)
+        self.assertIs(dense_value.dtype, torch.bfloat16)
+        torch.testing.assert_close(dense_key[loc, :, :lora_rank], dense_nope)
+        torch.testing.assert_close(dense_key[loc, :, lora_rank:], dense_rope)
+        torch.testing.assert_close(dense_value[loc], dense_nope)
+
+        tq_nope, tq_rope = pool.get_mla_kv_buffer(tq_layer, loc)
+        self.assertIs(tq_nope.dtype, torch.bfloat16)
+        self.assertIs(tq_rope.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(tq_nope).all())
+        torch.testing.assert_close(tq_rope, rope)
+
+        src = torch.tensor([7], device=self.device)
+        dst = torch.tensor([31], device=self.device)
+        expected_dense = pool.kv_fp8_buffer[0][src].clone()
+        expected_tq = pool.kv_nope_packed_buffer[1][src].clone()
+        pool.move_kv_cache(dst, src)
+        torch.testing.assert_close(pool.kv_fp8_buffer[0][dst], expected_dense)
+        torch.testing.assert_close(pool.kv_nope_packed_buffer[1][dst], expected_tq)
 
     def test_non_128_head_dim(self):
         """Verify TurboQuant works with head_dim=64 and head_dim=256."""

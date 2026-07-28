@@ -15,6 +15,7 @@ Supports two dequant modes:
 """
 
 import math
+from typing import Optional
 
 import numpy as np
 import torch
@@ -55,6 +56,53 @@ E2M1_SORTED_CODE_LUT = np.array(
 def should_allocate_mla_tq_fp8_codebook(decode_backend: str, e2m1: bool) -> bool:
     """Whether MLA TurboQuant needs the optional per-token FP8 lookup row."""
     return decode_backend == "tokenspeed_mla" and not e2m1
+
+
+def parse_mla_turboquant_layer_ids(
+    spec: Optional[str], num_layers: int
+) -> Optional[tuple[int, ...]]:
+    """Parse a comma-separated MLA TurboQuant layer selection.
+
+    ``None`` preserves the historical all-layer behavior. Explicit selections
+    accept individual global layer IDs and inclusive ranges (for example,
+    ``"8,12-15,20"``) and return one canonical sorted tuple.
+    """
+    if spec is None:
+        return None
+    if num_layers <= 0:
+        raise ValueError(f"num_layers must be positive; got {num_layers}")
+
+    selected: set[int] = set()
+    for raw_part in spec.split(","):
+        part = raw_part.strip()
+        if not part:
+            raise ValueError("TurboQuant MLA layer selection contains an empty item")
+        if "-" in part:
+            if part.count("-") != 1:
+                raise ValueError(f"Invalid TurboQuant MLA layer range: {part!r}")
+            start_text, end_text = part.split("-", 1)
+            if not start_text.isdigit() or not end_text.isdigit():
+                raise ValueError(f"Invalid TurboQuant MLA layer range: {part!r}")
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                raise ValueError(
+                    f"TurboQuant MLA layer range must be ascending: {part!r}"
+                )
+            selected.update(range(start, end + 1))
+        else:
+            if not part.isdigit():
+                raise ValueError(f"Invalid TurboQuant MLA layer ID: {part!r}")
+            selected.add(int(part))
+
+    if not selected:
+        raise ValueError("TurboQuant MLA layer selection must not be empty")
+    invalid = sorted(layer_id for layer_id in selected if layer_id >= num_layers)
+    if invalid:
+        raise ValueError(
+            f"TurboQuant MLA layer IDs must be in [0, {num_layers}); got {invalid}"
+        )
+    return tuple(sorted(selected))
 
 
 # ---------------------------------------------------------------------------

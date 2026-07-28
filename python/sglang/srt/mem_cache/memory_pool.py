@@ -2911,13 +2911,26 @@ class MLATokenToKVPool(KVCache):
             dtype=torch.uint64,
             device=self.device,
         )
+        stride_bytes_by_layer = [
+            int(np.prod(x.shape[1:]) * x.dtype.itemsize) for x in self.kv_buffer
+        ]
+        uniform_layer_stride = len(set(stride_bytes_by_layer)) <= 1
         self._mla_tiled_move_enabled = (
-            _is_cuda and envs.SGLANG_MLA_TILED_MOVE_KV_CACHE.get()
+            _is_cuda
+            and envs.SGLANG_MLA_TILED_MOVE_KV_CACHE.get()
+            and uniform_layer_stride
         )
+        if (
+            _is_cuda
+            and envs.SGLANG_MLA_TILED_MOVE_KV_CACHE.get()
+            and not uniform_layer_stride
+        ):
+            logger.warning(
+                "Disabling tiled MLA KV-cache moves because per-layer row "
+                "strides are heterogeneous: %s",
+                sorted(set(stride_bytes_by_layer)),
+            )
         if self._mla_tiled_move_enabled:
-            stride_bytes_by_layer = [
-                int(np.prod(x.shape[1:]) * x.dtype.itemsize) for x in self.kv_buffer
-            ]
             self.data_strides = torch.tensor(stride_bytes_by_layer, device=self.device)
             self._init_mla_kv_copy_and_warmup(stride_bytes_by_layer[0])
         else:
@@ -3416,6 +3429,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_fp8_codebook: bool = False,
+        turboquant_layer_ids: Optional[tuple[int, ...]] = None,
     ):
         # For MLA, V is derived from the same latent as K (no separate V buffer).
         # We honor turboquant_v_bits for API symmetry with the MHA pool, but
@@ -3439,6 +3453,32 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         self.turboquant_bits = k_bits
         self.enable_fp8_codebook = enable_fp8_codebook
         self.turboquant_e2m1 = turboquant_e2m1
+
+        resolved_start_layer = 0 if start_layer is None else start_layer
+        resolved_end_layer = (
+            resolved_start_layer + layer_num if end_layer is None else end_layer
+        )
+        if turboquant_layer_ids is not None and (
+            resolved_end_layer - resolved_start_layer != layer_num
+        ):
+            raise ValueError(
+                "Layer-wise MLA TurboQuant requires one local storage row per "
+                "global layer in [start_layer, end_layer)"
+            )
+        self.turboquant_layer_ids = (
+            None if turboquant_layer_ids is None else frozenset(turboquant_layer_ids)
+        )
+        self._tq_layer_ids_rel = frozenset(
+            range(layer_num)
+            if self.turboquant_layer_ids is None
+            else (
+                layer_id - resolved_start_layer
+                for layer_id in self.turboquant_layer_ids
+                if resolved_start_layer <= layer_id < resolved_end_layer
+            )
+        )
+        self.all_layers_turboquant = len(self._tq_layer_ids_rel) == layer_num
+        self.has_mixed_layer_storage = not self.all_layers_turboquant
 
         # Build a TurboQuantConfig for the NOPE dim only. The WHT sign vectors
         # and codebook all key off this dim; RoPE is stored raw, so no config
@@ -3492,6 +3532,44 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             1.0, dtype=torch.bfloat16, device=self.device
         )
 
+        if self.has_mixed_layer_storage:
+            logger.info(
+                "MLA TurboQuant heterogeneous pool: %d/%d local layers use "
+                "compressed storage; weighted row bytes=%d",
+                len(self._tq_layer_ids_rel),
+                self.layer_num,
+                self.get_per_token_all_layer_bytes(),
+            )
+
+    def is_turboquant_layer(self, layer_id: int) -> bool:
+        layer_id_rel = layer_id - self.start_layer
+        if not 0 <= layer_id_rel < self.layer_num:
+            raise IndexError(
+                f"Layer {layer_id} is outside local range "
+                f"[{self.start_layer}, {self.end_layer})"
+            )
+        return layer_id_rel in self._tq_layer_ids_rel
+
+    def _is_turboquant_layer_rel(self, layer_id_rel: int) -> bool:
+        if not 0 <= layer_id_rel < self.layer_num:
+            raise IndexError(
+                f"Relative layer {layer_id_rel} is outside [0, {self.layer_num})"
+            )
+        return layer_id_rel in self._tq_layer_ids_rel
+
+    def get_per_token_all_layer_bytes(self) -> int:
+        compressed_row_bytes = (
+            self.kv_lora_rank // 2
+            + 2
+            + self.qk_rope_head_dim * 2
+            + (16 if self.enable_fp8_codebook else 0)
+        )
+        fp8_row_bytes = self.kv_lora_rank + self.qk_rope_head_dim
+        tq_layers = len(self._tq_layer_ids_rel)
+        return compressed_row_bytes * tq_layers + fp8_row_bytes * (
+            self.layer_num - tq_layers
+        )
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -3504,61 +3582,53 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                 rope = self.qk_rope_head_dim
                 packed_dim = lora // 2  # 4-bit: 2 values per byte
 
-                # Packed nope: uint8, 2 x 4-bit values per byte.
-                self.kv_nope_packed_buffer = [
-                    torch.zeros(
-                        (m, 1, packed_dim),
-                        dtype=torch.uint8,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-                # Per-token dequant scale for nope (norm / max(quant_norm, eps)).
-                # Stored as bf16 to match MHA pool convention.
-                self.kv_nope_scale_buffer = [
-                    torch.zeros(
-                        (m, 1),
-                        dtype=torch.bfloat16,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-
-                # TokenSpeed's Lloyd TQ4 reader consumes exact E4M3FN bytes.
-                # Native E2M1 does not allocate this optional lookup row.  When
-                # present, uint8 is the canonical lifecycle representation and
-                # the FP8 views below alias it without another allocation.
+                self.kv_nope_packed_buffer = [None] * self.layer_num
+                self.kv_nope_scale_buffer = [None] * self.layer_num
+                self.kv_rope_buffer = [None] * self.layer_num
+                self.kv_fp8_buffer = [None] * self.layer_num
                 self.kv_nope_codebook_buffer = (
-                    [
-                        torch.zeros(
-                            (m, 1, 16),
+                    [None] * self.layer_num if self.enable_fp8_codebook else None
+                )
+                self._kv_nope_codebook_fp8_buffer = (
+                    [None] * self.layer_num if self.enable_fp8_codebook else None
+                )
+
+                for layer_id_rel in range(self.layer_num):
+                    if self._is_turboquant_layer_rel(layer_id_rel):
+                        packed = torch.zeros(
+                            (m, 1, packed_dim),
                             dtype=torch.uint8,
                             device=self.device,
                         )
-                        for _ in range(self.layer_num)
-                    ]
-                    if self.enable_fp8_codebook
-                    else None
-                )
-                self._kv_nope_codebook_fp8_buffer = (
-                    [
-                        buffer.view(torch.float8_e4m3fn)
-                        for buffer in self.kv_nope_codebook_buffer
-                    ]
-                    if self.kv_nope_codebook_buffer is not None
-                    else None
-                )
-
-                # RoPE stored uncompressed in bf16 (raw rotary values).
-                self.kv_rope_buffer = [
-                    torch.zeros(
-                        (m, 1, rope),
-                        dtype=torch.bfloat16,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                        scale = torch.zeros(
+                            (m, 1),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                        rope_buffer = torch.zeros(
+                            (m, 1, rope),
+                            dtype=torch.bfloat16,
+                            device=self.device,
+                        )
+                        self.kv_nope_packed_buffer[layer_id_rel] = packed
+                        self.kv_nope_scale_buffer[layer_id_rel] = scale
+                        self.kv_rope_buffer[layer_id_rel] = rope_buffer
+                        if self.kv_nope_codebook_buffer is not None:
+                            codebook = torch.zeros(
+                                (m, 1, 16),
+                                dtype=torch.uint8,
+                                device=self.device,
+                            )
+                            self.kv_nope_codebook_buffer[layer_id_rel] = codebook
+                            self._kv_nope_codebook_fp8_buffer[layer_id_rel] = (
+                                codebook.view(torch.float8_e4m3fn)
+                            )
+                    else:
+                        self.kv_fp8_buffer[layer_id_rel] = torch.zeros(
+                            (m, 1, lora + rope),
+                            dtype=torch.float8_e4m3fn,
+                            device=self.device,
+                        )
 
         workspace_tokens = max(1, envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.get())
         self._tq_mla_kv_write_unit = torch.empty(
@@ -3571,16 +3641,19 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
         )
 
-        # The parent MLATokenToKVPool.__init__ reads `self.kv_buffer` to build
-        # data_ptrs after _create_buffers returns. We don't have a single
-        # per-layer fused KV buffer, so alias kv_buffer to the packed nope
-        # buffer — external consumers that index data_ptrs (e.g. disagg) will
-        # see pointers to the compressed nope storage. Clients that need the
-        # full bf16 KV layout should call get_mla_kv_buffer / get_key_buffer,
-        # which dequantize on demand.
-        self.kv_buffer = self.kv_nope_packed_buffer
+        # The parent builds its pointer table from this list. Each entry is the
+        # sole primary allocation for that layer: packed nope for TQ, or the
+        # ordinary combined FP8 latent for an uncompressed layer.
+        self.kv_buffer = [
+            (
+                self.kv_nope_packed_buffer[layer_id_rel]
+                if self._is_turboquant_layer_rel(layer_id_rel)
+                else self.kv_fp8_buffer[layer_id_rel]
+            )
+            for layer_id_rel in range(self.layer_num)
+        ]
 
-        if envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get():
+        if envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.get() and self._tq_layer_ids_rel:
             self._warmup_mla_fused_kv_write()
 
     def _clear_buffers(self):
@@ -3593,6 +3666,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         del self.kv_nope_codebook_buffer
         del self._kv_nope_codebook_fp8_buffer
         del self.kv_rope_buffer
+        del self.kv_fp8_buffer
         del self._tq_mla_kv_write_unit
         del self._tq_mla_kv_write_norms
         del self._tq_mla_kv_write_y
@@ -3603,25 +3677,38 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
-        buffer_groups = [
-            self.kv_nope_packed_buffer,
-            self.kv_nope_scale_buffer,
-            self.kv_rope_buffer,
-        ]
-        if self.kv_nope_codebook_buffer is not None:
-            buffer_groups.append(self.kv_nope_codebook_buffer)
-        for buffers in buffer_groups:
-            for cache in buffers:
+        for layer_id_rel in range(self.layer_num):
+            if self._is_turboquant_layer_rel(layer_id_rel):
+                caches = [
+                    self.kv_nope_packed_buffer[layer_id_rel],
+                    self.kv_nope_scale_buffer[layer_id_rel],
+                    self.kv_rope_buffer[layer_id_rel],
+                ]
+                if self.kv_nope_codebook_buffer is not None:
+                    caches.append(self.kv_nope_codebook_buffer[layer_id_rel])
+            else:
+                caches = [self.kv_fp8_buffer[layer_id_rel]]
+            for cache in caches:
+                assert cache is not None
                 cache[tgt_loc_flat] = cache[src_loc_flat]
 
     def get_kv_size_bytes(self):
         total = 0
         for i in range(self.layer_num):
-            total += self.kv_nope_packed_buffer[i].nbytes
-            total += self.kv_nope_scale_buffer[i].nbytes
-            total += self.kv_rope_buffer[i].nbytes
-            if self.kv_nope_codebook_buffer is not None:
-                total += self.kv_nope_codebook_buffer[i].nbytes
+            if self._is_turboquant_layer_rel(i):
+                packed = self.kv_nope_packed_buffer[i]
+                scale = self.kv_nope_scale_buffer[i]
+                rope = self.kv_rope_buffer[i]
+                assert packed is not None and scale is not None and rope is not None
+                total += packed.nbytes + scale.nbytes + rope.nbytes
+                if self.kv_nope_codebook_buffer is not None:
+                    codebook = self.kv_nope_codebook_buffer[i]
+                    assert codebook is not None
+                    total += codebook.nbytes
+            else:
+                fp8 = self.kv_fp8_buffer[i]
+                assert fp8 is not None
+                total += fp8.nbytes
         return total
 
     # ------------------------------------------------------------------
@@ -3688,6 +3775,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         """
         packed = self.kv_nope_packed_buffer[layer_id_rel]  # (m, 1, packed_dim)
         scale = self.kv_nope_scale_buffer[layer_id_rel]  # (m, 1)
+        assert packed is not None and scale is not None
         return self._dequant_nope(packed, scale)
 
     def _get_fused_kv_buffer(self, layer_id: int) -> torch.Tensor:
@@ -3698,8 +3786,13 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         per call. Use only where callers expect the combined layout.
         """
         layer_id_rel = layer_id - self.start_layer
+        if not self._is_turboquant_layer_rel(layer_id_rel):
+            fp8 = self.kv_fp8_buffer[layer_id_rel]
+            assert fp8 is not None
+            return fp8.to(torch.bfloat16)
         nope = self._dequant_nope_full(layer_id_rel)  # (m, 1, lora)
         rope = self.kv_rope_buffer[layer_id_rel]  # (m, 1, rope)
+        assert rope is not None
         return torch.cat([nope, rope], dim=-1)  # (m, 1, lora+rope)
 
     # ------------------------------------------------------------------
@@ -3714,8 +3807,13 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        layer_id_rel = layer_id - self.start_layer
+        if not self._is_turboquant_layer_rel(layer_id_rel):
+            fp8 = self.kv_fp8_buffer[layer_id_rel]
+            assert fp8 is not None
+            return fp8[..., : self.kv_lora_rank].to(torch.bfloat16)
         # Baseline MLA returns kv_buffer[..., :kv_lora_rank] for V.
-        return self._dequant_nope_full(layer_id - self.start_layer)
+        return self._dequant_nope_full(layer_id_rel)
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -3786,6 +3884,14 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         )
 
         cfg = self.tq_config
+        packed_buffer = self.kv_nope_packed_buffer[layer_id_rel]
+        scale_buffer = self.kv_nope_scale_buffer[layer_id_rel]
+        rope_buffer = self.kv_rope_buffer[layer_id_rel]
+        assert (
+            packed_buffer is not None
+            and scale_buffer is not None
+            and rope_buffer is not None
+        )
         fuse_rope_write = self._can_fuse_rope_write(
             layer_id_rel, cache_k_nope, cache_k_rope
         )
@@ -3796,8 +3902,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             cfg.k_quant_centroids,
             cfg.k_boundaries,
             self.turboquant_bits,
-            self.kv_nope_packed_buffer[layer_id_rel],
-            self.kv_nope_scale_buffer[layer_id_rel],
+            packed_buffer,
+            scale_buffer,
             loc,
             pre_unit=self._tq_mla_kv_write_unit,
             pre_norms=self._tq_mla_kv_write_norms,
@@ -3811,10 +3917,10 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             decode_centroids=cfg.k_centroids,
             dequant_scale_multiplier=cfg.k_dequant_scale_multiplier,
             rope_src=cache_k_rope if fuse_rope_write else None,
-            rope_buffer=self.kv_rope_buffer[layer_id_rel] if fuse_rope_write else None,
+            rope_buffer=rope_buffer if fuse_rope_write else None,
         )
         if not fuse_rope_write:
-            self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+            rope_buffer[loc] = cache_k_rope
 
     def _can_fuse_rope_write(
         self,
@@ -3822,16 +3928,18 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ) -> bool:
+        rope_buffer = self.kv_rope_buffer[layer_id_rel]
         return (
-            envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.get()
+            rope_buffer is not None
+            and envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.get()
             and cache_k_nope.shape[-1] // 2 >= cache_k_rope.shape[-1]
-            and self.kv_rope_buffer[layer_id_rel].is_cuda
-            and self.kv_rope_buffer[layer_id_rel].device == cache_k_rope.device
-            and self.kv_rope_buffer[layer_id_rel].stride(-1) == 1
+            and rope_buffer.is_cuda
+            and rope_buffer.device == cache_k_rope.device
+            and rope_buffer.stride(-1) == 1
         )
 
     def _warmup_mla_fused_kv_write(self):
-        if self.layer_num <= 0:
+        if not self._tq_layer_ids_rel:
             return
 
         cache_k_nope = torch.zeros(
@@ -3841,7 +3949,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             (1, 1, self.qk_rope_head_dim), dtype=torch.bfloat16, device=self.device
         )
         loc = torch.zeros((1,), dtype=torch.long, device=self.device)
-        self._set_mla_kv_buffer_fused(0, loc, cache_k_nope, cache_k_rope)
+        layer_id_rel = min(self._tq_layer_ids_rel)
+        self._set_mla_kv_buffer_fused(layer_id_rel, loc, cache_k_nope, cache_k_rope)
         torch.cuda.synchronize()
 
     def set_mla_kv_buffer(
@@ -3855,6 +3964,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         from sglang.srt.layers.quantization.kv_turboquant import batched_quantize
 
         layer_id_rel = layer.layer_id - self.start_layer
+        maybe_detect_oob(
+            loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA TurboQuant)"
+        )
 
         # Upstream shape conventions for MLA write callers vary: some pass
         # (tokens, hidden) and some pass (tokens, 1, hidden). Normalize to
@@ -3863,6 +3975,21 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             cache_k_nope = cache_k_nope.unsqueeze(1)
         if cache_k_rope.dim() == 2:
             cache_k_rope = cache_k_rope.unsqueeze(1)
+
+        if not self._is_turboquant_layer_rel(layer_id_rel):
+            fp8_buffer = self.kv_fp8_buffer[layer_id_rel]
+            assert fp8_buffer is not None
+            if cache_k_nope.dtype != torch.float8_e4m3fn:
+                cache_k_nope = cache_k_nope.to(torch.float8_e4m3fn)
+            if cache_k_rope.dtype != torch.float8_e4m3fn:
+                cache_k_rope = cache_k_rope.to(torch.float8_e4m3fn)
+            set_mla_kv_buffer_triton(
+                fp8_buffer,
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
+            return
 
         assert (
             cache_k_nope.shape[-1] == self.kv_lora_rank
@@ -3923,17 +4050,27 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         )
 
         # Write packed nope + scale at loc.
-        self.kv_nope_packed_buffer[layer_id_rel][loc] = packed
-        self.kv_nope_scale_buffer[layer_id_rel][loc] = dequant_scale
+        packed_buffer = self.kv_nope_packed_buffer[layer_id_rel]
+        scale_buffer = self.kv_nope_scale_buffer[layer_id_rel]
+        rope_buffer = self.kv_rope_buffer[layer_id_rel]
+        assert (
+            packed_buffer is not None
+            and scale_buffer is not None
+            and rope_buffer is not None
+        )
+        packed_buffer[loc] = packed
+        scale_buffer[loc] = dequant_scale
         if self.kv_nope_codebook_buffer is not None:
+            codebook_buffer = self.kv_nope_codebook_buffer[layer_id_rel]
+            assert codebook_buffer is not None
             codebook = (
                 cfg.k_centroids.float().view(1, 1, 16)
                 * dequant_scale.float().unsqueeze(-1)
             ).to(torch.float8_e4m3fn)
-            self.kv_nope_codebook_buffer[layer_id_rel][loc] = codebook.view(torch.uint8)
+            codebook_buffer[loc] = codebook.view(torch.uint8)
 
         # Write rope raw at loc.
-        self.kv_rope_buffer[layer_id_rel][loc] = cache_k_rope
+        rope_buffer[loc] = cache_k_rope
 
     def get_mla_kv_buffer(
         self,
@@ -3948,13 +4085,39 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         for the inverse WHT, but with n = loc.shape[0] rather than size+page.
         """
         layer_id_rel = layer.layer_id - self.start_layer
+        if not self._is_turboquant_layer_rel(layer_id_rel):
+            fp8_buffer = self.kv_fp8_buffer[layer_id_rel]
+            assert fp8_buffer is not None
+            # Keep the generic pool accessor layer-invariant. TokenSpeed's
+            # native decode path reads the persistent FP8 row directly via
+            # _get_decode_kv_cache; generic/DCP callers expect BF16 here.
+            dst_dtype = dst_dtype or torch.bfloat16
+            cache_k_nope = torch.empty(
+                (loc.shape[0], 1, self.kv_lora_rank),
+                dtype=dst_dtype,
+                device=fp8_buffer.device,
+            )
+            cache_k_rope = torch.empty(
+                (loc.shape[0], 1, self.qk_rope_head_dim),
+                dtype=dst_dtype,
+                device=fp8_buffer.device,
+            )
+            get_mla_kv_buffer_triton(fp8_buffer, loc, cache_k_nope, cache_k_rope)
+            return cache_k_nope, cache_k_rope
+
         dst_dtype = dst_dtype or torch.bfloat16
 
-        packed_rows = self.kv_nope_packed_buffer[layer_id_rel][
-            loc
-        ]  # (n, 1, packed_dim)
-        scale_rows = self.kv_nope_scale_buffer[layer_id_rel][loc]  # (n, 1)
-        rope_rows = self.kv_rope_buffer[layer_id_rel][loc]  # (n, 1, rope_dim)
+        packed_buffer = self.kv_nope_packed_buffer[layer_id_rel]
+        scale_buffer = self.kv_nope_scale_buffer[layer_id_rel]
+        rope_buffer = self.kv_rope_buffer[layer_id_rel]
+        assert (
+            packed_buffer is not None
+            and scale_buffer is not None
+            and rope_buffer is not None
+        )
+        packed_rows = packed_buffer[loc]
+        scale_rows = scale_buffer[loc]
+        rope_rows = rope_buffer[loc]
 
         nope = self._dequant_nope(packed_rows, scale_rows)
 
@@ -3974,6 +4137,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         crash, but cross-instance KV migration will need a proper
         serialize/deserialize path in a later change.
         """
+        if self.has_mixed_layer_storage:
+            raise NotImplementedError(
+                "Contiguous/disaggregated transfer is not supported for "
+                "layer-wise MLA TurboQuant storage"
+            )
         kv_data_ptrs = [
             self.kv_nope_packed_buffer[i].data_ptr() for i in range(self.layer_num)
         ]
@@ -3999,22 +4167,41 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                packed_cpu = self.kv_nope_packed_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
-                scale_cpu = self.kv_nope_scale_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
-                rope_cpu = self.kv_rope_buffer[layer_id][chunk_indices].to(
-                    "cpu", non_blocking=True
-                )
-                if self.kv_nope_codebook_buffer is not None:
-                    codebook_cpu = self.kv_nope_codebook_buffer[layer_id][
-                        chunk_indices
-                    ].to("cpu", non_blocking=True)
-                    layer_chunks.append((packed_cpu, scale_cpu, rope_cpu, codebook_cpu))
+                if self._is_turboquant_layer_rel(layer_id):
+                    packed = self.kv_nope_packed_buffer[layer_id]
+                    scale = self.kv_nope_scale_buffer[layer_id]
+                    rope = self.kv_rope_buffer[layer_id]
+                    assert packed is not None and scale is not None and rope is not None
+                    packed_cpu = packed[chunk_indices].to("cpu", non_blocking=True)
+                    scale_cpu = scale[chunk_indices].to("cpu", non_blocking=True)
+                    rope_cpu = rope[chunk_indices].to("cpu", non_blocking=True)
+                    if self.kv_nope_codebook_buffer is not None:
+                        codebook = self.kv_nope_codebook_buffer[layer_id]
+                        assert codebook is not None
+                        codebook_cpu = codebook[chunk_indices].to(
+                            "cpu", non_blocking=True
+                        )
+                        layer_chunks.append(
+                            (
+                                ("tq", packed_cpu, scale_cpu, rope_cpu, codebook_cpu)
+                                if self.has_mixed_layer_storage
+                                else (packed_cpu, scale_cpu, rope_cpu, codebook_cpu)
+                            )
+                        )
+                    else:
+                        layer_chunks.append(
+                            (
+                                ("tq", packed_cpu, scale_cpu, rope_cpu)
+                                if self.has_mixed_layer_storage
+                                else (packed_cpu, scale_cpu, rope_cpu)
+                            )
+                        )
                 else:
-                    layer_chunks.append((packed_cpu, scale_cpu, rope_cpu))
+                    fp8 = self.kv_fp8_buffer[layer_id]
+                    assert fp8 is not None
+                    layer_chunks.append(
+                        ("fp8", fp8[chunk_indices].to("cpu", non_blocking=True))
+                    )
             kv_cache_cpu.append(layer_chunks)
         torch.cuda.synchronize()
         return kv_cache_cpu
@@ -4027,23 +4214,57 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 cpu_chunk = kv_cache_cpu[layer_id][i // chunk_size]
-                packed_cpu, scale_cpu, rope_cpu = cpu_chunk[:3]
-                dev = self.kv_nope_packed_buffer[0].device
-                self.kv_nope_packed_buffer[layer_id][chunk_indices] = packed_cpu.to(
-                    dev, non_blocking=True
+                if not self.has_mixed_layer_storage:
+                    packed_cpu, scale_cpu, rope_cpu = cpu_chunk[:3]
+                    packed = self.kv_nope_packed_buffer[layer_id]
+                    scale = self.kv_nope_scale_buffer[layer_id]
+                    rope = self.kv_rope_buffer[layer_id]
+                    assert packed is not None and scale is not None and rope is not None
+                    packed[chunk_indices] = packed_cpu.to(
+                        packed.device, non_blocking=True
+                    )
+                    scale[chunk_indices] = scale_cpu.to(scale.device, non_blocking=True)
+                    rope[chunk_indices] = rope_cpu.to(rope.device, non_blocking=True)
+                    if self.kv_nope_codebook_buffer is not None:
+                        if len(cpu_chunk) != 4:
+                            raise ValueError("CPU copy is missing the TQ4 FP8 codebook")
+                        codebook = self.kv_nope_codebook_buffer[layer_id]
+                        assert codebook is not None
+                        codebook[chunk_indices] = cpu_chunk[3].to(
+                            codebook.device, non_blocking=True
+                        )
+                    continue
+
+                expected_tag = (
+                    "tq" if self._is_turboquant_layer_rel(layer_id) else "fp8"
                 )
-                self.kv_nope_scale_buffer[layer_id][chunk_indices] = scale_cpu.to(
-                    dev, non_blocking=True
-                )
-                self.kv_rope_buffer[layer_id][chunk_indices] = rope_cpu.to(
-                    dev, non_blocking=True
-                )
+                if not cpu_chunk or cpu_chunk[0] != expected_tag:
+                    raise ValueError(
+                        f"CPU copy representation mismatch for layer {layer_id}: "
+                        f"expected {expected_tag!r}"
+                    )
+                if expected_tag == "fp8":
+                    fp8 = self.kv_fp8_buffer[layer_id]
+                    assert fp8 is not None
+                    fp8[chunk_indices] = cpu_chunk[1].to(fp8.device, non_blocking=True)
+                    continue
+
+                packed_cpu, scale_cpu, rope_cpu = cpu_chunk[1:4]
+                packed = self.kv_nope_packed_buffer[layer_id]
+                scale = self.kv_nope_scale_buffer[layer_id]
+                rope = self.kv_rope_buffer[layer_id]
+                assert packed is not None and scale is not None and rope is not None
+                packed[chunk_indices] = packed_cpu.to(packed.device, non_blocking=True)
+                scale[chunk_indices] = scale_cpu.to(scale.device, non_blocking=True)
+                rope[chunk_indices] = rope_cpu.to(rope.device, non_blocking=True)
                 if self.kv_nope_codebook_buffer is not None:
-                    if len(cpu_chunk) != 4:
+                    if len(cpu_chunk) != 5:
                         raise ValueError("CPU copy is missing the TQ4 FP8 codebook")
-                    self.kv_nope_codebook_buffer[layer_id][chunk_indices] = cpu_chunk[
-                        3
-                    ].to(dev, non_blocking=True)
+                    codebook = self.kv_nope_codebook_buffer[layer_id]
+                    assert codebook is not None
+                    codebook[chunk_indices] = cpu_chunk[4].to(
+                        codebook.device, non_blocking=True
+                    )
         torch.cuda.synchronize()
 
 
@@ -4211,10 +4432,7 @@ class MLATokenToKVPoolTurboQuantHotCold(MLATokenToKVPoolTurboQuant):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        if (
-            cache_k_nope.dtype == fp8_dtype
-            and cache_k_rope.dtype == fp8_dtype
-        ):
+        if cache_k_nope.dtype == fp8_dtype and cache_k_rope.dtype == fp8_dtype:
             set_mla_kv_buffer_triton(
                 self.kv_hot_buffer[layer_id_rel],
                 loc,
@@ -4255,9 +4473,7 @@ class MLATokenToKVPoolTurboQuantHotCold(MLATokenToKVPoolTurboQuant):
         if get_is_capture_mode():
             # Captured graphs are bounded to the FP8 capacity by the attention
             # backend. Replay therefore uses this same pointer-stable writer.
-            self._set_hot_mla_kv_buffer(
-                layer_id_rel, loc, cache_k_nope, cache_k_rope
-            )
+            self._set_hot_mla_kv_buffer(layer_id_rel, loc, cache_k_nope, cache_k_rope)
             return
 
         if logical_start is None:
@@ -4399,14 +4615,10 @@ class MLATokenToKVPoolTurboQuantHotCold(MLATokenToKVPoolTurboQuant):
 
         if hot_count:
             hot_rows = self.kv_hot_buffer[layer_id_rel][hot_loc]
-            cache_k_nope[hot_output_slice] = hot_rows[
-                ..., : self.kv_lora_rank
-            ].to(
+            cache_k_nope[hot_output_slice] = hot_rows[..., : self.kv_lora_rank].to(
                 dst_dtype
             )
-            cache_k_rope[hot_output_slice] = hot_rows[
-                ..., self.kv_lora_rank :
-            ].to(
+            cache_k_rope[hot_output_slice] = hot_rows[..., self.kv_lora_rank :].to(
                 dst_dtype
             )
 

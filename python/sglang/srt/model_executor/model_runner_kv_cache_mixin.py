@@ -20,7 +20,6 @@ from sglang.srt.distributed.parallel_state import (
     get_world_group,
 )
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.kv_turboquant import (
     should_allocate_mla_tq_fp8_codebook,
@@ -56,6 +55,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -150,9 +150,10 @@ def _validate_tq_hotcold_server_args(
     speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
     if speculative_algorithm not in (None, "DFLASH"):
         violations.append("speculative decoding disabled or DFLASH")
-    if speculative_algorithm == "DFLASH" and getattr(
-        server_args, "speculative_draft_attention_backend", None
-    ) != "fa4":
+    if (
+        speculative_algorithm == "DFLASH"
+        and getattr(server_args, "speculative_draft_attention_backend", None) != "fa4"
+    ):
         violations.append("--speculative-draft-attention-backend fa4")
     cuda_graph_config = getattr(server_args, "cuda_graph_config", None)
     prefill_graph_backend = getattr(
@@ -167,16 +168,15 @@ def _validate_tq_hotcold_server_args(
         violations.append("SGLANG_TQ_MLA_HOT_TOKENS aligned to 128 tokens")
     if envs.SGLANG_TQ_MLA_STAGED_FLASHMLA.get():
         violations.append("SGLANG_TQ_MLA_STAGED_FLASHMLA disabled")
-    legacy_active_shadow = os.getenv(
-        "SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW", ""
-    ).strip().lower()
+    legacy_active_shadow = (
+        os.getenv("SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW", "").strip().lower()
+    )
     if legacy_active_shadow not in ("", "0", "false", "no", "off"):
         violations.append("SGLANG_TQ_MLA_FP8_ACTIVE_SHADOW disabled")
     if violations:
         raise ValueError(
             "SGLANG_TQ_MLA_HOT_TOKENS enables the experimental static "
-            "single-owner cache and currently requires: "
-            + ", ".join(violations)
+            "single-owner cache and currently requires: " + ", ".join(violations)
         )
 
 
@@ -965,6 +965,38 @@ class ModelRunnerKVCacheMixin:
                 # The pool class itself enforces k_bits == 4 (raises otherwise),
                 # matching the sizing assumption in pool_configurator.py.
                 hot_capacity_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
+                selected_layer_ids = getattr(self, "turboquant_mla_layer_ids", None)
+                if selected_layer_ids is not None:
+                    prefill_backend, decode_backend = (
+                        self.server_args.get_attention_backends()
+                    )
+                    if (
+                        prefill_backend != "tokenspeed_mla"
+                        or decode_backend != "tokenspeed_mla"
+                    ):
+                        raise ValueError(
+                            "--turboquant-mla-layer-ids requires "
+                            "tokenspeed_mla for both prefill and decode"
+                        )
+                    if hot_capacity_tokens > 0:
+                        raise ValueError(
+                            "--turboquant-mla-layer-ids is incompatible with "
+                            "SGLANG_TQ_MLA_HOT_TOKENS"
+                        )
+                    if self.server_args.enable_hierarchical_cache:
+                        raise ValueError(
+                            "--turboquant-mla-layer-ids does not yet support "
+                            "hierarchical KV cache"
+                        )
+                    if getattr(self.server_args, "enable_lmcache", False):
+                        raise ValueError(
+                            "--turboquant-mla-layer-ids does not yet support LMCache"
+                        )
+                    if self.server_args.disaggregation_mode != "null":
+                        raise ValueError(
+                            "--turboquant-mla-layer-ids does not yet support "
+                            "disaggregated serving"
+                        )
                 if hot_capacity_tokens > 0 and self.is_draft_worker:
                     raise ValueError(
                         "static hot/cold TurboQuant must not be constructed "
@@ -994,6 +1026,7 @@ class ModelRunnerKVCacheMixin:
                     turboquant_v_bits=getattr(self, "turboquant_v_bits", 0),
                     turboquant_uniform=getattr(self, "turboquant_uniform", False),
                     turboquant_e2m1=getattr(self, "turboquant_e2m1", False),
+                    turboquant_layer_ids=selected_layer_ids,
                     enable_fp8_codebook=should_allocate_mla_tq_fp8_codebook(
                         self.server_args.get_attention_backends()[1],
                         getattr(self, "turboquant_e2m1", False),
