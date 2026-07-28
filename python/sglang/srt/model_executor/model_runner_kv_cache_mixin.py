@@ -128,9 +128,9 @@ def _validate_tq_hotcold_server_args(
         violations.append("symmetric TurboQuant K=4")
     if turboquant_v_bits is not None and turboquant_v_bits != 4:
         violations.append("symmetric TurboQuant V=4")
-    _, decode_backend = server_args.get_attention_backends()
-    if decode_backend != "tokenspeed_mla":
-        violations.append("--decode-attention-backend tokenspeed_mla")
+    prefill_backend, decode_backend = server_args.get_attention_backends()
+    if prefill_backend != "tokenspeed_mla" or decode_backend != "tokenspeed_mla":
+        violations.append("--attention-backend tokenspeed_mla for prefill and decode")
     if server_args.page_size != 32:
         violations.append("--page-size 32")
     if not server_args.disable_radix_cache:
@@ -150,6 +150,10 @@ def _validate_tq_hotcold_server_args(
     speculative_algorithm = getattr(server_args, "speculative_algorithm", None)
     if speculative_algorithm not in (None, "DFLASH"):
         violations.append("speculative decoding disabled or DFLASH")
+    if speculative_algorithm == "DFLASH" and getattr(
+        server_args, "speculative_draft_attention_backend", None
+    ) != "fa4":
+        violations.append("--speculative-draft-attention-backend fa4")
     cuda_graph_config = getattr(server_args, "cuda_graph_config", None)
     prefill_graph_backend = getattr(
         getattr(cuda_graph_config, "prefill", None),

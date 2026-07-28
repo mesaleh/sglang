@@ -443,6 +443,7 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
             attn_cp_size=1,
             enable_dp_attention=False,
             speculative_algorithm=None,
+            speculative_draft_attention_backend="fa4",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend="disabled")
             ),
@@ -458,6 +459,36 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
                 _validate_tq_hotcold_server_args(
                     SimpleNamespace(
                         **(base | {"speculative_algorithm": "EAGLE3"})
+                    )
+                )
+            with self.assertRaisesRegex(
+                ValueError, "speculative-draft-attention-backend fa4"
+            ):
+                _validate_tq_hotcold_server_args(
+                    SimpleNamespace(
+                        **(
+                            base
+                            | {
+                                "speculative_algorithm": "DFLASH",
+                                "speculative_draft_attention_backend": "flashinfer",
+                            }
+                        )
+                    )
+                )
+            with self.assertRaisesRegex(
+                ValueError, "attention-backend tokenspeed_mla for prefill and decode"
+            ):
+                _validate_tq_hotcold_server_args(
+                    SimpleNamespace(
+                        **(
+                            base
+                            | {
+                                "get_attention_backends": lambda: (
+                                    "trtllm_mla",
+                                    "tokenspeed_mla",
+                                )
+                            }
+                        )
                     )
                 )
             with self.assertRaisesRegex(ValueError, "prefill CUDA graphs disabled"):
