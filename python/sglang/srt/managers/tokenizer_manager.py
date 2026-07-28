@@ -1135,6 +1135,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Build return object
         if isinstance(obj, GenerateReqInput):
+            self._validate_hotcold_dflash_request(
+                input_token_num=(
+                    len(input_ids)
+                    if input_ids is not None
+                    else len(input_embeds)
+                    if input_embeds is not None
+                    else 0
+                ),
+                max_new_tokens=sampling_params.max_new_tokens,
+                has_continual_session=(
+                    bool(obj.session_params)
+                    and obj.session_params.get("id") is not None
+                ),
+            )
             session_params = (
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
@@ -1217,6 +1231,70 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
+
+    def _validate_hotcold_dflash_request(
+        self,
+        *,
+        input_token_num: int,
+        max_new_tokens: Optional[int],
+        has_continual_session: bool = False,
+    ) -> None:
+        """Reject DFlash requests that can leave the static FP8 hot segment.
+
+        The attention backend retains a rank-local invariant check, but an
+        exception from that path is fatal to the scheduler process. Validate
+        the request's full admitted generation envelope in the tokenizer
+        process so an unsupported request receives a normal request error
+        before it can be dispatched to any GPU rank.
+        """
+        hot_capacity_tokens = envs.SGLANG_TQ_MLA_HOT_TOKENS.get()
+        if hot_capacity_tokens <= 0:
+            return
+
+        speculative_algorithm = SpeculativeAlgorithm.from_string(
+            self.server_args.speculative_algorithm
+        )
+        if not speculative_algorithm.is_dflash():
+            return
+
+        if has_continual_session:
+            raise ValueError(
+                "segmented hot/cold TurboQuant with DFlash does not support "
+                "continual-session requests because their full KV length "
+                "cannot be admitted safely before scheduler dispatch"
+            )
+
+        if max_new_tokens is None:
+            raise ValueError(
+                "segmented hot/cold TurboQuant with DFlash requires an "
+                "explicit finite max_tokens value so the request can be "
+                "admitted before scheduler dispatch"
+            )
+        # The last possible target-verification step begins after at most
+        # max(max_new_tokens, 1) - 1 accepted output tokens. DFlash still
+        # executes one target-verify step for max_new_tokens=0 before overlap
+        # result processing retires the request. DFlash's normal host
+        # mirror already includes one verify block before the attention
+        # backend adds another. Its reserved-length fallback can include two
+        # blocks before the backend adds the third, so admission must budget
+        # the worst case to keep the rank-local invariant unreachable.
+        max_verify_seq_len = (
+            input_token_num
+            + max(max_new_tokens, 1)
+            - 1
+            + 3 * self.server_args.speculative_num_draft_tokens
+        )
+
+        if max_verify_seq_len > hot_capacity_tokens:
+            raise ValueError(
+                "segmented hot/cold TurboQuant with DFlash requires the "
+                "request's full generation envelope to stay within the "
+                f"{hot_capacity_tokens}-token FP8 hot segment; this request "
+                f"can reach {max_verify_seq_len} tokens during verification. "
+                "Reduce the prompt or max_tokens, increase "
+                "SGLANG_TQ_MLA_HOT_TOKENS, or launch without speculative "
+                "decoding"
+            )
 
     @staticmethod
     def _resolve_embed_overrides(

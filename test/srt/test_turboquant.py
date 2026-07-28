@@ -616,6 +616,133 @@ class TestTurboQuantMLAGraphMetadata(unittest.TestCase):
                 backend.init_forward_metadata(batch)
         parent_init.assert_not_called()
 
+    def test_hotcold_dflash_crossing_rejected_before_scheduler_dispatch(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        manager = object.__new__(TokenizerManager)
+        manager.context_len = 256_000
+        manager.server_args = SimpleNamespace(
+            speculative_algorithm="DFLASH",
+            speculative_num_draft_tokens=5,
+        )
+
+        with envs.SGLANG_TQ_MLA_HOT_TOKENS.override(128):
+            # 100 prompt + 14 generated - 1 already accepted + three
+            # 5-token DFlash reservations reaches the exact boundary.
+            manager._validate_hotcold_dflash_request(
+                input_token_num=100,
+                max_new_tokens=14,
+            )
+            manager._validate_hotcold_dflash_request(
+                input_token_num=113,
+                max_new_tokens=0,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "full generation envelope.*129 tokens during verification",
+            ):
+                manager._validate_hotcold_dflash_request(
+                    input_token_num=100,
+                    max_new_tokens=15,
+                )
+            with self.assertRaisesRegex(
+                ValueError,
+                "full generation envelope.*129 tokens during verification",
+            ):
+                manager._validate_hotcold_dflash_request(
+                    input_token_num=114,
+                    max_new_tokens=0,
+                )
+            with self.assertRaisesRegex(ValueError, "explicit finite max_tokens"):
+                manager._validate_hotcold_dflash_request(
+                    input_token_num=10,
+                    max_new_tokens=None,
+                )
+            with self.assertRaisesRegex(ValueError, "continual-session"):
+                manager._validate_hotcold_dflash_request(
+                    input_token_num=10,
+                    max_new_tokens=10,
+                    has_continual_session=True,
+                )
+
+        # Default-off and non-DFLASH paths preserve their existing admission.
+        with envs.SGLANG_TQ_MLA_HOT_TOKENS.override(0):
+            manager._validate_hotcold_dflash_request(
+                input_token_num=200_000,
+                max_new_tokens=None,
+            )
+        manager.server_args.speculative_algorithm = None
+        with envs.SGLANG_TQ_MLA_HOT_TOKENS.override(128):
+            manager._validate_hotcold_dflash_request(
+                input_token_num=200_000,
+                max_new_tokens=None,
+            )
+
+    def test_hotcold_dflash_admission_is_wired_before_tokenized_request(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+
+        manager = object.__new__(TokenizerManager)
+        manager.context_len = 256_000
+        manager.preferred_sampling_params = None
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(vocab_size=1)
+        manager.server_args = SimpleNamespace(
+            speculative_algorithm="DFLASH",
+            speculative_num_draft_tokens=5,
+        )
+
+        def sampling_params_class(**kwargs):
+            return SimpleNamespace(
+                max_new_tokens=kwargs["max_new_tokens"],
+                normalize=lambda _tokenizer: None,
+                verify=lambda _vocab_size: None,
+            )
+
+        manager.sampling_params_class = sampling_params_class
+        for input_ids, input_embeds in (
+            ([1] * 100, None),
+            (None, [[0.0]] * 100),
+        ):
+            request = GenerateReqInput(
+                input_ids=input_ids,
+                input_embeds=input_embeds,
+                sampling_params={"max_new_tokens": 15},
+            )
+            with (
+                self.subTest(input_form="ids" if input_ids else "embeds"),
+                envs.SGLANG_TQ_MLA_HOT_TOKENS.override(128),
+                self.assertRaisesRegex(
+                    ValueError,
+                    "full generation envelope.*129 tokens during verification",
+                ),
+            ):
+                manager._create_tokenized_object(
+                    request,
+                    input_text="",
+                    input_ids=input_ids,
+                    input_embeds=input_embeds,
+                )
+
+        zero_token_request = GenerateReqInput(
+            input_ids=[1] * 114,
+            sampling_params={"max_new_tokens": 0},
+        )
+        with (
+            envs.SGLANG_TQ_MLA_HOT_TOKENS.override(128),
+            self.assertRaisesRegex(
+                ValueError,
+                "full generation envelope.*129 tokens during verification",
+            ),
+        ):
+            manager._create_tokenized_object(
+                zero_token_request,
+                input_text="",
+                input_ids=zero_token_request.input_ids,
+            )
+
     def test_hotcold_fp8_frontend_is_used_only_inside_hot_capacity(self):
         import torch
 
