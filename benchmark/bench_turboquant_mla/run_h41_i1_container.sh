@@ -139,7 +139,7 @@ fi
 
 sudo install -d "$CACHE_ROOT"/{flashinfer,torch,torch-extensions,triton,nv,cutlass}
 
-sudo docker run --rm --name "h41-i1-$RUN_TAG" \
+sudo docker run --name "h41-i1-$RUN_TAG" \
   --gpus '"device=0"' \
   --ipc=host \
   --privileged \

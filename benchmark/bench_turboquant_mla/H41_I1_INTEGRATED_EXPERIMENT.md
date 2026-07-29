@@ -101,3 +101,8 @@ the extra-page memory-accounting error before any live run.
 The first live H40 contract invocation addressed a nonexistent `/usr/local/bin/pytest` entry point
 in the immutable image and exited before any GPU kernel ran. It is rejected infrastructure evidence;
 the accepted runner invokes the installed module with `python3 -m pytest` and requires a fresh rerun.
+
+The first W2 regression client detached during the long 352-case process while its `--rm` container
+continued and then removed its own exit/log record. The run is excluded because its verdict cannot
+be recovered. The accepted runner retains uniquely named stopped containers until their exit code
+and logs are archived, after which cleanup is a separate explicit operation.
