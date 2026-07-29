@@ -106,3 +106,7 @@ The first W2 regression client detached during the long 352-case process while i
 continued and then removed its own exit/log record. The run is excluded because its verdict cannot
 be recovered. The accepted runner retains uniquely named stopped containers until their exit code
 and logs are archived, after which cleanup is a separate explicit operation.
+
+The first sanitizer invocation used an unsupported `regex:` filter spelling and Compute Sanitizer
+exited in argument parsing before Python or CUDA launched. It is excluded CLI-harness evidence; the
+accepted runner uses the installed tool's reported `regex=` key/value form.

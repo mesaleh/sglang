@@ -61,7 +61,7 @@ if [[ "$MODE" == 'sanitizer' ]]; then
   container_arguments=(
     --tool memcheck
     --target-processes all
-    --kernel-name regex:tq_mla_frontend_kernel
+    --kernel-name regex=tq_mla_frontend_kernel
     python3 "$SCRIPT" --mode sanitizer
   )
 fi
