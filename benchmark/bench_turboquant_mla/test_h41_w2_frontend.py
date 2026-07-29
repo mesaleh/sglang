@@ -297,15 +297,23 @@ def test_graph_replay(
         buffers = allocate_guarded(tokens, pool_size, device)
         launch(inputs, locations, config, buffers, True, 8)
         torch.cuda.synchronize()
-        before_allocated = torch.cuda.memory_allocated(device)
+        eager_before = torch.cuda.memory_allocated(device)
+        for _ in range(100):
+            launch(inputs, locations, config, buffers, True, 8)
+        torch.cuda.synchronize()
+        eager_after = torch.cuda.memory_allocated(device)
+        assert eager_after == eager_before
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             launch(inputs, locations, config, buffers, True, 8)
+        graph.replay()
+        torch.cuda.synchronize()
+        replay_before = torch.cuda.memory_allocated(device)
         for _ in range(100):
             graph.replay()
         torch.cuda.synchronize()
-        after_allocated = torch.cuda.memory_allocated(device)
-        assert after_allocated == before_allocated
+        replay_after = torch.cuda.memory_allocated(device)
+        assert replay_after == replay_before
         expected = query_reference(inputs[0], inputs[1], config, True)
         assert torch.equal(raw_fp8(buffers.query), raw_fp8(expected))
         assert int(buffers.status.item()) == 0
