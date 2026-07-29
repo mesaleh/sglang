@@ -108,13 +108,14 @@ class TestTurboQuantCLI(unittest.TestCase):
         fuse.assert_not_called()
         self.assertFalse(tq_config.mla_absorb_rotation_fused)
 
-    def test_layerwise_mla_does_not_globally_rotate_absorb_weights(self):
+    def test_layerwise_mla_rotates_only_selected_absorb_weights(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         tq_config = SimpleNamespace(mla_absorb_rotation_fused=False)
         pool = SimpleNamespace(
             tq_config=tq_config,
             has_mixed_layer_storage=True,
+            turboquant_layer_ids=frozenset({3, 5}),
         )
         fuse = Mock()
         runner = SimpleNamespace(
@@ -124,13 +125,20 @@ class TestTurboQuantCLI(unittest.TestCase):
             server_args=SimpleNamespace(
                 get_attention_backends=lambda: (None, "tokenspeed_mla"),
                 enable_lora=False,
+                disable_chunked_prefix_cache=False,
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(backend="disabled")
+                ),
             ),
+            start_layer=0,
+            end_layer=4,
             _maybe_fuse_tq_mla_absorb_rotations=fuse,
         )
 
         ModelRunner._maybe_fuse_tq_output_rotation(runner)
 
-        fuse.assert_not_called()
+        fuse.assert_called_once()
+        self.assertEqual(fuse.call_args.kwargs["selected_layer_ids"], frozenset({3}))
         self.assertFalse(tq_config.mla_absorb_rotation_fused)
 
     def test_native_e2m1_cli_resolves_mla_format_contract(self):

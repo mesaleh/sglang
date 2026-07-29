@@ -92,6 +92,7 @@ def test_bounded_graph_block_table_has_contiguous_stable_storage():
 def test_tq4_codebook_backend_fails_closed_above_graph_bound():
     backend = object.__new__(TokenspeedMLABackend)
     backend._tq4_cache = True
+    backend._tq4_hotcold_cache = False
     backend._tq_pool = SimpleNamespace(kv_nope_codebook_buffer=object())
     backend.max_context_len = 256_000
     backend.num_draft_tokens = 5
@@ -110,9 +111,7 @@ def test_tq4_codebook_backend_fails_closed_above_graph_bound():
     )
 
     assert backend.get_cuda_graph_max_seq_len() == 32_768
-    assert (
-        backend.get_cuda_graph_max_prefix_len(ForwardMode.TARGET_VERIFY) == 32_763
-    )
+    assert backend.get_cuda_graph_max_prefix_len(ForwardMode.TARGET_VERIFY) == 32_763
     assert backend.get_cuda_graph_max_prefix_len(ForwardMode.DECODE) == 32_768
     assert backend.can_run_cuda_graph(exact_boundary)
     assert not backend.can_run_cuda_graph(one_token_over)
@@ -210,3 +209,97 @@ def test_tq4_rotation_fusion_is_idempotent():
     ModelRunner._maybe_fuse_tq_mla_absorb_rotations(runner, tq_config, logger)
 
     runner.model.named_modules.assert_not_called()
+
+
+def test_tq4_rotation_fusion_changes_only_selected_layers():
+    def make_layer(layer_id):
+        return SimpleNamespace(
+            layer_id=layer_id,
+            w_kc=torch.full((2, 3, 4), float(layer_id), dtype=torch.bfloat16),
+            w_vc=torch.full((2, 4, 3), float(layer_id), dtype=torch.bfloat16),
+        )
+
+    layer0 = make_layer(0)
+    layer1 = make_layer(1)
+    layer0_k = layer0.w_kc.clone()
+    layer0_v = layer0.w_vc.clone()
+    tq_config = SimpleNamespace(
+        mla_absorb_rotation_fused=False,
+        head_dim=4,
+        fuse_mla_absorb_rotations=Mock(
+            side_effect=lambda w_kc, w_vc: (w_kc + 10, w_vc + 20)
+        ),
+    )
+    runner = object.__new__(ModelRunner)
+    runner.model = SimpleNamespace(
+        named_modules=lambda: iter(
+            (("model.layers.0.self_attn", layer0), ("model.layers.1.self_attn", layer1))
+        )
+    )
+
+    ModelRunner._maybe_fuse_tq_mla_absorb_rotations(
+        runner, tq_config, Mock(), selected_layer_ids={1}
+    )
+
+    torch.testing.assert_close(layer0.w_kc, layer0_k)
+    torch.testing.assert_close(layer0.w_vc, layer0_v)
+    torch.testing.assert_close(layer1.w_kc, torch.full_like(layer1.w_kc, 11))
+    torch.testing.assert_close(layer1.w_vc, torch.full_like(layer1.w_vc, 21))
+    assert tq_config.mla_absorb_rotation_fused
+    tq_config.fuse_mla_absorb_rotations.assert_called_once()
+
+
+def test_tq4_rotation_fusion_fails_closed_if_a_selected_layer_is_missing():
+    layer = SimpleNamespace(
+        layer_id=1,
+        w_kc=torch.zeros((2, 3, 4), dtype=torch.bfloat16),
+        w_vc=torch.zeros((2, 4, 3), dtype=torch.bfloat16),
+    )
+    tq_config = SimpleNamespace(
+        mla_absorb_rotation_fused=False,
+        head_dim=4,
+        fuse_mla_absorb_rotations=Mock(
+            side_effect=lambda w_kc, w_vc: (w_kc + 1, w_vc + 1)
+        ),
+    )
+    runner = object.__new__(ModelRunner)
+    runner.model = SimpleNamespace(
+        named_modules=lambda: iter((("model.layers.1.self_attn", layer),))
+    )
+
+    ModelRunner._maybe_fuse_tq_mla_absorb_rotations(
+        runner, tq_config, Mock(), selected_layer_ids={1, 2}
+    )
+
+    assert not tq_config.mla_absorb_rotation_fused
+    tq_config.fuse_mla_absorb_rotations.assert_not_called()
+
+
+def test_tq4_rotation_fusion_fails_closed_for_duplicate_selected_layer():
+    def make_layer():
+        return SimpleNamespace(
+            layer_id=1,
+            w_kc=torch.zeros((2, 3, 4), dtype=torch.bfloat16),
+            w_vc=torch.zeros((2, 4, 3), dtype=torch.bfloat16),
+        )
+
+    tq_config = SimpleNamespace(
+        mla_absorb_rotation_fused=False,
+        head_dim=4,
+        fuse_mla_absorb_rotations=Mock(
+            side_effect=lambda w_kc, w_vc: (w_kc + 1, w_vc + 1)
+        ),
+    )
+    runner = object.__new__(ModelRunner)
+    runner.model = SimpleNamespace(
+        named_modules=lambda: iter(
+            (("model.layers.1.self_attn", make_layer()), ("duplicate", make_layer()))
+        )
+    )
+
+    ModelRunner._maybe_fuse_tq_mla_absorb_rotations(
+        runner, tq_config, Mock(), selected_layer_ids={1}
+    )
+
+    assert not tq_config.mla_absorb_rotation_fused
+    tq_config.fuse_mla_absorb_rotations.assert_not_called()

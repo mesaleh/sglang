@@ -2809,15 +2809,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                     return
                 if getattr(kvcache, "has_mixed_layer_storage", False):
-                    # Dense layers keep the original FP8 latent and use the
-                    # ordinary TokenSpeed reader. A model-wide w_kc/w_vc
-                    # rotation would therefore corrupt every dense layer.
-                    # Keep query/output rotation inside selected TQ readers.
-                    logger.info(
-                        "TurboQuant layer-wise MLA: keeping runtime rotations "
-                        "for selected compressed layers."
+                    selected_layer_ids = frozenset(
+                        layer_id
+                        for layer_id in kvcache.turboquant_layer_ids
+                        if self.start_layer <= layer_id < self.end_layer
                     )
-                    return
+                else:
+                    selected_layer_ids = None
                 prefill_graph_backend = getattr(
                     getattr(
                         getattr(self.server_args, "cuda_graph_config", None),
@@ -2840,7 +2838,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         "because an extend fallback is enabled."
                     )
                     return
-                self._maybe_fuse_tq_mla_absorb_rotations(tq_cfg, logger)
+                self._maybe_fuse_tq_mla_absorb_rotations(
+                    tq_cfg,
+                    logger,
+                    selected_layer_ids=selected_layer_ids,
+                )
                 return
 
             # The fallback MLA paths dequantize and inverse-rotate on read, so
@@ -2922,17 +2924,36 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     skipped_quantized + skipped_other,
                 )
 
-    def _maybe_fuse_tq_mla_absorb_rotations(self, tq_cfg, logger):
-        """Move MLA target decode into the packed cache's rotation domain."""
+    def _maybe_fuse_tq_mla_absorb_rotations(
+        self, tq_cfg, logger, *, selected_layer_ids=None
+    ):
+        """Move every compressed MLA layer into the packed cache's rotation domain.
+
+        ``selected_layer_ids`` limits mutation to a heterogeneous pool's TQ layers.
+        Fusion fails closed unless an eligible absorb-weight pair is found for every
+        selected local layer; the shared config flag is set only after all mutations.
+        """
         if getattr(tq_cfg, "mla_absorb_rotation_fused", False):
             logger.info("TurboQuant native MLA rotations are already fused.")
             return
+
+        if selected_layer_ids is not None:
+            selected_layer_ids = frozenset(selected_layer_ids)
+            if not selected_layer_ids:
+                logger.warning(
+                    "TurboQuant native MLA rotation fusion disabled: no selected "
+                    "layers belong to this pipeline stage."
+                )
+                return
 
         safe_dtypes = (torch.float16, torch.bfloat16, torch.float32)
         candidates = []
         rejected = []
         for name, module in self.model.named_modules():
             if not (hasattr(module, "w_kc") and hasattr(module, "w_vc")):
+                continue
+            layer_id = getattr(module, "layer_id", None)
+            if selected_layer_ids is not None and layer_id not in selected_layer_ids:
                 continue
             w_kc = module.w_kc
             w_vc = module.w_vc
@@ -2958,19 +2979,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
                 )
                 continue
-            candidates.append((name, w_kc, w_vc))
+            candidates.append((name, layer_id, w_kc, w_vc))
 
-        if not candidates or rejected:
+        candidate_layer_ids = {layer_id for _, layer_id, _, _ in candidates}
+        missing_selected_layers = (
+            sorted(selected_layer_ids - candidate_layer_ids)
+            if selected_layer_ids is not None
+            else []
+        )
+        duplicate_selected_layers = (
+            sorted(
+                layer_id
+                for layer_id in selected_layer_ids
+                if sum(candidate[1] == layer_id for candidate in candidates) > 1
+            )
+            if selected_layer_ids is not None
+            else []
+        )
+        if (
+            not candidates
+            or rejected
+            or missing_selected_layers
+            or duplicate_selected_layers
+        ):
             logger.warning(
                 "TurboQuant native MLA rotation fusion disabled: "
-                "eligible_layers=%d rejected_layers=%s",
+                "eligible_layers=%d rejected_layers=%s missing_selected_layers=%s "
+                "duplicate_selected_layers=%s",
                 len(candidates),
                 rejected,
+                missing_selected_layers,
+                duplicate_selected_layers,
             )
             return
 
         with torch.no_grad():
-            for _, w_kc, w_vc in candidates:
+            for _, _, w_kc, w_vc in candidates:
                 w_kc_rotated, w_vc_rotated = tq_cfg.fuse_mla_absorb_rotations(
                     w_kc, w_vc
                 )
@@ -2980,8 +3024,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         tq_cfg.mla_absorb_rotation_fused = True
         logger.info(
             "TurboQuant native MLA: fused query/output rotations into %d "
-            "w_kc/w_vc layer pairs.",
+            "w_kc/w_vc layer pairs%s.",
             len(candidates),
+            (
+                f" selected from {sorted(selected_layer_ids)}"
+                if selected_layer_ids is not None
+                else ""
+            ),
         )
 
     def maybe_init_ngram_embedding(self):
