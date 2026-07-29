@@ -40,8 +40,9 @@ dynamic, intermediate, or shadow allocation is allowed.
 
 1. Static-rotation query bytes differ from the accepted `_quantize_tq4_query` oracle, or the
    explicit-rotation branch differs after applying the accepted rotation oracle.
-2. Packed nibbles differ from the accepted writer; FP8 RoPE bytes differ from SATFINITE E4M3; or
-   BF16 scales exceed the frozen tolerance (`atol=0.002`, `rtol=0.002`).
+2. Packed nibbles, FP8 RoPE bytes, or BF16 scale bytes differ from the accepted writer on
+   realistic/random/zero/basis inputs. Artificial boundary probes may report an adjacent-bin-only
+   mismatch separately, but cannot qualify captured/realistic mismatches.
 3. Zero, near-zero, threshold-boundary, NaN/Inf, minimum/maximum valid-location, invalid-location,
    non-contiguous, wrong-dtype/device/shape, graph-replay, or current-stream tests violate the
    wrapper/fault contract. Destination locations must be unique, matching the existing allocator
