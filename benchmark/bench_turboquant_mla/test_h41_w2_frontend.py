@@ -478,10 +478,52 @@ def run_strict_invalid(
     raise AssertionError("strict invalid-location launch did not trap")
 
 
+def run_candidate_only_sanitizer(
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> dict[str, Any]:
+    launches = 0
+    for tokens in (1, 5, 40):
+        inputs = make_inputs(tokens, device, generator, "random")
+        pool_size = tokens + 11
+        locations = torch.arange(tokens, dtype=torch.int64, device=device) + 3
+        for rotation_fused in (True, False):
+            for warps in (1, 2, 4, 8):
+                buffers = allocate_guarded(tokens, pool_size, device)
+                launch(inputs, locations, config, buffers, rotation_fused, warps)
+                torch.cuda.synchronize()
+                assert int(buffers.status.item()) == 0
+                assert_guards(buffers)
+                launches += 1
+
+    inputs = make_inputs(3, device, generator, "random")
+    buffers = allocate_guarded(3, 8, device)
+    packed_before = buffers.packed.clone()
+    scale_before = buffers.scale.clone()
+    rope_before = raw_fp8(buffers.rope).clone()
+    invalid = torch.tensor([-1, 8, 25], dtype=torch.int64, device=device)
+    launch(inputs, invalid, config, buffers, True, 8)
+    torch.cuda.synchronize()
+    assert int(buffers.status.item()) == 1
+    assert torch.equal(buffers.packed, packed_before)
+    assert torch.equal(buffers.scale, scale_before)
+    assert torch.equal(raw_fp8(buffers.rope), rope_before)
+    assert_guards(buffers)
+    return {
+        "status": "PASS",
+        "candidate_only": True,
+        "valid_launches": launches,
+        "invalid_skip": "PASS",
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mode", choices=("correctness", "strict-invalid", "compile"), default="correctness"
+        "--mode",
+        choices=("correctness", "strict-invalid", "sanitizer", "compile"),
+        default="correctness",
     )
     parser.add_argument("--seed", type=int, default=20260729)
     args = parser.parse_args()
@@ -503,6 +545,11 @@ def main() -> None:
 
     if args.mode == "strict-invalid":
         result = run_strict_invalid(config, device, generator)
+        print(json.dumps(result, sort_keys=True))
+        return
+
+    if args.mode == "sanitizer":
+        result = run_candidate_only_sanitizer(config, device, generator)
         print(json.dumps(result, sort_keys=True))
         return
 
