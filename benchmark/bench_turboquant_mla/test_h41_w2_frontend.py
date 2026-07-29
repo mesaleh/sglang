@@ -347,6 +347,137 @@ def test_invalid_sticky(
     assert_guards(buffers)
 
 
+def test_valid_edge_locations(
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> None:
+    pool_size = 9
+    inputs = make_inputs(2, device, generator, "random")
+    locations = torch.tensor([0, pool_size - 1], dtype=torch.int64, device=device)
+    assert_case(inputs, locations, config, True, 8, pool_size)
+
+
+def test_identical_duplicate_locations(
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> None:
+    """Exercise benign duplicate writes without expanding the API contract.
+
+    SGLang's allocator supplies unique locations. Identical duplicate rows are
+    nevertheless useful as a race-tolerance probe because every writer stores
+    exactly the same bytes.
+    """
+
+    pool_size = 8
+    single = make_inputs(1, device, generator, "random")
+    repeated = tuple(
+        value.expand(4, *value.shape[1:]).contiguous() for value in single
+    )
+
+    baseline = allocate_guarded(1, pool_size, device)
+    baseline_location = torch.tensor([3], dtype=torch.int64, device=device)
+    launch(single, baseline_location, config, baseline, True, 8)
+    torch.cuda.synchronize()
+
+    duplicate = allocate_guarded(4, pool_size, device)
+    duplicate_locations = torch.full((4,), 3, dtype=torch.int64, device=device)
+    launch(repeated, duplicate_locations, config, duplicate, True, 8)
+    torch.cuda.synchronize()
+
+    expected_query_row = raw_fp8(baseline.query[0])
+    for row in range(4):
+        assert torch.equal(raw_fp8(duplicate.query[row]), expected_query_row)
+    assert torch.equal(duplicate.packed[3], baseline.packed[3])
+    assert torch.equal(
+        duplicate.scale[3].view(torch.uint16), baseline.scale[3].view(torch.uint16)
+    )
+    assert torch.equal(raw_fp8(duplicate.rope[3]), raw_fp8(baseline.rope[3]))
+    assert int(duplicate.status.item()) == 0
+    assert_guards(duplicate)
+
+
+def test_quant_boundary_semantics(
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> None:
+    """Probe the writer's strict-greater-than classification around zero."""
+
+    inputs = make_inputs(1, device, generator, "zero")
+    locations = torch.tensor([2], dtype=torch.int64, device=device)
+    original = config.k_boundaries.clone()
+    zero_index = int(torch.argmin(original.abs()).item())
+    assert float(original[zero_index].item()) == 0.0
+    probes = (
+        torch.nextafter(
+            torch.tensor(0.0, dtype=torch.float32, device=device),
+            torch.tensor(float("-inf"), dtype=torch.float32, device=device),
+        ),
+        torch.tensor(0.0, dtype=torch.float32, device=device),
+        torch.nextafter(
+            torch.tensor(0.0, dtype=torch.float32, device=device),
+            torch.tensor(float("inf"), dtype=torch.float32, device=device),
+        ),
+    )
+    packed_rows: list[torch.Tensor] = []
+    try:
+        for probe in probes:
+            boundaries = original.clone()
+            boundaries[zero_index] = probe
+            config.k_boundaries.copy_(boundaries)
+            buffers = allocate_guarded(1, 5, device)
+            expected_packed, expected_scale, expected_rope = writer_reference(
+                inputs[2], inputs[3], locations, config, 5
+            )
+            launch(inputs, locations, config, buffers, True, 8)
+            torch.cuda.synchronize()
+            assert torch.equal(buffers.packed[2], expected_packed[2])
+            assert torch.equal(
+                buffers.scale[2].view(torch.uint16),
+                expected_scale[2].view(torch.uint16),
+            )
+            assert torch.equal(raw_fp8(buffers.rope[2]), raw_fp8(expected_rope[0]))
+            assert int(buffers.status.item()) == 0
+            assert_guards(buffers)
+            packed_rows.append(buffers.packed[2].clone())
+    finally:
+        config.k_boundaries.copy_(original)
+    # At y == 0, `y > boundary` changes only when the boundary is just below
+    # zero. Equality remains in the lower bin, matching torch.searchsorted.
+    assert not torch.equal(packed_rows[0], packed_rows[1])
+    assert torch.equal(packed_rows[1], packed_rows[2])
+
+
+def test_current_stream(
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> None:
+    inputs = make_inputs(5, device, generator, "random")
+    locations = torch.arange(5, dtype=torch.int64, device=device) + 2
+    buffers = allocate_guarded(5, 11, device)
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        launch(inputs, locations, config, buffers, True, 8)
+    stream.synchronize()
+    expected_query = query_reference(inputs[0], inputs[1], config, True)
+    expected_packed, expected_scale, expected_rope = writer_reference(
+        inputs[2], inputs[3], locations, config, 11
+    )
+    assert torch.equal(raw_fp8(buffers.query), raw_fp8(expected_query))
+    assert torch.equal(buffers.packed[locations], expected_packed[locations])
+    assert torch.equal(
+        buffers.scale[locations].view(torch.uint16),
+        expected_scale[locations].view(torch.uint16),
+    )
+    assert torch.equal(raw_fp8(buffers.rope[locations]), raw_fp8(expected_rope))
+    assert int(buffers.status.item()) == 0
+    assert_guards(buffers)
+
+
 def expect_error(fn, text: str) -> None:
     try:
         fn()
@@ -589,6 +720,10 @@ def main() -> None:
                     )
     test_graph_replay(config, device, generator)
     test_invalid_sticky(config, device, generator)
+    test_valid_edge_locations(config, device, generator)
+    test_identical_duplicate_locations(config, device, generator)
+    test_quant_boundary_semantics(config, device, generator)
+    test_current_stream(config, device, generator)
     test_wrapper_rejections(config, device, generator)
     test_special_fp8(config, device)
     result = {
@@ -604,6 +739,10 @@ def main() -> None:
         "cases": cases,
         "graph_rows": [1, 5],
         "invalid_sticky": "PASS",
+        "valid_edge_locations": "PASS",
+        "identical_duplicate_locations": "PASS",
+        "quant_boundary_semantics": "PASS",
+        "current_stream": "PASS",
         "wrapper_rejections": "PASS",
         "special_fp8": "PASS",
     }
