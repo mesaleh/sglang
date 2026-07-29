@@ -1,6 +1,7 @@
-"""H41 I1 complete 61-layer four-family CUDA-graph falsifier.
+"""H41 I1 complete graph falsifier plus opt-in H42 localization arms.
 
-This is isolated graph evidence. It is not an endpoint or quality result.
+The H41 CLI remains the default. H42 variants are diagnostic-only and are not
+endpoint or quality evidence.
 """
 
 from __future__ import annotations
@@ -159,6 +160,7 @@ def time_graph(
     replays_per_sample: int,
     output: torch.Tensor,
     status: torch.Tensor | None,
+    timed_layers: int,
 ) -> dict[str, Any]:
     before = gpu_covariates()
     sample_us: list[float] = []
@@ -180,6 +182,9 @@ def time_graph(
         "graph_us": summarize(sample_us),
         "per_total_layer_us": summarize(
             [value / TOTAL_LAYERS for value in sample_us]
+        ),
+        "per_timed_layer_us": summarize(
+            [value / timed_layers for value in sample_us]
         ),
         "replays": samples * replays_per_sample,
         "gpu_before": before,
@@ -277,17 +282,48 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260729)
     parser.add_argument("--correctness-atol", type=float, default=0.002)
     parser.add_argument("--graph-debug-dir", type=Path)
+    parser.add_argument(
+        "--trace-only",
+        action="store_true",
+        help="Allow a short Nsight trace run that is ineligible for timing decisions.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=(
+            "f-chain",
+            "s-chain",
+            "s-static",
+            "s-phased",
+            "s-chain-noapdl",
+        ),
+        help="Opt into one frozen H42 D1 diagnostic arm.",
+    )
     args = parser.parse_args()
+    h42_mode = args.variant is not None
+    variant = args.variant or "f-chain"
 
     expected_split = {10219: 64, 37932: 40}[args.context]
     if args.split_kv != expected_split:
         raise ValueError(
             f"context {args.context} requires frozen split-kv {expected_split}"
         )
-    if args.warmups < 100:
-        raise ValueError("H41 I1 requires at least 100 graph warmups per arm")
-    if args.samples * args.replays_per_sample < 2000:
-        raise ValueError("H41 I1 requires at least 2,000 timed replays per arm")
+    if args.trace_only:
+        if not h42_mode:
+            raise ValueError("trace-only mode is restricted to explicit H42 variants")
+        if args.warmups < 5 or args.samples * args.replays_per_sample < 1:
+            raise ValueError("H42 trace-only mode requires 5 warmups and one replay")
+    else:
+        if args.warmups < 100:
+            raise ValueError("H41 I1 requires at least 100 graph warmups per arm")
+        if args.samples * args.replays_per_sample < 2000:
+            raise ValueError("H41 I1 requires at least 2,000 timed replays per arm")
+    if h42_mode:
+        if args.context != 37932 or args.split_kv != 40:
+            raise ValueError("H42 D1 variants require context 37932 and split-kv 40")
+        if args.allocation_order != "control-first" or args.seed != 20260729:
+            raise ValueError(
+                "H42 D1 variants require control-first allocation and seed 20260729"
+            )
 
     idle_proof = assert_idle_before_cuda()
     import flashinfer.rope
@@ -448,6 +484,25 @@ def main() -> None:
         1, TOKENS, HEADS, LATENT, dtype=torch.bfloat16, device=device
     )
     candidate_out = torch.empty_like(control_out)
+    control_query_layers = torch.empty(
+        SELECTED_LAYERS,
+        TOKENS,
+        HEADS,
+        LATENT + ROPE,
+        dtype=FP8,
+        device=device,
+    )
+    candidate_query_layers = torch.empty_like(control_query_layers)
+    control_out_layers = torch.empty(
+        SELECTED_LAYERS,
+        1,
+        TOKENS,
+        HEADS,
+        LATENT,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    candidate_out_layers = torch.empty_like(control_out_layers)
     check_dense_out = torch.empty_like(control_out)
     check_tq_out = torch.empty_like(control_out)
     config = TurboQuantConfig(
@@ -462,6 +517,7 @@ def main() -> None:
     assert config.k_storage_code_lut is not None
     torch.testing.assert_close(config.k_centroids, centroids, rtol=0, atol=0)
     softmax_scale = 1.0 / math.sqrt(LATENT + ROPE)
+    attention_pdl = variant != "s-chain-noapdl"
 
     def dense_attention(
         cache: torch.Tensor,
@@ -481,7 +537,7 @@ def main() -> None:
             softmax_scale=softmax_scale,
             out=output,
             causal_mask=True,
-            enable_pdl=True,
+            enable_pdl=attention_pdl,
         )
 
     def tq_attention(layer: int, query: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
@@ -500,7 +556,7 @@ def main() -> None:
             softmax_scale=softmax_scale,
             out=output,
             causal_mask=True,
-            enable_pdl=True,
+            enable_pdl=attention_pdl,
             split_kv_override=args.split_kv,
             kv_nope_codebook=None,
             fp8_rope=True,
@@ -534,7 +590,11 @@ def main() -> None:
             cache.view(CACHE_ROWS, -1), locations, k_out, rope_out
         )
 
-    def selected_frontend(layer: int, query_latent_input: torch.Tensor) -> None:
+    def selected_frontend(
+        layer: int,
+        query_latent_input: torch.Tensor,
+        query_output: torch.Tensor = candidate_query,
+    ) -> None:
         flashinfer.rope._apply_rope_pos_ids_cos_sin_cache(
             q=query_rope_raw,
             k=cache_rope_raw,
@@ -555,7 +615,7 @@ def main() -> None:
             config.k_boundaries,
             config.k_quant_centroids,
             config.k_storage_code_lut,
-            candidate_query,
+            query_output,
             candidate_packed[layer].view(CACHE_ROWS, 1, LATENT // 2),
             candidate_scale[layer].view(CACHE_ROWS, 1),
             candidate_rope[layer].view(CACHE_ROWS, 1, ROPE),
@@ -630,7 +690,7 @@ def main() -> None:
     if int(status.item()) != 0:
         raise AssertionError("writer-reader round trip changed sticky status")
 
-    def run_control() -> torch.Tensor:
+    def run_control_full() -> torch.Tensor:
         result = control_out
         layer_query_latent = query_latent
         for layer in range(TOTAL_LAYERS):
@@ -650,7 +710,7 @@ def main() -> None:
             layer_query_latent = control_out.view(TOKENS, HEADS, LATENT)
         return result
 
-    def run_candidate() -> torch.Tensor:
+    def run_candidate_full() -> torch.Tensor:
         result = candidate_out
         layer_query_latent = query_latent
         for dense_index in range(DENSE_BEFORE):
@@ -689,14 +749,149 @@ def main() -> None:
             layer_query_latent = candidate_out.view(TOKENS, HEADS, LATENT)
         return result
 
+    def run_control_selected(*, chain: bool) -> torch.Tensor:
+        result = control_out
+        layer_query_latent = query_latent
+        for selected_index in range(SELECTED_LAYERS):
+            control_layer = DENSE_BEFORE + selected_index
+            normal_frontend(
+                control_dense[control_layer],
+                layer_query_latent,
+                control_query,
+                control_k,
+                control_rope,
+            )
+            result = dense_attention(
+                control_dense[control_layer],
+                control_query,
+                control_out,
+                control_workspace,
+            )
+            if chain:
+                layer_query_latent = control_out.view(TOKENS, HEADS, LATENT)
+        return result
+
+    def run_candidate_selected(*, chain: bool) -> torch.Tensor:
+        result = candidate_out
+        layer_query_latent = query_latent
+        for selected_index in range(SELECTED_LAYERS):
+            selected_frontend(selected_index, layer_query_latent)
+            result = tq_attention(selected_index, candidate_query, candidate_out)
+            if chain:
+                layer_query_latent = candidate_out.view(TOKENS, HEADS, LATENT)
+        return result
+
+    def run_control_static() -> torch.Tensor:
+        result = control_out_layers[-1]
+        for selected_index in range(SELECTED_LAYERS):
+            control_layer = DENSE_BEFORE + selected_index
+            normal_frontend(
+                control_dense[control_layer],
+                query_latent,
+                control_query_layers[selected_index],
+                control_k,
+                control_rope,
+            )
+            result = dense_attention(
+                control_dense[control_layer],
+                control_query_layers[selected_index],
+                control_out_layers[selected_index],
+                control_workspace,
+            )
+        return result
+
+    def run_candidate_static() -> torch.Tensor:
+        result = candidate_out_layers[-1]
+        for selected_index in range(SELECTED_LAYERS):
+            selected_frontend(
+                selected_index,
+                query_latent,
+                candidate_query_layers[selected_index],
+            )
+            result = tq_attention(
+                selected_index,
+                candidate_query_layers[selected_index],
+                candidate_out_layers[selected_index],
+            )
+        return result
+
+    def run_control_phased() -> torch.Tensor:
+        for selected_index in range(SELECTED_LAYERS):
+            control_layer = DENSE_BEFORE + selected_index
+            normal_frontend(
+                control_dense[control_layer],
+                query_latent,
+                control_query_layers[selected_index],
+                control_k,
+                control_rope,
+            )
+        result = control_out_layers[-1]
+        for selected_index in range(SELECTED_LAYERS):
+            control_layer = DENSE_BEFORE + selected_index
+            result = dense_attention(
+                control_dense[control_layer],
+                control_query_layers[selected_index],
+                control_out_layers[selected_index],
+                control_workspace,
+            )
+        return result
+
+    def run_candidate_phased() -> torch.Tensor:
+        for selected_index in range(SELECTED_LAYERS):
+            selected_frontend(
+                selected_index,
+                query_latent,
+                candidate_query_layers[selected_index],
+            )
+        result = candidate_out_layers[-1]
+        for selected_index in range(SELECTED_LAYERS):
+            result = tq_attention(
+                selected_index,
+                candidate_query_layers[selected_index],
+                candidate_out_layers[selected_index],
+            )
+        return result
+
+    if variant == "f-chain":
+        run_control = run_control_full
+        run_candidate = run_candidate_full
+        timed_layers = TOTAL_LAYERS
+        query_topology = "attention_output_to_next_query_latent"
+        scheduling = "frontend_attention_interleaved"
+    elif variant in ("s-chain", "s-chain-noapdl"):
+        run_control = lambda: run_control_selected(chain=True)
+        run_candidate = lambda: run_candidate_selected(chain=True)
+        timed_layers = SELECTED_LAYERS
+        query_topology = "attention_output_to_next_query_latent"
+        scheduling = "frontend_attention_interleaved"
+    elif variant == "s-static":
+        run_control = run_control_static
+        run_candidate = run_candidate_static
+        timed_layers = SELECTED_LAYERS
+        query_topology = "fixed_independent_input"
+        scheduling = "frontend_attention_interleaved"
+    elif variant == "s-phased":
+        run_control = run_control_phased
+        run_candidate = run_candidate_phased
+        timed_layers = SELECTED_LAYERS
+        query_topology = "fixed_independent_input"
+        scheduling = "all_frontends_then_all_readers"
+    else:
+        raise AssertionError(f"unhandled H42 variant {variant}")
+
     run_control()
     run_candidate()
     torch.cuda.synchronize()
     if int(status.item()) != 0:
         raise AssertionError("candidate sticky status changed during valid eager run")
-    if not bool(torch.isfinite(control_out.float()).all()):
+    eager_control_output = run_control()
+    eager_candidate_output = run_candidate()
+    torch.cuda.synchronize()
+    if int(status.item()) != 0:
+        raise AssertionError("candidate sticky status changed during repeated eager run")
+    if not bool(torch.isfinite(eager_control_output.float()).all()):
         raise AssertionError("control output contains a non-finite value")
-    if not bool(torch.isfinite(candidate_out.float()).all()):
+    if not bool(torch.isfinite(eager_candidate_output.float()).all()):
         raise AssertionError("candidate output contains a non-finite value")
 
     debug_control = (
@@ -716,7 +911,8 @@ def main() -> None:
         run_candidate, warmups=args.warmups, debug_path=debug_candidate
     )
     allocation_before_replay = torch.cuda.memory_allocated(device)
-    for _ in range(100):
+    allocation_check_replays = 5 if args.trace_only else 100
+    for _ in range(allocation_check_replays):
         control_graph.replay()
         candidate_graph.replay()
     torch.cuda.synchronize()
@@ -729,9 +925,9 @@ def main() -> None:
 
     sequence: list[dict[str, Any]] = []
     for kind, graph, output, graph_status in (
-        ("control", control_graph, control_out, None),
-        ("candidate", candidate_graph, candidate_out, status),
-        ("control", control_graph, control_out, None),
+        ("control", control_graph, eager_control_output, None),
+        ("candidate", candidate_graph, eager_candidate_output, status),
+        ("control", control_graph, eager_control_output, None),
     ):
         control_number = sum(item["kind"] == "control" for item in sequence) + 1
         arm = f"control_{control_number}" if kind == "control" else "candidate"
@@ -745,6 +941,7 @@ def main() -> None:
                     replays_per_sample=args.replays_per_sample,
                     output=output,
                     status=graph_status,
+                    timed_layers=timed_layers,
                 ),
             }
         )
@@ -766,8 +963,17 @@ def main() -> None:
     )
 
     result = {
-        "status": "TIMING_ONLY",
-        "experiment": "H41_I1_INTEGRATED_FOUR_FAMILY",
+        "status": (
+            "TRACE_ONLY"
+            if args.trace_only
+            else ("DIAGNOSTIC_ONLY" if h42_mode else "TIMING_ONLY")
+        ),
+        "experiment": (
+            "H42_D1_LONG_DEPENDENCY_LOCALIZATION"
+            if h42_mode
+            else "H41_I1_INTEGRATED_FOUR_FAMILY"
+        ),
+        "variant": variant,
         "timestamp_unix": time.time(),
         "pid": os.getpid(),
         "hostname": platform.node(),
@@ -782,6 +988,7 @@ def main() -> None:
         "q_len": TOKENS,
         "heads": HEADS,
         "total_layers": TOTAL_LAYERS,
+        "timed_layers": timed_layers,
         "selected_layers": SELECTED_LAYERS,
         "selected_layer_ids": list(
             range(DENSE_BEFORE, DENSE_BEFORE + SELECTED_LAYERS)
@@ -793,10 +1000,13 @@ def main() -> None:
         "selected_fp8_rope": True,
         "selected_codebook_materialized": False,
         "split_kv": args.split_kv,
+        "attention_pdl": attention_pdl,
+        "trace_only": args.trace_only,
         "allocation_order": args.allocation_order,
         "warmups_per_graph": args.warmups,
         "samples_per_arm": args.samples,
         "replays_per_sample": args.replays_per_sample,
+        "allocation_check_replays": allocation_check_replays,
         "sequence": sequence,
         "control_mean_graph_us": control_mean,
         "candidate_mean_graph_us": candidate_us,
@@ -804,16 +1014,29 @@ def main() -> None:
         "integrated_delta_per_selected_layer_us": graph_delta / SELECTED_LAYERS,
         "control_flank_drift_fraction": (control_2 - control_1) / control_mean,
         "operation_traces": {
-            "control": control_trace,
-            "candidate": candidate_trace,
+            "control": (
+                control_trace
+                if variant == "f-chain"
+                else control_trace[DENSE_BEFORE : DENSE_BEFORE + SELECTED_LAYERS]
+            ),
+            "candidate": (
+                candidate_trace
+                if variant == "f-chain"
+                else candidate_trace[DENSE_BEFORE : DENSE_BEFORE + SELECTED_LAYERS]
+            ),
         },
         "logical_operation_counts": {
-            "control_dense_layers": TOTAL_LAYERS,
-            "candidate_dense_layers": DENSE_LAYERS,
+            "control_dense_layers": (
+                TOTAL_LAYERS if variant == "f-chain" else SELECTED_LAYERS
+            ),
+            "candidate_dense_layers": DENSE_LAYERS if variant == "f-chain" else 0,
             "candidate_selected_layers": SELECTED_LAYERS,
             "operations_per_layer": 3,
         },
-        "inter_layer_dependency": "attention_output_to_next_query_latent",
+        "inter_layer_dependency": query_topology,
+        "query_input_topology": query_topology,
+        "stream_dependency_topology": "single_stream_programmatic_edges",
+        "scheduling": scheduling,
         "graph_debug_dir": (
             str(args.graph_debug_dir) if args.graph_debug_dir is not None else None
         ),
@@ -843,8 +1066,13 @@ def main() -> None:
         ),
         "seed": args.seed,
         "interpretation": (
-            "Complete isolated 61-layer graph timing; not endpoint performance, "
-            "semantic quality, production, or promotion evidence."
+            (
+                "H42 source-only dependency localization; "
+                if h42_mode
+                else "Complete isolated 61-layer graph timing; "
+            )
+            + "not endpoint performance, semantic quality, production, or "
+            "promotion evidence."
         ),
     }
     print(json.dumps(result, sort_keys=True))

@@ -35,9 +35,15 @@ the physical interaction instead of assuming that isolated kernel deltas add.
 At historical-long, most of the unexplained `~15.4 us/layer` is attributable to one of three
 separable mechanisms:
 
-1. the true attention-output-to-next-query dependency;
+1. query pointer/value sensitivity within the unchanged same-stream dependency graph;
 2. loss of back-to-back PDL opportunity when frontend and attention families are interleaved; or
 3. the two dense/selected transitions and the surrounding 47 dense layers.
+
+The fixed-input arm does **not** remove CUDA's same-stream/programmatic graph edge: CUDA graph
+capture does not infer tensor-pointer data dependencies, and the downstream PDL wait remains. It is
+therefore a negative control for query address/value effects only. The real transformer dependency
+is a semantic scheduling constraint; its cost is bounded by the illegal phased schedule, not
+identified by subtracting two same-order graphs.
 
 Reader split selection is not retuned in the first diagnostic. H40 already screened long split
 `32/40/64/96` and selected 40, so another unrestricted sweep would duplicate evidence and create a
@@ -59,29 +65,31 @@ The diagnostic variants are:
 |---|---:|---|---|---|---|
 | `F-chain` | 61 | output chain | interleaved | on | fresh H41 I1 replication |
 | `S-chain` | 14 | output chain | interleaved | on | remove surrounding dense layers/transitions |
-| `S-static` | 14 | fixed independent input | interleaved | on | remove only the inter-layer query dependency |
+| `S-static` | 14 | fixed independent input | interleaved | on | query pointer/value negative control; same stream edges |
 | `S-phased` | 14 | fixed independent input | all frontends, then all readers | on | expose the isolated-ring PDL opportunity |
 | `S-chain-noapdl` | 14 | output chain | interleaved | off for both readers | identify reader PDL contribution without changing frontend PDL |
 
-`S-phased` owns distinct query and attention outputs per layer so phase separation cannot race on
-shared material. It is a diagnostic lower bound, not a legal transformer schedule or deployment
-candidate. `S-static` is likewise attribution-only. The control receives the same topology and
-scheduling transformation as its paired candidate; no arm manufactures a win by slowing only the
-dense control.
+`S-static` and `S-phased` both own the same distinct query and attention outputs per layer, so their
+difference changes operation order rather than buffer aliasing. Phase separation therefore cannot
+race on shared material. `S-phased` is a diagnostic lower bound, not a legal transformer schedule
+or deployment candidate; `S-static` is likewise attribution-only. The control receives the same
+topology and scheduling transformation as its paired candidate; no arm manufactures a win by
+slowing only the dense control.
 
 For every selected-only arm, normalize `(candidate_graph_us - control_graph_us) / 14`. Compute:
 
 - surroundings/transition contribution: `F-chain - S-chain`;
-- true query-chain contribution: `S-chain - S-static`;
+- query pointer/value/buffer sensitivity: `S-chain - S-static` (a non-causal negative control);
 - interleaving contribution: `S-static - S-phased`;
 - reader-PDL sensitivity: `S-chain-noapdl - S-chain`.
 
 The signs and magnitudes are diagnostic; they are not endpoint or acceptance results. An
 optimization mechanism is eligible for implementation only if its favorable measured contribution
 is at least the missing `6.122896 us/layer`, its two control flanks differ by at most 2%, and the
-graph output/status and GPU covariates are valid. A true-chain contribution is evidence of a legal
-scheduling constraint, not permission to remove that dependency. If contributions interact and do
-not sum, the physical trace—not an additive reconstruction—determines the next hypothesis.
+graph output/status and GPU covariates are valid. A large chain/static difference is treated as a
+pointer/value confound to investigate, never as permission to remove a transformer dependency. If
+contributions interact and do not sum, the physical trace—not an additive reconstruction—determines
+the next hypothesis.
 
 ## Physical trace and falsifiers
 
@@ -112,9 +120,9 @@ N2 DFlash service is restored and smoke-tested, select at most one implementatio
   options are PDL-safe launch plus fused BF16 RoPE, not a reordered transformer);
 - if split scheduling is implicated after PDL attribution, freeze a small integrated split set
   before testing; H40's split-40 result remains the control;
-- if the true query dependency consumes the excess and no legal overlap is available, do not claim
-  the isolated W1/W2 sum as deployable. Move to a more substantial fused attention/frontend SM100
-  design or reject N14 for the 5% gate.
+- if only illegal phase separation exposes enough opportunity and no dependency-safe overlap is
+  available, do not claim the isolated W1/W2 sum as deployable. Move to a more substantial fused
+  attention/frontend SM100 design or reject N14 for the 5% gate.
 
 Any selected source hypothesis gets its own committed plan, byte-exact/eager/graph/sanitizer gate,
 and three fresh C/T/C decision processes at both 10,219 and 37,932. It must recover at least
@@ -144,4 +152,23 @@ completion, and verify P0/max-clock, ECC zero, no recovery action, and no new Xi
   excluded fresh process matching one variant.
 - Round 3 checked paired control transformations, numerical gates, the no-retuning rule, machine
   restrictions, deterministic rollback, off-node evidence, and service restoration. LGTM for
-  harness implementation; it does not approve a kernel change or live result.
+  proceeding from plan to harness implementation; it did not approve code or a live result.
+- Implementation self-review round 1 corrected a causal-labeling error: `S-static` changes query
+  addresses/values but preserves same-stream PDL edges, so it is now a negative control rather than
+  a claimed measurement of true transformer-dependency cost.
+- Implementation self-review round 2 found that `S-static` reused buffers while `S-phased` owned
+  per-layer outputs. Both now use identical per-layer query/attention buffers, making their
+  difference a scheduling-only comparison.
+- Implementation self-review round 3 tightened evidence integrity by recomputing every reported
+  C/T/C aggregate in the analyzer, validating idle/current-location/logical-trace contracts, and
+  limiting excluded trace-only allocation checks to five graph pairs while retaining 100 for
+  timing evidence.
+- Claude Opus 5 collaborative review was invoked with the required read-only skill, but its shell
+  could not spawn because the accumulated worktree sandbox deny list exceeded macOS `ARG_MAX`.
+  The reviewer explicitly read no file and gave no verdict; its audit log is retained, and no LGTM
+  was inferred from that infrastructure failure.
+- Implementation self-review round 4 traced all five control/candidate call orders, per-layer buffer
+  lifetimes, PDL toggles, legacy default behavior, analyzer recomputation, and runner restrictions.
+  Python compilation, analyzer CLI, shell syntax, executable mode, and whitespace checks pass.
+  LGTM for an isolated CT13 source smoke and D1 run; no kernel, endpoint, or production result is
+  approved.
