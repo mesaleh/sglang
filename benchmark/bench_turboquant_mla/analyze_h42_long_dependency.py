@@ -73,7 +73,6 @@ def load_result(root: Path, variant: str) -> dict[str, Any]:
     assert value["experiment"] == "H42_D1_LONG_DEPENDENCY_LOCALIZATION"
     assert value["variant"] == variant
     assert value["trace_only"] is False
-    assert value["hostname"].endswith("ct13")
     assert value["context"] == 37932
     assert value["split_kv"] == 40
     assert value["allocation_order"] == "control-first"

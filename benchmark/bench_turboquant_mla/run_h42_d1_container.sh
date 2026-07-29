@@ -36,7 +36,7 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EXPECTED_BENCHMARK_SHA256='bea0de4e9c655cd08fd1cef75cf206ed2446b09b31f6f4759b73bb5bb7f39801'
-EXPECTED_ANALYZER_SHA256='23c891ab9639b033d32afd0dd7e3e9b0af379a5adcdc504168e855ed33672e1e'
+EXPECTED_ANALYZER_SHA256='0fda02add6d37e35d0630c60155befc1f503d6618241da69d6bdef637835e0bb'
 if [[ "$(sha256sum "$SCRIPT_DIR/bench_h41_i1_integrated.py" | awk '{print $1}')" != \
   "$EXPECTED_BENCHMARK_SHA256" ]]; then
   echo 'H42 D1 benchmark source mismatch' >&2

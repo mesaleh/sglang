@@ -172,3 +172,7 @@ completion, and verify P0/max-clock, ECC zero, no recovery action, and no new Xi
   Python compilation, analyzer CLI, shell syntax, executable mode, and whitespace checks pass.
   LGTM for an isolated CT13 source smoke and D1 run; no kernel, endpoint, or production result is
   approved.
+- The first isolated smoke passed CUDA execution but exposed one analyzer-only environment error:
+  `platform.node()` is the container ID, not a CT13 host name. The invalid suffix assertion was
+  removed; host restriction remains fail-closed in the outer runner and SM100 is checked in the
+  benchmark. The first smoke is retained as harness evidence and cannot enter D1 timing.
