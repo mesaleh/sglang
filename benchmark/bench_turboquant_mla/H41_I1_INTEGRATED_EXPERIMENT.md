@@ -1,6 +1,6 @@
 # H41 I1 integrated four-family graph experiment
 
-Status: harness implemented and locally self-reviewed; live execution not started
+Status: `FAIL`; actual-10K passes, historical-long integrated gate fails
 SGLang base: `8d47c429299458564a45d427ef2a6ded29a49bf2`
 TokenSpeed base: `a9af4c57f682e800c42cc53063e5f013369210a9`
 Machine scope: source work is local. Final isolated correctness/timing uses CT13 GPU0 with both
@@ -122,3 +122,36 @@ PyTorch debug dump created only the parent directory when given extensionless ta
 screen timing but incomplete graph-debug evidence. The accepted harness uses explicit `control.dot`
 and `candidate.dot` file targets as documented by PyTorch and requires a repeated pre-decision
 screen; the frozen graph, splits, warps, layer interval, and numerical gates are unchanged.
+
+## Live result and decision
+
+All four q1/q5 writer-to-reader cases passed at both contexts in eager and graph replay. The maximum
+dense-oracle difference was `0.0002250671`, replay allocation was unchanged, writer locations were
+unique physical slots from shuffled partial-page tables, and sticky status stayed zero. H40's 30
+contract tests passed. H41's 352 byte-exact cases passed on the merged source. The decisive filtered
+sanitizer completed 24 valid launches plus invalid skip with `ERROR SUMMARY: 0 errors`.
+
+The full graph allocated exactly 256,000 rows. Control persistent cache bytes were `8,994,816,000`;
+candidate persistent cache bytes were `8,084,480,000`; gross saving was `910,336,000` bytes or
+`0.847816467 GiB` per rank. There was no codebook, dense shadow, or replay allocation.
+
+| Context | Sequence deltas per selected layer | Bootstrap 95% interval | Allowance lower | Gate |
+|---|---|---|---:|---|
+| 10,219 | 12.815642, 13.262944, 12.370810 us | 12.370810-13.262944 us | 27.0292 us | PASS |
+| 37,932 | 33.820196, 33.638324, 33.804324 us | 33.638324-33.820196 us | 27.6973 us | FAIL |
+
+Every process used the declared C/T/C order; sequence two reversed allocation order. Maximum control
+flank drift was `0.0608%`, every sampled GPU state was P0 at max clock with zero uncorrected ECC and
+no recovery action, and correctness remained within `0.000244141`. The two debug screens also fit
+at actual-10K (`12.814819` and `13.716999 us/layer`). PyTorch 2.11 emitted its debug-dump warning but
+no DOT for these externally launched custom kernels even with explicit `.dot` paths. This absence is
+recorded as a tooling limitation; only the exact logical trace and replay behavior are claimed.
+
+Decision: reject I1 as an immutable image candidate because the historical-long interval is wholly
+above its allowance by at least `5.941024 us/layer` at the interval's lower edge. Do not retune or
+reinterpret this decision set. The result rules out adding independently qualified reader and
+front-end costs: the dependency-carrying 61-layer graph exposes an additional context-growing cost
+of roughly `15.5 us/selected layer` beyond W1 reader plus W2 front-end estimates. The next hypothesis
+must first localize that interaction (reader split/PDL or launch dependency) and recover at least
+`6.122896 us/layer` at the conservative upper edge; front-end-only launch fusion cannot close the
+long-context gap by itself.
