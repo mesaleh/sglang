@@ -700,12 +700,12 @@ def main() -> None:
         raise AssertionError("candidate output contains a non-finite value")
 
     debug_control = (
-        args.graph_debug_dir / "control"
+        args.graph_debug_dir / "control.dot"
         if args.graph_debug_dir is not None
         else None
     )
     debug_candidate = (
-        args.graph_debug_dir / "candidate"
+        args.graph_debug_dir / "candidate.dot"
         if args.graph_debug_dir is not None
         else None
     )

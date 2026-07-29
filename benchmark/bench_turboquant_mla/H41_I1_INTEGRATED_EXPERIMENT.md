@@ -116,3 +116,9 @@ the known JIT/tooling `cuKernelGetFunction INVALID_HANDLE` API event and therefo
 one. It is retained as diagnostic evidence, not a pass. The decisive W2-equivalent filter uses the
 candidate kernel substring and disables CUDA API-error reporting only; device memory access errors
 remain enabled and must end with error summary zero.
+
+The first integrated screen passed numerical, memory, allocation, drift, and timing checks, but its
+PyTorch debug dump created only the parent directory when given extensionless targets. It is valid
+screen timing but incomplete graph-debug evidence. The accepted harness uses explicit `control.dot`
+and `candidate.dot` file targets as documented by PyTorch and requires a repeated pre-decision
+screen; the frozen graph, splits, warps, layer interval, and numerical gates are unchanged.
