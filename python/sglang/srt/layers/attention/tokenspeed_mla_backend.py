@@ -85,14 +85,14 @@ def _find_mla_turboquant_pool(token_to_kv_pool):
 
 
 def _tq4_split_override(batch_size: int, max_seq_len: int, num_sms: int) -> int:
-    # Keep graph-capture shapes on one compact CuTe specialization. A
-    # production-shaped Kimi DFlash batch-2 sweep on GB200 found 32 splits
-    # faster than 64 at 10K, 16K, 38K, and 60K contexts, while the 4K path
-    # already clamps to 32 tiles. Packed tile traversal remains runtime-rolled
-    # for longer contexts.
+    # Keep graph-capture shapes on one compact CuTe specialization.  The
+    # split count stays fixed across graph batch sizes; packed tile traversal
+    # is runtime-rolled when a configured context assigns more than four
+    # 128-token tiles to each split. Sixty-four splits is already the c1
+    # decode choice on GB200.
     del batch_size, num_sms
     tiles = (max_seq_len + 127) // 128
-    return min(tiles, 32)
+    return min(tiles, 64)
 
 
 def _tq4_kernel_max_seq_len(requested: int, configured: int) -> int:
