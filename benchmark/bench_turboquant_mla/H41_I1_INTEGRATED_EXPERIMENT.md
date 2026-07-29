@@ -1,6 +1,6 @@
 # H41 I1 integrated four-family graph experiment
 
-Status: predeclared; integrated harness implementation not started
+Status: harness implemented and locally self-reviewed; live execution not started
 SGLang base: `8d47c429299458564a45d427ef2a6ded29a49bf2`
 TokenSpeed base: `a9af4c57f682e800c42cc53063e5f013369210a9`
 Machine scope: source work is local. Final isolated correctness/timing uses CT13 GPU0 with both
@@ -87,3 +87,13 @@ GPU/fabric/Xid state, restore fingerprints, and a sorted SHA-256 manifest outsid
 decision. Commit each accepted harness/source correction before the next hypothesis. A rejected
 source candidate is quarantined on a named pushed ref and restored only with a Git revert from the
 last accepted commit; never reconstruct source from memory.
+
+## Accepted harness implementation
+
+The implementation keeps the persistent ring at exactly 256,000 rows (8,000 pages), matching H40
+and the 0.847816467 GiB gross N14 saving; it has no benchmark-only padding page. A focused q1/q5
+composition gate reconstructs the exact dense FP8 oracle after eager and graph-replayed H41 writes.
+The decision analyzer requires those four composition cases, exact cache byte counts, exact logical
+operation traces, healthy P0/max-clock GPU covariates, zero uncorrected ECC/recovery action, zero
+replay allocation, and the frozen C/T/C timing protocol. Two self-review rounds caught and removed
+the extra-page memory-accounting error before any live run.
