@@ -109,4 +109,10 @@ and logs are archived, after which cleanup is a separate explicit operation.
 
 The first sanitizer invocation used an unsupported `regex:` filter spelling and Compute Sanitizer
 exited in argument parsing before Python or CUDA launched. It is excluded CLI-harness evidence; the
-accepted runner uses the installed tool's reported `regex=` key/value form.
+next diagnostic used the installed tool's reported key/value form.
+
+The second sanitizer invocation completed all 24 valid launches plus the invalid skip, but reported
+the known JIT/tooling `cuKernelGetFunction INVALID_HANDLE` API event and therefore had error summary
+one. It is retained as diagnostic evidence, not a pass. The decisive W2-equivalent filter uses the
+candidate kernel substring and disables CUDA API-error reporting only; device memory access errors
+remain enabled and must end with error summary zero.
