@@ -3861,15 +3861,35 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             and cache_k_nope.stride(-1) == 1
             and cache_k_rope.stride(-1) == 1
             and loc.dim() == 1
+            and loc.is_contiguous()
             and loc.numel() == tokens
-            and self._tq_mla_kv_write_unit.shape[0] >= tokens
+            and self._tq_mla_kv_write_unit.dim() == 3
+            and self._tq_mla_kv_write_norms.dim() == 2
+            and self._tq_mla_kv_write_y.dim() == 3
+            and self._tq_mla_kv_write_unit.shape[0] > 0
+            and self._tq_mla_kv_write_norms.shape[0] > 0
+            and self._tq_mla_kv_write_y.shape[0] > 0
             and self._tq_mla_kv_write_unit.shape[1] >= cache_k_nope.shape[1]
             and self._tq_mla_kv_write_unit.shape[2] >= cache_k_nope.shape[-1]
-            and self._tq_mla_kv_write_norms.shape[0] >= tokens
             and self._tq_mla_kv_write_norms.shape[1] >= cache_k_nope.shape[1]
-            and self._tq_mla_kv_write_y.shape[0] >= tokens
             and self._tq_mla_kv_write_y.shape[1] >= cache_k_nope.shape[1]
             and self._tq_mla_kv_write_y.shape[2] >= cache_k_nope.shape[-1]
+            and self._tq_mla_kv_write_unit.dtype == torch.float32
+            and self._tq_mla_kv_write_norms.dtype == torch.float32
+            and self._tq_mla_kv_write_y.dtype == torch.float32
+            and self._tq_mla_kv_write_unit.device == cache_k_nope.device
+            and self._tq_mla_kv_write_norms.device == cache_k_nope.device
+            and self._tq_mla_kv_write_y.device == cache_k_nope.device
+            and self._tq_mla_kv_write_unit.is_contiguous()
+            and self._tq_mla_kv_write_norms.is_contiguous()
+            and self._tq_mla_kv_write_y.is_contiguous()
+        )
+
+    def _fused_kv_write_chunk_capacity(self) -> int:
+        return min(
+            self._tq_mla_kv_write_unit.shape[0],
+            self._tq_mla_kv_write_norms.shape[0],
+            self._tq_mla_kv_write_y.shape[0],
         )
 
     def _set_mla_kv_buffer_fused(
@@ -3921,6 +3941,34 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         )
         if not fuse_rope_write:
             rope_buffer[loc] = cache_k_rope
+
+    def _set_mla_kv_buffer_fused_chunked(
+        self,
+        layer_id_rel: int,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        """Write an arbitrarily large token batch through bounded fused scratch.
+
+        TurboQuant quantization is independent per token, so reusing the same
+        workspace on ordered stream slices preserves the packed cache image
+        without allocating full-prefill-sized temporary tensors.
+        """
+        tokens = cache_k_nope.shape[0]
+        if tokens == 0:
+            return
+
+        chunk_capacity = self._fused_kv_write_chunk_capacity()
+        assert chunk_capacity > 0
+        for start in range(0, tokens, chunk_capacity):
+            end = min(start + chunk_capacity, tokens)
+            self._set_mla_kv_buffer_fused(
+                layer_id_rel,
+                loc[start:end],
+                cache_k_nope[start:end],
+                cache_k_rope[start:end],
+            )
 
     def _can_fuse_rope_write(
         self,
@@ -4013,7 +4061,9 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             cache_k_rope = cache_k_rope.to(torch.bfloat16)
 
         if self._can_use_fused_kv_write(loc, cache_k_nope, cache_k_rope):
-            self._set_mla_kv_buffer_fused(layer_id_rel, loc, cache_k_nope, cache_k_rope)
+            self._set_mla_kv_buffer_fused_chunked(
+                layer_id_rel, loc, cache_k_nope, cache_k_rope
+            )
             return
 
         if not cache_k_nope.is_contiguous():

@@ -1765,6 +1765,113 @@ class TestTurboQuantGPU(unittest.TestCase):
             ).item()
             self.assertGreater(cosine, 0.99)
 
+    def test_mla_e2m1_chunked_fused_writer_matches_full_workspace(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        torch.manual_seed(20260728)
+        tokens = 11
+        pool_size = 48
+        lora_rank = 512
+        rope_dim = 64
+        loc = torch.tensor([1, 3, 7, 8, 13, 17, 19, 26, 31, 38, 45], device=self.device)
+        cache = torch.randn(
+            tokens,
+            1,
+            lora_rank + rope_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        layer = SimpleNamespace(layer_id=0)
+
+        def make_pool(workspace_tokens):
+            with envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.override(
+                workspace_tokens
+            ):
+                return MLATokenToKVPoolTurboQuant(
+                    size=pool_size,
+                    page_size=0,
+                    dtype=torch.bfloat16,
+                    kv_lora_rank=lora_rank,
+                    qk_rope_head_dim=rope_dim,
+                    layer_num=1,
+                    device=self.device,
+                    enable_memory_saver=False,
+                    turboquant_bits=4,
+                    turboquant_e2m1=True,
+                    enable_fp8_codebook=True,
+                    start_layer=0,
+                    end_layer=0,
+                )
+
+        full_pool = make_pool(tokens)
+        chunked_pool = make_pool(4)
+        strided_loc_pool = make_pool(4)
+        strided_loc_fallback_pool = make_pool(4)
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
+            with envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.override(True):
+                full_pool.set_kv_buffer(layer, loc, cache, cache)
+                chunked_pool.set_kv_buffer(layer, loc, cache, cache)
+
+                empty_cache = torch.empty(
+                    0,
+                    1,
+                    lora_rank + rope_dim,
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+                chunked_pool.set_kv_buffer(
+                    layer,
+                    torch.empty(0, dtype=torch.long, device=self.device),
+                    empty_cache,
+                    empty_cache,
+                )
+
+                strided_loc = torch.tensor(
+                    [2, 47, 6, 46, 14, 44, 22, 43, 42, 41], device=self.device
+                )[::2]
+                self.assertFalse(strided_loc.is_contiguous())
+                strided_loc_pool.set_kv_buffer(
+                    layer, strided_loc, cache[: strided_loc.numel()], cache
+                )
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            strided_loc_fallback_pool.set_kv_buffer(
+                layer, strided_loc, cache[: strided_loc.numel()], cache
+            )
+
+        self.assertEqual(chunked_pool._fused_kv_write_chunk_capacity(), 4)
+        torch.testing.assert_close(
+            chunked_pool.kv_nope_packed_buffer[0],
+            full_pool.kv_nope_packed_buffer[0],
+        )
+        torch.testing.assert_close(
+            chunked_pool.kv_nope_scale_buffer[0],
+            full_pool.kv_nope_scale_buffer[0],
+        )
+        torch.testing.assert_close(
+            chunked_pool.kv_nope_codebook_buffer[0],
+            full_pool.kv_nope_codebook_buffer[0],
+        )
+        torch.testing.assert_close(
+            chunked_pool.kv_rope_buffer[0], full_pool.kv_rope_buffer[0]
+        )
+        torch.testing.assert_close(
+            strided_loc_pool.kv_nope_packed_buffer[0],
+            strided_loc_fallback_pool.kv_nope_packed_buffer[0],
+        )
+        torch.testing.assert_close(
+            strided_loc_pool.kv_nope_scale_buffer[0],
+            strided_loc_fallback_pool.kv_nope_scale_buffer[0],
+        )
+        torch.testing.assert_close(
+            strided_loc_pool.kv_nope_codebook_buffer[0],
+            strided_loc_fallback_pool.kv_nope_codebook_buffer[0],
+        )
+        torch.testing.assert_close(
+            strided_loc_pool.kv_rope_buffer[0],
+            strided_loc_fallback_pool.kv_rope_buffer[0],
+        )
+
     def test_mla_hotcold_pool_has_disjoint_physical_ownership(self):
         from types import SimpleNamespace
 

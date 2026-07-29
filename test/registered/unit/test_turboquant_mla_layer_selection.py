@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -112,3 +112,55 @@ def test_tokenspeed_layer_static_frontend_dispatch():
 
     assert backend.uses_fp8_frontend(SimpleNamespace(layer_id=10), forward_batch)
     assert not backend.uses_fp8_frontend(SimpleNamespace(layer_id=11), forward_batch)
+
+
+@pytest.mark.parametrize(
+    ("tokens", "expected_chunk_sizes"),
+    (
+        (0, ()),
+        (2, (2,)),
+        (3, (3,)),
+        (4, (3, 1)),
+        (6, (3, 3)),
+        (8, (3, 3, 2)),
+    ),
+)
+def test_mla_turboquant_fused_writer_chunks_aligned_inputs(
+    tokens, expected_chunk_sizes
+):
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+    pool = object.__new__(MLATokenToKVPoolTurboQuant)
+    pool._tq_mla_kv_write_unit = torch.empty(4, 1, 8, dtype=torch.float32)
+    pool._tq_mla_kv_write_norms = torch.empty(3, 1, dtype=torch.float32)
+    pool._tq_mla_kv_write_y = torch.empty(5, 1, 8, dtype=torch.float32)
+    pool._set_mla_kv_buffer_fused = Mock()
+
+    loc = torch.tensor([13, 2, 21, 8, 5, 34, 1, 3])[:tokens]
+    nope = (
+        torch.arange(8 * 8, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(8, 1, 8)[:tokens]
+    )
+    rope = (
+        torch.arange(8 * 2, dtype=torch.float32)
+        .to(torch.bfloat16)
+        .view(8, 1, 2)[:tokens]
+    )
+
+    pool._set_mla_kv_buffer_fused_chunked(7, loc, nope, rope)
+
+    assert pool._fused_kv_write_chunk_capacity() == 3
+    assert pool._set_mla_kv_buffer_fused.call_count == len(expected_chunk_sizes)
+    expected_ranges = []
+    start = 0
+    for chunk_size in expected_chunk_sizes:
+        expected_ranges.append((start, start + chunk_size))
+        start += chunk_size
+    for call, (start, end) in zip(
+        pool._set_mla_kv_buffer_fused.call_args_list, expected_ranges, strict=True
+    ):
+        assert call.args[0] == 7
+        torch.testing.assert_close(call.args[1], loc[start:end])
+        torch.testing.assert_close(call.args[2], nope[start:end])
+        torch.testing.assert_close(call.args[3], rope[start:end])
