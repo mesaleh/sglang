@@ -31,11 +31,21 @@ def bootstrap_mean_ci(
     return percentile(means, 0.025), percentile(means, 0.975)
 
 
-def load_sequence(root: Path, context: int, warps: int, sequence: int) -> dict[str, Any]:
+def load_sequence(
+    root: Path,
+    context: int,
+    warps: int,
+    sequence: int,
+    *,
+    expected_experiment: str,
+    expected_rope_mode: str | None,
+) -> dict[str, Any]:
     path = root / f"context{context}" / f"warps{warps}" / f"seq{sequence:02d}" / "result.json"
     value = json.loads(path.read_text())
     assert value["status"] == "TIMING_ONLY"
-    assert value["experiment"] == "H41_W2_REAL_COMBINED_FRONTEND"
+    assert value["experiment"] == expected_experiment
+    if expected_rope_mode is not None:
+        assert value["candidate_rope_mode"] == expected_rope_mode
     assert value["context"] == context
     assert value["tokens"] == 5
     assert value["warps"] == warps
@@ -52,13 +62,32 @@ def main() -> None:
     parser.add_argument("root", type=Path)
     parser.add_argument("--draws", type=int, default=50_000)
     parser.add_argument("--seed", type=int, default=20260729)
+    parser.add_argument(
+        "--mode",
+        choices=("legacy-post-rope", "complete"),
+        default="complete",
+    )
     args = parser.parse_args()
+
+    if args.mode == "complete":
+        expected_experiment = "H41_W2_COMPLETE_SELECTED_FRONTEND"
+        expected_rope_mode = "complete"
+    else:
+        expected_experiment = "H41_W2_REAL_COMBINED_FRONTEND"
+        expected_rope_mode = None
 
     analyses: list[dict[str, Any]] = []
     for context in (10219, 37932):
         for warps in (4, 8):
             sequences = [
-                load_sequence(args.root, context, warps, sequence)
+                load_sequence(
+                    args.root,
+                    context,
+                    warps,
+                    sequence,
+                    expected_experiment=expected_experiment,
+                    expected_rope_mode=expected_rope_mode,
+                )
                 for sequence in (1, 2, 3)
             ]
             deltas = [value["candidate_minus_control_us"] for value in sequences]
@@ -119,6 +148,7 @@ def main() -> None:
             "50,000 deterministic percentile draws by default."
         ),
         "draws": args.draws,
+        "mode": args.mode,
         "seed": args.seed,
         "analyses": analyses,
         "warp_summary": by_warps,

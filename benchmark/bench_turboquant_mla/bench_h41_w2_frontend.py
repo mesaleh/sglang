@@ -22,6 +22,7 @@ import torch
 
 from sglang.jit_kernel.tq_mla_frontend import tq_mla_frontend_out
 from sglang.jit_kernel.utils import is_arch_support_pdl
+from sglang.srt.layers.attention.tokenspeed_mla_backend import _quantize_tq4_query
 from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 from sglang.srt.mem_cache.triton_ops.mla_buffer import set_mla_kv_buffer_triton
 
@@ -129,6 +130,15 @@ def main() -> None:
     )
     parser.add_argument("--warps", type=int, choices=(1, 2, 4, 8), required=True)
     parser.add_argument(
+        "--candidate-rope-mode",
+        choices=("preapplied", "complete"),
+        default="preapplied",
+        help=(
+            "Use 'complete' for the production-comparable selected-layer path: "
+            "BF16 RoPE followed by the H41 post-RoPE kernel."
+        ),
+    )
+    parser.add_argument(
         "--allocation-order",
         choices=("control-first", "candidate-first"),
         default="control-first",
@@ -204,6 +214,8 @@ def main() -> None:
             torch.empty(POOL_SIZE, 1, dtype=torch.bfloat16, device=device),
             torch.empty(POOL_SIZE, 1, ROPE, dtype=FP8, device=device),
             torch.zeros(1, dtype=torch.int32, device=device),
+            torch.empty_like(query_rope),
+            torch.empty_like(cache_rope),
         )
 
     if args.allocation_order == "control-first":
@@ -213,7 +225,15 @@ def main() -> None:
         candidate = allocate_candidate()
         control = allocate_control()
     control_query, control_k, control_rope, control_cache = control
-    candidate_query, candidate_packed, candidate_scale, candidate_rope, status = candidate
+    (
+        candidate_query,
+        candidate_packed,
+        candidate_scale,
+        candidate_rope,
+        status,
+        candidate_query_rope,
+        candidate_cache_rope,
+    ) = candidate
 
     def run_control() -> None:
         flashinfer.rope.mla_rope_quantize_fp8(
@@ -238,11 +258,26 @@ def main() -> None:
         )
 
     def run_candidate() -> None:
+        if args.candidate_rope_mode == "complete":
+            flashinfer.rope._apply_rope_pos_ids_cos_sin_cache(
+                q=query_rope,
+                k=cache_rope,
+                q_rope=candidate_query_rope,
+                k_rope=candidate_cache_rope,
+                cos_sin_cache=cos_sin_cache,
+                pos_ids=positions,
+                interleave=False,
+            )
+            query_rope_input = candidate_query_rope
+            cache_rope_input = candidate_cache_rope
+        else:
+            query_rope_input = query_rope
+            cache_rope_input = cache_rope
         tq_mla_frontend_out(
             query_latent,
-            query_rope,
+            query_rope_input,
             cache_latent,
-            cache_rope,
+            cache_rope_input,
             locations,
             config.signs1,
             config.signs2,
@@ -271,6 +306,49 @@ def main() -> None:
         raise AssertionError("candidate set the fault word for valid locations")
     if not bool(torch.isfinite(candidate_query.float()).all()):
         raise AssertionError("candidate query contains a non-finite value")
+    normal_control_query_byte_mismatches = 0
+    normal_control_rope_byte_mismatches = 0
+    if args.candidate_rope_mode == "complete":
+        candidate_query_expected = _quantize_tq4_query(
+            torch.cat((query_latent, candidate_query_rope), dim=-1), LATENT, False
+        )
+        rope_carrier = torch.zeros(
+            args.tokens,
+            HEADS,
+            LATENT + ROPE,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        rope_carrier[:, 0, LATENT:] = candidate_cache_rope[:, 0]
+        candidate_rope_expected = _quantize_tq4_query(
+            rope_carrier, LATENT, False
+        )[:, 0:1, LATENT:]
+        if not torch.equal(
+            candidate_query.view(torch.uint8),
+            candidate_query_expected.view(torch.uint8),
+        ):
+            raise AssertionError("complete candidate query differs from selected TQ oracle")
+        if not torch.equal(
+            candidate_rope[locations].view(torch.uint8),
+            candidate_rope_expected.view(torch.uint8),
+        ):
+            raise AssertionError("complete candidate cache RoPE differs from selected TQ oracle")
+        normal_control_query_byte_mismatches = int(
+            (
+                candidate_query.view(torch.uint8)
+                != control_query.view(torch.uint8)
+            )
+            .sum()
+            .item()
+        )
+        normal_control_rope_byte_mismatches = int(
+            (
+                candidate_rope[locations].view(torch.uint8)
+                != control_rope.unsqueeze(1).view(torch.uint8)
+            )
+            .sum()
+            .item()
+        )
 
     graphs = {
         "control": capture_graph(run_control, args.warmups),
@@ -309,7 +387,11 @@ def main() -> None:
     control_mean = (control_1 + control_2) / 2.0
     result = {
         "status": "TIMING_ONLY",
-        "experiment": "H41_W2_REAL_COMBINED_FRONTEND",
+        "experiment": (
+            "H41_W2_COMPLETE_SELECTED_FRONTEND"
+            if args.candidate_rope_mode == "complete"
+            else "H41_W2_POST_ROPE_KERNEL_FRONTEND"
+        ),
         "timestamp_unix": time.time(),
         "pid": os.getpid(),
         "hostname": platform.node(),
@@ -321,6 +403,13 @@ def main() -> None:
         "heads": HEADS,
         "warps": args.warps,
         "rotation_fused": True,
+        "candidate_rope_mode": args.candidate_rope_mode,
+        "candidate_physical_launches": (
+            2 if args.candidate_rope_mode == "complete" else 1
+        ),
+        "control_physical_launches": 2,
+        "normal_control_query_byte_mismatches": normal_control_query_byte_mismatches,
+        "normal_control_rope_byte_mismatches": normal_control_rope_byte_mismatches,
         "allocation_order": args.allocation_order,
         "pool_size": POOL_SIZE,
         "candidate_row_bytes": 322,
@@ -335,8 +424,10 @@ def main() -> None:
         "candidate_over_control": candidate_us / control_mean,
         "seed": args.seed,
         "interpretation": (
-            "Real candidate versus the H41 W1 normal FP8 front-end control; "
-            "isolated timing only, not endpoint performance or quality evidence."
+            "Candidate versus the H41 W1 normal FP8 front-end control. Complete "
+            "mode includes the accepted selected-layer BF16 RoPE launch before the "
+            "post-RoPE H41 kernel; isolated timing only, not endpoint performance "
+            "or quality evidence."
         ),
     }
     print(json.dumps(result, sort_keys=True))
