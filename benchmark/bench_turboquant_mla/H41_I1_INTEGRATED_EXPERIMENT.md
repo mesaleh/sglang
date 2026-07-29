@@ -97,3 +97,7 @@ The decision analyzer requires those four composition cases, exact cache byte co
 operation traces, healthy P0/max-clock GPU covariates, zero uncorrected ECC/recovery action, zero
 replay allocation, and the frozen C/T/C timing protocol. Two self-review rounds caught and removed
 the extra-page memory-accounting error before any live run.
+
+The first live H40 contract invocation addressed a nonexistent `/usr/local/bin/pytest` entry point
+in the immutable image and exited before any GPU kernel ran. It is rejected infrastructure evidence;
+the accepted runner invokes the installed module with `python3 -m pytest` and requires a fresh rerun.

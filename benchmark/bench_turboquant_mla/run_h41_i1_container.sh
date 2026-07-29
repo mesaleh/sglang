@@ -38,8 +38,7 @@ case "$MODE" in
     SCRIPT='/work/tokenspeed-test/microbench_tq4_mla_decode.py'
     ;;
   h40-contract)
-    SCRIPT='/usr/local/bin/pytest'
-    set -- /work/tokenspeed-test/test_tq4_contract.py -q "$@"
+    SCRIPT='pytest-module'
     ;;
   sanitizer)
     SCRIPT='/work/bench_turboquant_mla/test_h41_w2_frontend.py'
@@ -52,6 +51,11 @@ esac
 
 ENTRYPOINT='python3'
 container_arguments=("$SCRIPT" "$@")
+if [[ "$MODE" == 'h40-contract' ]]; then
+  container_arguments=(
+    -m pytest /work/tokenspeed-test/test_tq4_contract.py -q "$@"
+  )
+fi
 if [[ "$MODE" == 'sanitizer' ]]; then
   ENTRYPOINT='compute-sanitizer'
   container_arguments=(
