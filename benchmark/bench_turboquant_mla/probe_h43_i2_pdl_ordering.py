@@ -1,4 +1,4 @@
-"""Positive writer-to-reader PDL ordering sensitivity gate for H43 I2."""
+"""Writer-to-reader PDL ordering conformance probe for H43 I2."""
 
 from __future__ import annotations
 
@@ -203,8 +203,6 @@ def main() -> None:
 
     if ordered_control_mismatches != 0:
         raise AssertionError("PDL-disabled same-stream control was not deterministic")
-    if args.reader == "pre-move" and mismatched_steps == 0:
-        raise AssertionError("pre-move reader did not establish positive sensitivity")
     if args.reader == "post-wait" and mismatched_steps != 0:
         raise AssertionError("post-wait reader observed stale writer state")
     if int(status.item()) != 0:
@@ -220,6 +218,10 @@ def main() -> None:
                 "q_len": args.q_len,
                 "split_kv": args.split_kv,
                 "steps": args.steps,
+                "producer_explicit_trigger": False,
+                "sensitivity_required": False,
+                "overlap_observed": mismatched_steps > 0,
+                "ordering_gate": args.reader == "post-wait",
                 "mismatched_steps": mismatched_steps,
                 "mismatched_values": mismatched_values,
                 "ordered_control_mismatches": ordered_control_mismatches,

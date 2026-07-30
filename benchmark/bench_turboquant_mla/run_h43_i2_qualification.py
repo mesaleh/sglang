@@ -79,6 +79,7 @@ MEMORY_CONTRACT = {
     "meets_old_ten_percent_target_kv_bar": False,
 }
 QUALIFICATION_FRONTEND_TEST = "test_h41_w2_frontend.py"
+QUALIFICATION_PDL_PROBE = "probe_h43_i2_pdl_ordering.py"
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +154,7 @@ class I2Qualification(h43.Campaign):
         self.source_manifest_digest = ""
         self.native_build_ninja = ""
         self.qualification_frontend_test_sha256 = ""
+        self.qualification_pdl_probe_sha256 = ""
         self.records: dict[str, dict[str, Any]] = {}
         self.reference_container_name = f"ct13-h43-i2-reference-{self.campaign}"
 
@@ -190,6 +192,12 @@ class I2Qualification(h43.Campaign):
                 "timeout": 120,
                 "processes": 1,
                 "phase": "pre-outage",
+            },
+            "pdl_producer_source": {
+                "timeout": 120,
+                "processes": 1,
+                "phase": "pre-outage",
+                "gpu_access": False,
             },
             "gpu_stage_surface": {
                 "timeout": 180,
@@ -539,15 +547,23 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
 
     def setup(self) -> None:
         super().setup()
-        test_path = Path(__file__).resolve().with_name(QUALIFICATION_FRONTEND_TEST)
-        test_payload = test_path.read_bytes()
-        self.qualification_frontend_test_sha256 = sha256_bytes(test_payload)
-        h43.write_remote_root_file(
-            self.host0,
-            f"{self.results}/{QUALIFICATION_FRONTEND_TEST}",
-            test_payload.decode("utf-8"),
-            "0444",
+        qualification_files = (
+            (
+                QUALIFICATION_FRONTEND_TEST,
+                "qualification_frontend_test_sha256",
+            ),
+            (QUALIFICATION_PDL_PROBE, "qualification_pdl_probe_sha256"),
         )
+        for filename, digest_attribute in qualification_files:
+            path = Path(__file__).resolve().with_name(filename)
+            payload = path.read_bytes()
+            setattr(self, digest_attribute, sha256_bytes(payload))
+            h43.write_remote_root_file(
+                self.host0,
+                f"{self.results}/{filename}",
+                payload.decode("utf-8"),
+                "0444",
+            )
         self._run_preoutage_checks()
         timeout_evidence = {
             "schema_version": 1,
@@ -574,6 +590,13 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "qualification_frontend_test_sha256": (
                 self.qualification_frontend_test_sha256
             ),
+            "qualification_pdl_probe_sha256": self.qualification_pdl_probe_sha256,
+            "pdl_conformance_contract": {
+                "producer_explicit_trigger": False,
+                "reference_overlap_is_opportunistic": True,
+                "candidate_mismatched_steps_required": 0,
+                "ordered_control_mismatches_required": 0,
+            },
             "native_build_cache_files": NATIVE_CACHE_FILES,
             "native_build_ninja": self.native_build_ninja,
             "aot_preparation_sha256": I2_AOT_PREPARATION_SHA256,
@@ -588,6 +611,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                     "native-prebuilt-load",
                     "h40-contract",
                     "pdl-source-order",
+                    "pdl-producer-source",
                     "gpu-stage-surface",
                     "writer-test-cli",
                 )
@@ -789,6 +813,32 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         )
         if pdl_source is None:
             raise RuntimeError("PDL source-order gate produced no result")
+        producer_source = self._preoutage_run(
+            self.candidate,
+            "pdl-producer-source",
+            [
+                "python3",
+                "-c",
+                (
+                    "import json,pathlib;"
+                    "p=pathlib.Path('/i2/python/sglang/jit_kernel/csrc/"
+                    "tq_mla_frontend/tq_mla_frontend_sm100.cu');"
+                    "s=p.read_text();"
+                    "assert 'cudaTriggerProgrammaticLaunchCompletion' not in s;"
+                    "assert '<<<grid, block, 0, stream>>>' in s;"
+                    "print(json.dumps({'status':'PASS',"
+                    "'explicit_trigger':False,'launch':'standard-stream'}))"
+                ),
+            ],
+            timeout=120,
+            expected_json_status="PASS",
+        )
+        if (
+            producer_source is None
+            or producer_source.get("explicit_trigger") is not False
+            or producer_source.get("launch") != "standard-stream"
+        ):
+            raise RuntimeError("PDL producer source contract is invalid")
         surface_script = r"""set -euo pipefail
 help=$(compute-sanitizer --help)
 for option in --tool --error-exitcode --target-processes --report-api-errors --kernel-name --log-file; do grep -Fq -- "$option" <<<"$help"; done
@@ -801,8 +851,8 @@ grep -Fq -- '--mode' <<<"$help"
 test -f /i2/benchmark/bench_turboquant_mla/test_h41_i1_roundtrip.py
 help=$(python3 /i2/benchmark/bench_turboquant_mla/test_h41_i1_roundtrip.py --help)
 for option in --context --q-len --split-kv; do grep -Fq -- "$option" <<<"$help"; done
-test -f /i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py
-help=$(python3 /i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py --help)
+test -f /results/probe_h43_i2_pdl_ordering.py
+help=$(PYTHONPATH=/i2/python:/i2:/work:/results python3 /results/probe_h43_i2_pdl_ordering.py --help)
 for option in --context --q-len --split-kv --steps --reader; do grep -Fq -- "$option" <<<"$help"; done
 test -f /i2/benchmark/bench_turboquant_mla/bench_h43_i2_writer_delta.py
 help=$(python3 /i2/benchmark/bench_turboquant_mla/bench_h43_i2_writer_delta.py --help)
@@ -1138,7 +1188,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             for q_len in (1, 5):
                 common = [
                     "python3",
-                    "/i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py",
+                    f"/results/{QUALIFICATION_PDL_PROBE}",
                     "--context",
                     str(context),
                     "--q-len",
@@ -1160,16 +1210,24 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
                     timeout=300,
                     expected_json_status="PASS",
                 )
+                # PDL overlap is opportunistic, and this production writer has
+                # no explicit early trigger.  Preserve the pre-move result as
+                # exploratory evidence without requiring an observable race.
                 if (
                     reference is None
-                    or reference.get("mismatched_steps", 0) <= 0
                     or reference.get("ordered_control_mismatches") != 0
+                    or reference.get("sensitivity_required") is not False
+                    or reference.get("producer_explicit_trigger") is not False
+                    or reference.get("ordering_gate") is not False
                 ):
-                    raise RuntimeError("pre-move PDL run did not establish sensitivity")
+                    raise RuntimeError("pre-move PDL conformance run is invalid")
                 if (
                     candidate is None
                     or candidate.get("mismatched_steps") != 0
                     or candidate.get("ordered_control_mismatches") != 0
+                    or candidate.get("sensitivity_required") is not False
+                    or candidate.get("producer_explicit_trigger") is not False
+                    or candidate.get("ordering_gate") is not True
                 ):
                     raise RuntimeError("post-wait PDL run did not establish ordering")
 
@@ -1605,6 +1663,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "qualification_frontend_test_sha256": (
                 self.qualification_frontend_test_sha256
             ),
+            "qualification_pdl_probe_sha256": self.qualification_pdl_probe_sha256,
             "native_build_cache_files": NATIVE_CACHE_FILES,
             "native_build_ninja": self.native_build_ninja,
             "aot_preparation": self.i2_preparation,
