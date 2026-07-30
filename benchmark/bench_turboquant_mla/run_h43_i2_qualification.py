@@ -165,6 +165,52 @@ class I2Qualification(h43.Campaign):
             "h43_i2_qualification",
         )
 
+    def timeout_command_contract(self) -> dict[str, dict[str, Any]]:
+        return {
+            "gpu_identity_sample": {"timeout": 60, "processes": 2},
+            "idle_compute_check": {"timeout": 60, "processes": 1},
+            "tokenspeed_source_manifest_each": {
+                "timeout": 180,
+                "processes": 2,
+                "phase": "pre-outage",
+            },
+            "native_prebuilt_load": {
+                "timeout": 120,
+                "processes": 1,
+                "phase": "pre-outage",
+            },
+            "h40_contract": {
+                "timeout": 180,
+                "phase": "pre-outage",
+                "basis": "pinned 31-test static contract suite",
+            },
+            "pdl_source_order": {
+                "timeout": 120,
+                "processes": 1,
+                "phase": "pre-outage",
+            },
+            "gpu_stage_surface": {
+                "timeout": 180,
+                "processes": 1,
+                "phase": "pre-outage",
+                "gpu_access": False,
+            },
+            "writer_correctness": {"timeout": 300, "observed_seconds": 54},
+            "lifecycle": {"timeout": 300, "basis": "six focused unit methods"},
+            "roundtrip_each": {"timeout": 300, "processes": 5},
+            "integrated_smoke_each": {"timeout": 900, "processes": 2},
+            "pdl_each": {"timeout": 300, "processes": 8},
+            "writer_delta_each": {"timeout": 180, "processes": 3},
+            "sanitizer_each": {
+                "timeout": 300,
+                "processes": 2,
+                "observed_seconds": 10,
+            },
+            "racecheck_each": {"timeout": 300, "processes": 2},
+            "ncu_each": {"timeout": 240, "processes": 2},
+            "resource_usage": {"timeout": 60, "processes": 1},
+        }
+
     def _validate_tooling_repository(self) -> Path:
         script = Path(__file__).resolve()
         repository = Path(
@@ -492,51 +538,12 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "experiment": "H43_I2_QUALIFICATION_TIMEOUT_BUDGET",
             "maintenance_seconds": self.maintenance_contract()[0],
             "restore_lower_bound_seconds": 1185,
-            "commands": {
-                "gpu_identity_sample": {"timeout": 60, "processes": 2},
-                "idle_compute_check": {"timeout": 60, "processes": 1},
-                "tokenspeed_source_manifest_each": {
-                    "timeout": 180,
-                    "processes": 2,
-                    "phase": "pre-outage",
-                },
-                "native_prebuilt_load": {
-                    "timeout": 120,
-                    "processes": 1,
-                    "phase": "pre-outage",
-                },
-                "h40_contract": {
-                    "timeout": 180,
-                    "phase": "pre-outage",
-                    "basis": "pinned 31-test static contract suite",
-                },
-                "pdl_source_order": {
-                    "timeout": 120,
-                    "processes": 1,
-                    "phase": "pre-outage",
-                },
-                "gpu_stage_surface": {
-                    "timeout": 180,
-                    "processes": 1,
-                    "phase": "pre-outage",
-                    "gpu_access": False,
-                },
-                "writer_correctness": {"timeout": 300, "observed_seconds": 54},
-                "lifecycle": {"timeout": 300, "basis": "six focused unit methods"},
-                "roundtrip_each": {"timeout": 300, "processes": 5},
-                "integrated_smoke_each": {"timeout": 900, "processes": 2},
-                "pdl_each": {"timeout": 300, "processes": 8},
-                "writer_delta_each": {"timeout": 180, "processes": 3},
-                "sanitizer_each": {
-                    "timeout": 300,
-                    "processes": 2,
-                    "observed_seconds": 10,
-                },
-                "racecheck_each": {"timeout": 300, "processes": 2},
-                "ncu_each": {"timeout": 240, "processes": 2},
-                "resource_usage": {"timeout": 60, "processes": 1},
-            },
-            "note": "Per-command limits are fail-closed; the 3,000-second experiment alarm remains authoritative.",
+            "commands": self.timeout_command_contract(),
+            "note": (
+                "Per-command limits are fail-closed; the "
+                f"{self.maintenance_contract()[0]['experiment']:,}-second experiment "
+                "alarm remains authoritative."
+            ),
         }
         preflight = {
             "schema_version": 1,
