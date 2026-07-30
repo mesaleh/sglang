@@ -22,6 +22,7 @@ from run_h43_i2_aot_preparation import (
     I2_NATIVE_DIR,
     I2_NATIVE_SHA256,
     I2_NATIVE_SO,
+    I2_PREPARATION,
     I2_SOURCE,
 )
 
@@ -32,12 +33,25 @@ AOT_PREPARATION_SGLANG_COMMIT = "f443468c02b32d25472201a479a2fd064e347f08"
 AOT_PREPARATION_NATIVE_SHA256 = (
     "e09f64bf5e169bf3f203ab673722e5721d3f459226a504c41393fd14cc1f0da7"
 )
-I2_PREPARATION_MANIFEST = f"{I2_PREPARATION}/manifest.json"
+I2_PREPARATION_MANIFEST = f"{I2_PREPARATION}/manifest-v2.json"
 I2_PREPARATION_MANIFEST_SHA256 = (
-    "8baad87e152ce37087170b3cba78992f477e202fdd466921cbb6ca6abc3570ee"
+    "21415979d6e8e8458584f953c6124b500c03eb1376c9349a98892355f2c60cc6"
+)
+I2_NATIVE_BUILD_DIR = (
+    f"{I2_PREPARATION}/native-build-cache/"
+    "sglang_tq_mla_frontend_sm100_h43_i3_v2"
 )
 NATIVE_SEALED_FILES = {
     "sglang_tq_mla_frontend_sm100_h43_i3_v2.so": I2_NATIVE_SHA256,
+}
+NATIVE_BUILD_FILES = {
+    ".ninja_deps": "b26ec7a25fb6d8aab42ab261ad4c9b3c36ea6c59b3c9f08f95fe330af2ebec56",
+    ".ninja_log": "087e4bebf3a94c21b40b99d293b2a94d9e39630cb74e040773b355372737b716",
+    "build.ninja": "ee001cc30f86ef174217b2b3fc939098314b9dccfef313928f83f5b14c5f30dc",
+    "sglang_tq_mla_frontend_sm100_h43_i3_v2.so": I2_NATIVE_SHA256,
+    "tq_mla_frontend_sm100.cuda.o": (
+        "c89e914714c03b195c4cc152f05202790a9950329797d684207d35056238a85c"
+    ),
 }
 PINNED_READER_QUALIFICATION_SHA256 = (
     "1680b09493db8b066f37a1455e4076c47e5132b525bedf83f611c7af796de5e5"
@@ -156,6 +170,7 @@ class I2Qualification(h43.Campaign):
         self.source_manifest: list[dict[str, str]] = []
         self.source_manifest_digest = ""
         self.native_seal_attestation: dict[str, Any] = {}
+        self.native_build_ninja = ""
         self.qualification_frontend_test_sha256 = ""
         self.qualification_pdl_probe_sha256 = ""
         self.serving_integration_test_sha256 = ""
@@ -434,40 +449,83 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             ).stdout
         )
 
+    def _remote_flat_file_inventory(self, root: str) -> dict[str, str]:
+        code = r"""import hashlib,json,os,stat,sys
+root=sys.argv[1]
+files={}
+for name in os.listdir(root):
+    path=os.path.join(root,name)
+    info=os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"non-regular sealed entry: {name}")
+    digest=hashlib.sha256()
+    with open(path,"rb") as handle:
+        for block in iter(lambda:handle.read(1048576),b""):
+            digest.update(block)
+    files[name]=digest.hexdigest()
+print(json.dumps(files,separators=(",",":"),sort_keys=True))
+"""
+        return json.loads(
+            h43.remote(
+                self.host0, ["python3", "-c", code, root], timeout=180
+            ).stdout
+        )
+
     def _validate_remote_i2_artifacts(self) -> None:
-        for path in (I2_SOURCE, I2_NATIVE_SO, I2_PREPARATION_MANIFEST):
+        for path in (
+            I2_SOURCE,
+            I2_NATIVE_SO,
+            I2_NATIVE_BUILD_DIR,
+            I2_PREPARATION_MANIFEST,
+        ):
             h43.remote(self.host0, ["test", "!", "-L", path], timeout=30)
         native_digest = h43.remote(
             self.host0, ["sha256sum", I2_NATIVE_SO], timeout=60
         ).stdout.split()[0]
         if native_digest != I2_NATIVE_SHA256:
             raise ValueError("sealed H43 I2 native extension changed")
-        observed_native_files = {
-            line.split("  ", 1)[1]: line.split("  ", 1)[0]
-            for line in h43.remote(
-                self.host0,
-                [
-                    "bash",
-                    "-lc",
-                    f"cd {shlex.quote(I2_NATIVE_DIR)} && sha256sum -- *",
-                ],
-                timeout=120,
-            ).stdout.splitlines()
-            if line.strip()
-        }
+        observed_native_files = self._remote_flat_file_inventory(I2_NATIVE_DIR)
         if observed_native_files != NATIVE_SEALED_FILES:
             raise ValueError("sealed H43 I2 native inventory changed")
+        observed_build_files = self._remote_flat_file_inventory(I2_NATIVE_BUILD_DIR)
+        if observed_build_files != NATIVE_BUILD_FILES:
+            raise ValueError("sealed H43 I2 native build inventory changed")
+        self.native_build_ninja = h43.remote(
+            self.host0, ["cat", f"{I2_NATIVE_BUILD_DIR}/build.ninja"], timeout=60
+        ).stdout
+        required_build_fragments = (
+            "nvcc = /usr/local/cuda/bin/nvcc",
+            "-O3 -lineinfo -gencode=arch=compute_100,code=sm_100",
+            "build tq_mla_frontend_sm100.cuda.o: cuda_compile",
+            "build sglang_tq_mla_frontend_sm100_h43_i3_v2.so: link",
+        )
+        if any(
+            fragment not in self.native_build_ninja
+            for fragment in required_build_fragments
+        ):
+            raise ValueError("sealed native compiler command is incomplete")
         manifest_payload = h43.remote(
             self.host0, ["cat", I2_PREPARATION_MANIFEST], timeout=60
         ).stdout
-        if sha256_bytes(manifest_payload.encode()) != I2_PREPARATION_MANIFEST_SHA256:
+        manifest_digest = h43.remote(
+            self.host0, ["sha256sum", I2_PREPARATION_MANIFEST], timeout=60
+        ).stdout.split()[0]
+        if manifest_digest != I2_PREPARATION_MANIFEST_SHA256:
             raise ValueError("sealed H43 I3 preparation manifest changed")
         manifest = json.loads(manifest_payload)
+        native_manifest = manifest.get("native", {})
+        build_manifest = native_manifest.get("build_cache", {})
         if (
             manifest.get("sealed") is not True
             or manifest.get("sglang", {}).get("commit") != I2_COMMIT
-            or manifest.get("native", {}).get("sha256") != I2_NATIVE_SHA256
-            or manifest.get("native", {}).get("gpu_qualified") is not False
+            or native_manifest.get("sha256") != I2_NATIVE_SHA256
+            or native_manifest.get("source_sha256")
+            != "819ed01e06b1181ae02a346402d105e484ab0927574710e207770e4b70d8083b"
+            or native_manifest.get("gpu_qualified") is not False
+            or build_manifest.get("files") != NATIVE_BUILD_FILES
+            or build_manifest.get("compiler") != "/usr/local/cuda/bin/nvcc"
+            or build_manifest.get("architecture")
+            != "-gencode=arch=compute_100,code=sm_100"
         ):
             raise ValueError("sealed H43 I3 preparation attestation is invalid")
         self.native_seal_attestation = manifest
@@ -475,8 +533,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             self.host0,
             [
                 "find",
-                I2_SOURCE,
-                I2_NATIVE_DIR,
+                I2_PREPARATION,
                 "-not",
                 "-type",
                 "l",
@@ -608,6 +665,8 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                 "ordered_control_mismatches_required": 0,
             },
             "native_sealed_files": NATIVE_SEALED_FILES,
+            "native_build_files": NATIVE_BUILD_FILES,
+            "native_build_ninja": self.native_build_ninja,
             "native_seal_attestation": self.native_seal_attestation,
             "aot_preparation_sha256": I2_AOT_PREPARATION_SHA256,
             "aot_preparation": self.i2_preparation,
@@ -870,6 +929,8 @@ for option in --tokens --pairs --replays --profile-arm; do grep -Fq -- "$option"
 test -f /i2/benchmark/bench_turboquant_mla/bench_h41_i1_integrated.py
 help=$(python3 /i2/benchmark/bench_turboquant_mla/bench_h41_i1_integrated.py --help)
 for option in --context --split-kv --allocation-order --sequence --warmups --samples --replays-per-sample; do grep -Fq -- "$option" <<<"$help"; done
+test -f /results/test_h43_i3_serving_integration.py
+PYTHONPATH=/i2/python:/i2:/work:/results python3 -c "import importlib.util; spec=importlib.util.spec_from_file_location('h43_i3_serving_integration','/results/test_h43_i3_serving_integration.py'); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module); assert callable(module.main)"
 test -f /work/probe_h43_tq_racecheck.py
 help=$(python3 /work/probe_h43_tq_racecheck.py --help)
 for option in --contract --context --sequence; do grep -Fq -- "$option" <<<"$help"; done
@@ -877,7 +938,7 @@ test -f /work/check_h43_racecheck.py
 help=$(python3 /work/check_h43_racecheck.py --help)
 for option in --contract --context --reference-log --candidate-log --reference-target --candidate-target --reference-exit-code --candidate-exit-code; do grep -Fq -- "$option" <<<"$help"; done
 PYTHONPATH=/i2/python:/i2/test:/i2:/work python3 -c "from srt.test_turboquant import TestTurboQuantGPU as T; from registered.unit.mem_cache.test_mem_pool_host import TestMLATurboQuantHostKVCache as H; names=('test_mla_fused_kv_write_matches_legacy_quantize_store','test_mla_e2m1_fused_and_fallback_writers_match','test_mla_e2m1_chunked_fused_writer_matches_full_workspace','test_mla_layerwise_pool_has_one_representation_per_layer','test_mla_layerwise_codebook_allocates_only_selected_slots'); assert all(hasattr(T,n) for n in names); assert hasattr(H,'test_codebook_allocation_and_transfer_contract')"
-printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
+printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":8,"status":"PASS"}'
 """
         self._preoutage_run(
             self.candidate,
@@ -1726,6 +1787,8 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                 self.serving_integration_test_sha256
             ),
             "native_sealed_files": NATIVE_SEALED_FILES,
+            "native_build_files": NATIVE_BUILD_FILES,
+            "native_build_ninja": self.native_build_ninja,
             "native_seal_attestation": self.native_seal_attestation,
             "aot_preparation": self.i2_preparation,
             "pinned_reader_ncu": self.reader_ncu_proof,
