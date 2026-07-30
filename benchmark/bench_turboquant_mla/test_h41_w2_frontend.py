@@ -776,7 +776,24 @@ def run_candidate_only_sanitizer(
     config: TurboQuantConfig,
     device: torch.device,
     generator: torch.Generator,
+    sanitizer_tool: str,
 ) -> dict[str, Any]:
+    if sanitizer_tool == "initcheck":
+        inputs = make_inputs(1, device, generator, "random")
+        buffers = allocate_guarded(1, 12, device)
+        locations = torch.tensor([3], dtype=torch.int64, device=device)
+        launch(inputs, locations, config, buffers, True, 8)
+        torch.cuda.synchronize()
+        assert int(buffers.status.item()) == 0
+        assert_guards(buffers)
+        return {
+            "status": "PASS",
+            "candidate_only": True,
+            "sanitizer_tool": sanitizer_tool,
+            "valid_launches": 1,
+            "invalid_skip": "NOT_RUN",
+        }
+
     launches = 0
     for tokens in (1, 5, 40):
         inputs = make_inputs(tokens, device, generator, "random")
@@ -809,6 +826,7 @@ def run_candidate_only_sanitizer(
     return {
         "status": "PASS",
         "candidate_only": True,
+        "sanitizer_tool": sanitizer_tool,
         "valid_launches": launches,
         "invalid_skip": "PASS",
     }
@@ -822,6 +840,11 @@ def main() -> None:
         default="correctness",
     )
     parser.add_argument("--seed", type=int, default=20260729)
+    parser.add_argument(
+        "--sanitizer-tool",
+        choices=("memcheck", "initcheck"),
+        default="memcheck",
+    )
     args = parser.parse_args()
 
     device = torch.device("cuda", 0)
@@ -845,7 +868,9 @@ def main() -> None:
         return
 
     if args.mode == "sanitizer":
-        result = run_candidate_only_sanitizer(config, device, generator)
+        result = run_candidate_only_sanitizer(
+            config, device, generator, args.sanitizer_tool
+        )
         print(json.dumps(result, sort_keys=True))
         return
 

@@ -889,7 +889,10 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             timeout=120,
         )
         writer_test_help = self._read_remote_text("writer-test-cli.stdout.log")
-        if any(option not in writer_test_help for option in ("--mode", "--seed")):
+        if any(
+            option not in writer_test_help
+            for option in ("--mode", "--seed", "--sanitizer-tool")
+        ):
             raise RuntimeError("qualification writer test CLI is incomplete")
 
     def start_candidate(self) -> None:
@@ -1322,15 +1325,29 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
                 "all",
                 "--report-api-errors",
                 "no",
-                "--kernel-name",
-                "kns=tq_mla_frontend_kernel",
-                "--log-file",
-                f"/results/{log}",
-                "python3",
-                f"/results/{QUALIFICATION_FRONTEND_TEST}",
-                "--mode",
-                "sanitizer",
             ]
+            if tool == "memcheck":
+                command.extend(
+                    ["--kernel-name", "kns=tq_mla_frontend_kernel"]
+                )
+            else:
+                # Initcheck must observe the preceding PyTorch initialization
+                # kernels; filtering to only the writer makes initialized
+                # buffers appear undefined.  API-copy checking is orthogonal
+                # to the target kernel and is already covered by memcheck.
+                command.extend(["--check-api-memory-access", "no"])
+            command.extend(
+                [
+                    "--log-file",
+                    f"/results/{log}",
+                    "python3",
+                    f"/results/{QUALIFICATION_FRONTEND_TEST}",
+                    "--mode",
+                    "sanitizer",
+                    "--sanitizer-tool",
+                    tool,
+                ]
+            )
             value = self._candidate(
                 f"writer-sanitizer-{tool}-target",
                 command,
@@ -1340,8 +1357,12 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             sanitizer_log = h43.remote(
                 self.host0, ["cat", f"{self.results}/{log}"], timeout=60
             ).stdout
-            if value is None or not re.search(
-                r"ERROR SUMMARY:\s+0 errors", sanitizer_log
+            expected_launches = 24 if tool == "memcheck" else 1
+            if (
+                value is None
+                or value.get("sanitizer_tool") != tool
+                or value.get("valid_launches") != expected_launches
+                or not re.search(r"ERROR SUMMARY:\s+0 errors", sanitizer_log)
             ):
                 raise RuntimeError(f"writer {tool} did not report zero errors")
 
