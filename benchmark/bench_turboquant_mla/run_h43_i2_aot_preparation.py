@@ -279,9 +279,26 @@ class I2AOTPreparation(h43.Campaign):
         phase: str,
         result: subprocess.CompletedProcess[str],
     ) -> None:
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeError(f"{role} {phase} prebuild produced no stdout")
+        try:
+            value = json.loads(lines[-1])
+        except json.JSONDecodeError as error:
+            raise RuntimeError(
+                f"{role} {phase} prebuild did not end with JSON"
+            ) from error
+        if value.get("status") != "PASS" or value.get("phase") != phase:
+            raise RuntimeError(f"{role} {phase} prebuild result is not PASS")
         h43.write_remote_root_file(
             self.host0,
             f"{self.results}/{role}-aot-{phase}.json",
+            json.dumps(value, allow_nan=False, sort_keys=True) + "\n",
+            "0644",
+        )
+        h43.write_remote_root_file(
+            self.host0,
+            f"{self.results}/{role}-aot-{phase}.stdout.log",
             result.stdout,
             "0644",
         )
