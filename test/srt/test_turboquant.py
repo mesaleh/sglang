@@ -2789,6 +2789,48 @@ class TestTurboQuantGPU(unittest.TestCase):
             (64, 1, 16),
         )
 
+    def test_mla_h43_n14_allocates_exact_production_layout(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        pool_tokens = 256_000
+        selected_layer_ids = tuple(range(24, 38))
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            pool = MLATokenToKVPoolTurboQuant(
+                size=pool_tokens,
+                page_size=0,
+                dtype=torch.float8_e4m3fn,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=61,
+                device=self.device,
+                enable_memory_saver=False,
+                turboquant_bits=4,
+                turboquant_e2m1=True,
+                enable_fp8_codebook=True,
+                enable_fp8_rope=True,
+                enable_h43_frontend=True,
+                start_layer=0,
+                end_layer=61,
+                turboquant_layer_ids=selected_layer_ids,
+            )
+
+        self.assertEqual(pool.get_per_token_all_layer_bytes(), 31_804)
+        self.assertEqual(pool.get_kv_size_bytes(), 8_141_824_000)
+        self.assertEqual(sum(pool.is_turboquant_layer(i) for i in range(61)), 14)
+        self.assertEqual(sum(not pool.is_turboquant_layer(i) for i in range(61)), 47)
+        self.assertIsNotNone(pool.kv_nope_codebook_buffer)
+        for layer_id in range(61):
+            if layer_id in selected_layer_ids:
+                self.assertIsNotNone(pool.kv_nope_codebook_buffer[layer_id])
+                self.assertIsNotNone(pool.kv_nope_packed_buffer[layer_id])
+                self.assertIsNone(pool.kv_fp8_buffer[layer_id])
+                self.assertIs(pool.kv_rope_buffer[layer_id].dtype, torch.float8_e4m3fn)
+            else:
+                self.assertIsNone(pool.kv_nope_codebook_buffer[layer_id])
+                self.assertIsNone(pool.kv_nope_packed_buffer[layer_id])
+                self.assertIsNotNone(pool.kv_fp8_buffer[layer_id])
+
     def test_non_128_head_dim(self):
         """Verify TurboQuant works with head_dim=64 and head_dim=256."""
         from sglang.srt.layers.quantization.kv_turboquant import (

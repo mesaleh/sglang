@@ -68,6 +68,19 @@ def _make_model_runner(
     """Create a mock ModelRunner with the fields configurators need."""
     mr = MagicMock()
 
+    # A bare MagicMock reports every attribute as present. Pool configurators
+    # use hasattr(turboquant_bits) as the capability boundary, so leaving these
+    # unset would silently route ordinary MHA/MLA/SWA fixtures through the TQ
+    # sizing path. Real non-TQ ModelRunner instances do not define them.
+    for optional_tq_attr in (
+        "turboquant_bits",
+        "turboquant_k_bits",
+        "turboquant_v_bits",
+        "turboquant_e2m1",
+        "turboquant_mla_layer_ids",
+    ):
+        delattr(mr, optional_tq_attr)
+
     mr.use_mla_backend = use_mla_backend
     mr.is_draft_worker = False
     mr.num_effective_layers = num_layers
@@ -207,15 +220,17 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.swa_max_total_num_tokens)
 
     def test_mla_turboquant_optional_tokenspeed_codebook_is_accounted(self):
+        from sglang.srt.environ import envs
         from sglang.srt.model_executor.pool_configurator import (
             DefaultPoolConfigurator,
         )
 
         num_layers = 61
-        for decode_backend, e2m1, expected_bytes in (
-            ("triton", False, 386),
-            ("tokenspeed_mla", False, 402),
-            ("tokenspeed_mla", True, 386),
+        for decode_backend, e2m1, h43_frontend, expected_bytes in (
+            ("triton", False, False, 386),
+            ("tokenspeed_mla", False, False, 402),
+            ("tokenspeed_mla", True, False, 386),
+            ("tokenspeed_mla", True, True, 338),
         ):
             mr = _make_model_runner(
                 use_mla_backend=True,
@@ -226,15 +241,81 @@ class TestDefaultConfigurator(unittest.TestCase):
             mr.turboquant_bits = 4
             mr.turboquant_k_bits = 4
             mr.turboquant_e2m1 = e2m1
-            mr.server_args.get_attention_backends = lambda backend=decode_backend: (
-                "flashinfer_mla",
-                backend,
+            mr.turboquant_mla_layer_ids = tuple(range(num_layers))
+            mr.server_args.get_attention_backends = (
+                lambda backend=decode_backend, h43=h43_frontend: (
+                    "tokenspeed_mla" if h43 else "flashinfer_mla",
+                    backend,
+                )
             )
-            with mock_cpu_env():
+            with (
+                mock_cpu_env(kv_size=1),
+                envs.SGLANG_TQ_MLA_H43_FRONTEND.override(h43_frontend),
+            ):
                 configurator = DefaultPoolConfigurator(mr)
             self.assertEqual(
                 configurator._cell_size,
                 expected_bytes * num_layers,
+            )
+            self.assertEqual(
+                sum(
+                    mr.start_layer <= layer_id < mr.end_layer
+                    for layer_id in mr.turboquant_mla_layer_ids
+                ),
+                num_layers,
+            )
+
+    def test_mla_turboquant_n14_production_accounting(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        num_layers = 61
+        selected_layer_ids = tuple(range(24, 38))
+        pool_tokens = 256_000
+
+        fp8 = _make_model_runner(use_mla_backend=True, num_layers=num_layers)
+        fp8.model_config.kv_lora_rank = 512
+        fp8.model_config.qk_rope_head_dim = 64
+        with mock_cpu_env(kv_size=1):
+            fp8_configurator = DefaultPoolConfigurator(fp8)
+        self.assertEqual(fp8_configurator._cell_size, 61 * 576)
+        self.assertEqual(
+            fp8_configurator._cell_size * pool_tokens,
+            8_994_816_000,
+        )
+
+        for h43_frontend, selected_row_bytes, expected_rank_bytes in (
+            (False, 386, 8_313_856_000),
+            (True, 338, 8_141_824_000),
+        ):
+            mr = _make_model_runner(use_mla_backend=True, num_layers=num_layers)
+            mr.model_config.kv_lora_rank = 512
+            mr.model_config.qk_rope_head_dim = 64
+            mr.turboquant_bits = 4
+            mr.turboquant_k_bits = 4
+            mr.turboquant_e2m1 = True
+            mr.turboquant_mla_layer_ids = selected_layer_ids
+            mr.server_args.get_attention_backends = lambda h43=h43_frontend: (
+                "tokenspeed_mla" if h43 else "flashinfer_mla",
+                "tokenspeed_mla",
+            )
+            with (
+                mock_cpu_env(kv_size=1),
+                envs.SGLANG_TQ_MLA_H43_FRONTEND.override(h43_frontend),
+            ):
+                configurator = DefaultPoolConfigurator(mr)
+
+            self.assertEqual(len(selected_layer_ids), 14)
+            self.assertEqual(num_layers - len(selected_layer_ids), 47)
+            self.assertEqual(
+                configurator._cell_size,
+                14 * selected_row_bytes + 47 * 576,
+            )
+            self.assertEqual(
+                configurator._cell_size * pool_tokens,
+                expected_rank_bytes,
             )
 
 
