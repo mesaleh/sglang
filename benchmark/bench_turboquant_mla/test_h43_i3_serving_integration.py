@@ -122,7 +122,7 @@ def main() -> None:
             assert query_rope.stride() == (8 * 192, 192, 1)
             assert cache_rope.stride() == (576, 64, 1)
             assert not query_rope.is_contiguous()
-            assert not cache_rope.is_contiguous()
+            assert cache_rope.is_contiguous() is (tokens == 1)
             locations = torch.tensor(locations_list, dtype=torch.int64, device=device)
             query = backend.prepare_mla_absorb_qkv(
                 q_nope=query_latent,
