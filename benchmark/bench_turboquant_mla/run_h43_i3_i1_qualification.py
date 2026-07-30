@@ -36,6 +36,10 @@ SEED = 20260729
 SENTINEL_MAX_DRIFT_FRACTION = 0.005
 SEQUENCE_PHASE_SECONDS = 600
 ANALYSIS_PHASE_SECONDS = 900
+# The archived longest fresh process took 26.698303 seconds. Twenty required
+# sequences plus one replacement take 560.665 seconds at that conservative
+# bound. Further per-sequence replacements remain subject to the same frozen
+# 600-second global phase; 120 seconds is a fail-closed per-attempt timeout.
 SEQUENCE_TIMEOUT_SECONDS = 120
 ROUNDTRIP_MEMBERS = {
     (context, q_len): f"results/roundtrip-c{context}-q{q_len}.json"
@@ -288,20 +292,22 @@ class I1Qualification(I2Qualification):
             )
 
     @staticmethod
-    def _sentinel_reasons(value: dict[str, Any]) -> tuple[list[str], float]:
+    def _sentinel_reasons(
+        value: dict[str, Any],
+    ) -> tuple[list[str], float | None]:
         reasons: list[str] = []
         before = value.get("sentinel_before", {})
         after = value.get("sentinel_after", {})
         try:
             before_us = float(before["graph_us"])
             after_us = float(after["graph_us"])
-            drift = abs(after_us - before_us) / ((after_us + before_us) / 2.0)
-        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        except (KeyError, TypeError, ValueError):
             return [
                 "sentinel timings are absent, non-finite, or non-positive"
-            ], math.inf
+            ], None
         if not all(math.isfinite(item) and item > 0 for item in (before_us, after_us)):
-            reasons.append("sentinel timings are non-finite or non-positive")
+            return ["sentinel timings are non-finite or non-positive"], None
+        drift = abs(after_us - before_us) / ((after_us + before_us) / 2.0)
         if before.get("telemetry_valid") is not True:
             reasons.append("sentinel-before telemetry is invalid")
         if after.get("telemetry_valid") is not True:
@@ -322,7 +328,7 @@ class I1Qualification(I2Qualification):
 
     def _run_attempt(
         self, context: int, sequence: int, attempt: int, timeout: int
-    ) -> tuple[dict[str, Any], list[str], float]:
+    ) -> tuple[dict[str, Any], list[str], float | None]:
         allocation_order = "candidate-first" if sequence == 2 else "control-first"
         name = f"i1-c{context}-seq{sequence:02d}-attempt{attempt:02d}"
         self._assert_no_compute_process(f"{name}-idle-before")
@@ -386,7 +392,10 @@ class I1Qualification(I2Qualification):
         return value, reasons, drift
 
     def _write_component_result(
-        self, status: str, analysis: dict[str, Any] | None
+        self,
+        status: str,
+        analysis: dict[str, Any] | None,
+        failure: dict[str, str] | None = None,
     ) -> None:
         result = {
             "schema_version": 1,
@@ -400,6 +409,7 @@ class I1Qualification(I2Qualification):
             "valid_sequences_required_per_context": len(SEQUENCES),
             "attempts": self.attempts,
             "analysis": analysis,
+            "failure": failure,
             "memory_contract": MEMORY_CONTRACT,
             "authorization": (
                 "SUCCESSOR_IMAGE_BUILD_PERMITTED; "
@@ -464,9 +474,9 @@ class I1Qualification(I2Qualification):
         command = [
             "python3",
             "/i2/benchmark/bench_turboquant_mla/analyze_h41_i1_integrated.py",
-            f"{self.results}/i1/selected",
+            "/results/i1/selected",
             "--roundtrip-root",
-            f"{self.results}/i1/roundtrip",
+            "/results/i1/roundtrip",
             "--draws",
             str(BOOTSTRAP_DRAWS),
             "--seed",
@@ -574,8 +584,23 @@ def main() -> None:
     try:
         campaign = I1Qualification(args)
         campaign.execute()
-    except BaseException:
+    except BaseException as error:
         if campaign is not None and campaign.local_output.exists():
+            if campaign.service_stopped and campaign.component_result is None:
+                try:
+                    campaign._write_component_result(
+                        "NO_DECISION",
+                        None,
+                        {
+                            "type": type(error).__name__,
+                            "message": str(error),
+                        },
+                    )
+                except BaseException as result_error:
+                    print(
+                        f"failed to record H43 I1 NO_DECISION: {result_error}",
+                        file=sys.stderr,
+                    )
             try:
                 campaign.collect()
             except BaseException as collect_error:
