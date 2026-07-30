@@ -567,9 +567,12 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
     def _container_volumes(self, identity: dict[str, Any]) -> list[str]:
         cache = self.i2_preparation["caches"][identity["role"]]
         work = self.work if identity["role"] == "candidate" else self.reference_work
+        tokenspeed_source = f"{self.prep_root}/{identity['role']}/source"
         return [
             "--volume",
             f"{work}:/work:ro",
+            "--volume",
+            f"{tokenspeed_source}:/tokenspeed-source:ro",
             "--volume",
             f"{I2_SOURCE}:/i2:ro",
             "--volume",
@@ -807,15 +810,15 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "python3",
             "-m",
             "pytest",
-            "/work/test_tq4_contract.py",
+            "/tokenspeed-source/tokenspeed-mla/test/test_tq4_contract.py",
             "-q",
         ]
         self._candidate("h40-contract", contract_command, timeout=180)
         contract_stdout = h43.remote(
             self.host0, ["cat", f"{self.results}/h40-contract.stdout.log"], timeout=30
         ).stdout
-        if not re.search(r"\b30 passed\b", contract_stdout):
-            raise RuntimeError("H40 contract did not report exactly 30 passing tests")
+        if not re.search(r"\b31 passed\b", contract_stdout):
+            raise RuntimeError("H40 contract did not report exactly 31 passing tests")
 
         correctness = self._candidate(
             "writer-correctness",
