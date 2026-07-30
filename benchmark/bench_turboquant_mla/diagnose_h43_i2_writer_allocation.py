@@ -40,6 +40,7 @@ STAT_KEYS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("single", "exact-sequence"), required=True)
     parser.add_argument("--tokens", type=int, choices=(1, 5), required=True)
     parser.add_argument("--write-codebook", type=int, choices=(0, 1), required=True)
     parser.add_argument("--prelude", choices=("none", "correctness"), required=True)
@@ -59,12 +60,35 @@ def parse_args() -> argparse.Namespace:
         or not re.fullmatch(r"[a-z0-9-]+", prefix.name)
     ):
         raise ValueError("output-prefix must be /results/<lowercase-safe-name>")
-    for suffix in (
-        "initial-before.pickle",
-        "eager-before.pickle",
-        "eager-after.pickle",
-        "graph-after.pickle",
+    if args.mode == "exact-sequence" and (
+        args.tokens != 1
+        or args.write_codebook != 1
+        or args.prelude != "correctness"
+        or args.prior_q1_graph != 0
     ):
+        raise ValueError(
+            "exact-sequence requires tokens=1, write-codebook=1, "
+            "prelude=correctness, and prior-q1-graph=0"
+        )
+    if args.mode == "single":
+        suffixes = (
+            "initial-before.pickle",
+            "eager-before.pickle",
+            "eager-after.pickle",
+            "graph-after.pickle",
+        )
+    else:
+        suffixes = tuple(
+            f"q{tokens}-{phase}.pickle"
+            for tokens in (1, 5)
+            for phase in (
+                "initial-before",
+                "eager-before",
+                "eager-after",
+                "graph-after",
+            )
+        )
+    for suffix in suffixes:
         if Path(f"{prefix}-{suffix}").exists():
             raise ValueError(f"diagnostic snapshot already exists: {prefix}-{suffix}")
     return args
@@ -217,6 +241,133 @@ def run_replays(
     }
 
 
+def run_exact_sequence(
+    args: argparse.Namespace,
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> dict[str, Any]:
+    """Reproduce the original q1/q5 graph loop with identical rebinding order."""
+
+    torch.cuda.memory._record_memory_history(
+        enabled="all",
+        context="all",
+        stacks="python",
+        max_entries=50_000,
+        device=device,
+        clear_history=True,
+    )
+    prefix = str(args.output_prefix)
+    sequence: dict[str, dict[str, Any]] = {}
+    for tokens in (1, 5):
+        inputs = make_inputs(tokens, device, generator, "random")
+        pool_size = tokens + 7
+        locations = torch.arange(tokens, dtype=torch.int64, device=device) + 3
+        buffers = allocate_guarded(tokens, pool_size, device)
+
+        torch.cuda.memory._dump_snapshot(f"{prefix}-q{tokens}-initial-before.pickle")
+        initial_before = allocator_sample(device)
+        launch(inputs, locations, config, buffers, True, 8)
+        torch.cuda.synchronize(device)
+        initial_after = allocator_sample(device)
+
+        torch.cuda.memory._dump_snapshot(f"{prefix}-q{tokens}-eager-before.pickle")
+        eager_before = allocator_sample(device)
+        eager_before_bytes = int(torch.cuda.memory_allocated(device))
+        for _ in range(args.iterations):
+            launch(inputs, locations, config, buffers, True, 8)
+        torch.cuda.synchronize(device)
+        eager_after_bytes = int(torch.cuda.memory_allocated(device))
+        eager_after = allocator_sample(device)
+        torch.cuda.memory._dump_snapshot(f"{prefix}-q{tokens}-eager-after.pickle")
+
+        graph = torch.cuda.CUDAGraph()
+        capture_before = allocator_sample(device)
+        with torch.cuda.graph(graph):
+            launch(inputs, locations, config, buffers, True, 8)
+        torch.cuda.synchronize(device)
+        capture_after = allocator_sample(device)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        replay_before = allocator_sample(device)
+        replay_before_bytes = int(torch.cuda.memory_allocated(device))
+        for _ in range(args.iterations):
+            graph.replay()
+        torch.cuda.synchronize(device)
+        replay_after_bytes = int(torch.cuda.memory_allocated(device))
+        replay_after = allocator_sample(device)
+        torch.cuda.memory._dump_snapshot(f"{prefix}-q{tokens}-graph-after.pickle")
+
+        expected = query_reference(inputs[0], inputs[1], config, True)
+        _, _, _, expected_codebook = writer_reference(
+            inputs[2], inputs[3], locations, config, pool_size
+        )
+        if not torch.equal(raw_fp8(buffers.query), raw_fp8(expected)):
+            raise AssertionError(f"exact q{tokens} graph query mismatch")
+        if not torch.equal(buffers.codebook[locations], expected_codebook[locations]):
+            raise AssertionError(f"exact q{tokens} graph codebook mismatch")
+        if int(buffers.status.item()) != 0:
+            raise AssertionError(f"exact q{tokens} graph sticky status is nonzero")
+        assert_guards(buffers)
+
+        sequence[f"q{tokens}"] = {
+            "tokens": tokens,
+            "initial_launch": {
+                "before": initial_before,
+                "after": initial_after,
+                "delta": delta(initial_after, initial_before),
+            },
+            "eager": {
+                "before": eager_before,
+                "after": eager_after,
+                "delta": delta(eager_after, eager_before),
+                "memory_allocated_before": eager_before_bytes,
+                "memory_allocated_after": eager_after_bytes,
+                "invariant": eager_after_bytes == eager_before_bytes,
+                "iterations": args.iterations,
+                "synchronize_each": False,
+            },
+            "graph_capture": {
+                "before": capture_before,
+                "after": capture_after,
+                "delta": delta(capture_after, capture_before),
+            },
+            "graph_replay": {
+                "before": replay_before,
+                "after": replay_after,
+                "delta": delta(replay_after, replay_before),
+                "memory_allocated_before": replay_before_bytes,
+                "memory_allocated_after": replay_after_bytes,
+                "invariant": replay_after_bytes == replay_before_bytes,
+                "iterations": args.iterations,
+                "synchronize_each": False,
+            },
+        }
+    torch.cuda.memory._record_memory_history(enabled=None, device=device)
+    return {
+        "status": "PASS",
+        "experiment": "H43_I2_WRITER_EXACT_SEQUENCE_DIAGNOSTIC_ARM",
+        "pid": os.getpid(),
+        "hostname": platform.node(),
+        "torch_version": torch.__version__,
+        "cuda_version": torch.version.cuda,
+        "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING", "UNSET"),
+        "allocator_backend": torch.cuda.get_allocator_backend(),
+        "device": torch.cuda.get_device_name(device),
+        "mode": args.mode,
+        "tokens": [1, 5],
+        "write_codebook": True,
+        "prelude": args.prelude,
+        "prelude_cases": 352,
+        "prior_q1_graph": False,
+        "iterations": args.iterations,
+        "seed": args.seed,
+        "sequence": sequence,
+        "snapshot_prefix": prefix,
+        "qualification_claim": False,
+    }
+
+
 def main() -> None:
     args = parse_args()
     device = torch.device("cuda", 0)
@@ -237,6 +388,11 @@ def main() -> None:
         prelude_cases, retained_prelude = run_prelude(config, device, generator)
     else:
         prelude_cases, retained_prelude = 0, None
+    if args.mode == "exact-sequence":
+        result = run_exact_sequence(args, config, device, generator)
+        _ = retained_prelude
+        print(json.dumps(result, allow_nan=False, sort_keys=True))
+        return
     retained_prior_q1 = (
         run_prior_q1_graph(config, device, generator, args.iterations)
         if args.prior_q1_graph
@@ -341,6 +497,7 @@ def main() -> None:
         "cuda_module_loading": os.environ.get("CUDA_MODULE_LOADING", "UNSET"),
         "allocator_backend": torch.cuda.get_allocator_backend(),
         "device": torch.cuda.get_device_name(device),
+        "mode": args.mode,
         "tokens": args.tokens,
         "write_codebook": bool(args.write_codebook),
         "prelude": args.prelude,

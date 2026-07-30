@@ -92,6 +92,7 @@ class WriterAllocationDiagnostic(I2Qualification):
             raise RuntimeError("diagnostic CLI unexpectedly emitted a JSON result")
         help_text = self._read_remote_text("allocation-diagnostic-cli.stdout.log")
         required_options = (
+            "--mode",
             "--tokens",
             "--write-codebook",
             "--prelude",
@@ -172,6 +173,8 @@ class WriterAllocationDiagnostic(I2Qualification):
                 *environment,
                 "python3",
                 script,
+                "--mode",
+                "single",
                 "--tokens",
                 str(tokens),
                 "--write-codebook",
@@ -192,6 +195,7 @@ class WriterAllocationDiagnostic(I2Qualification):
                 expected_json_status="PASS",
             )
             expected = {
+                "mode": "single",
                 "tokens": tokens,
                 "write_codebook": bool(codebook),
                 "prelude": prelude,
