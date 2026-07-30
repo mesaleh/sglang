@@ -41,6 +41,9 @@ I2_NATIVE_BUILD_DIR = (
     f"{I2_PREPARATION}/native-build-cache/"
     "sglang_tq_mla_frontend_sm100_h43_i3_v2"
 )
+I2_NATIVE_SOURCE_SHA256 = (
+    "819ed01e06b1181ae02a346402d105e484ab0927574710e207770e4b70d8083b"
+)
 NATIVE_SEALED_FILES = {
     "sglang_tq_mla_frontend_sm100_h43_i3_v2.so": I2_NATIVE_SHA256,
 }
@@ -473,7 +476,9 @@ print(json.dumps(files,separators=(",",":"),sort_keys=True))
 
     def _validate_remote_i2_artifacts(self) -> None:
         for path in (
+            I2_PREPARATION,
             I2_SOURCE,
+            I2_NATIVE_DIR,
             I2_NATIVE_SO,
             I2_NATIVE_BUILD_DIR,
             I2_PREPARATION_MANIFEST,
@@ -484,6 +489,15 @@ print(json.dumps(files,separators=(",",":"),sort_keys=True))
         ).stdout.split()[0]
         if native_digest != I2_NATIVE_SHA256:
             raise ValueError("sealed H43 I2 native extension changed")
+        native_source = (
+            f"{I2_SOURCE}/python/sglang/jit_kernel/csrc/"
+            "tq_mla_frontend/tq_mla_frontend_sm100.cu"
+        )
+        native_source_digest = h43.remote(
+            self.host0, ["sha256sum", native_source], timeout=60
+        ).stdout.split()[0]
+        if native_source_digest != I2_NATIVE_SOURCE_SHA256:
+            raise ValueError("sealed H43 I2 native source changed")
         observed_native_files = self._remote_flat_file_inventory(I2_NATIVE_DIR)
         if observed_native_files != NATIVE_SEALED_FILES:
             raise ValueError("sealed H43 I2 native inventory changed")
@@ -519,8 +533,7 @@ print(json.dumps(files,separators=(",",":"),sort_keys=True))
             manifest.get("sealed") is not True
             or manifest.get("sglang", {}).get("commit") != I2_COMMIT
             or native_manifest.get("sha256") != I2_NATIVE_SHA256
-            or native_manifest.get("source_sha256")
-            != "819ed01e06b1181ae02a346402d105e484ab0927574710e207770e4b70d8083b"
+            or native_manifest.get("source_sha256") != I2_NATIVE_SOURCE_SHA256
             or native_manifest.get("gpu_qualified") is not False
             or build_manifest.get("files") != NATIVE_BUILD_FILES
             or build_manifest.get("compiler") != "/usr/local/cuda/bin/nvcc"
