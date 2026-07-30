@@ -1,11 +1,16 @@
 """Native SM100 TurboQuant MLA query and cache-writer front end.
 
-This is an experimental, default-off H41 operator. The capture-safe ``out``
-entry point owns no allocations and writes only caller-provided tensors.
+This is an experimental, default-off H43 operator. The capture-safe ``out``
+entry point owns no allocations and writes only caller-provided tensors. Its
+optional raw-FP8 codebook output is compile-time specialized in the CUDA
+extension and requires the storage-order decode centroids.
 """
 
 from __future__ import annotations
 
+import hashlib
+import importlib.util
+import os
 import threading
 from pathlib import Path
 from types import ModuleType
@@ -15,7 +20,45 @@ from torch.utils.cpp_extension import load
 
 _MODULE: ModuleType | None = None
 _MODULE_LOCK = threading.Lock()
-_MODULE_NAME = "sglang_tq_mla_frontend_sm100_h41_v1"
+_MODULE_NAME = "sglang_tq_mla_frontend_sm100_h43_i2_v1"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_prebuilt_module() -> ModuleType | None:
+    value = os.environ.get("SGLANG_TQ_MLA_FRONTEND_SO")
+    expected = os.environ.get("SGLANG_TQ_MLA_FRONTEND_SO_SHA256")
+    if value is None and expected is None:
+        return None
+    if (
+        not value
+        or not expected
+        or len(expected) != 64
+        or any(character not in "0123456789abcdef" for character in expected)
+    ):
+        raise RuntimeError("H43 native frontend prebuilt environment is incomplete")
+    path = Path(value)
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or path.resolve() != path
+        or not path.is_file()
+    ):
+        raise RuntimeError("H43 native frontend prebuilt path is unsafe or missing")
+    if _sha256(path) != expected:
+        raise RuntimeError("H43 native frontend prebuilt digest mismatch")
+    spec = importlib.util.spec_from_file_location(_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("H43 native frontend prebuilt import spec is invalid")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _get_module() -> ModuleType:
@@ -23,6 +66,8 @@ def _get_module() -> ModuleType:
     if _MODULE is not None:
         return _MODULE
     with _MODULE_LOCK:
+        if _MODULE is None:
+            _MODULE = _load_prebuilt_module()
         if _MODULE is None:
             source = (
                 Path(__file__).resolve().parent
@@ -61,6 +106,8 @@ def tq_mla_frontend_out(
     rope_cache: torch.Tensor,
     fault_status: torch.Tensor,
     *,
+    decode_centroids: torch.Tensor | None = None,
+    codebook_cache: torch.Tensor | None = None,
     scale_multiplier: float,
     rotation_fused: bool,
     num_warps: int = 8,
@@ -70,8 +117,14 @@ def tq_mla_frontend_out(
 
     ``locations`` must be unique, matching SGLang's token-slot allocator
     contract. ``fault_status`` is process-lifetime sticky state: initialize it
-    once before graph capture and never clear it per replay.
+    once before graph capture and never clear it per replay. The optional
+    ``decode_centroids`` and ``codebook_cache`` arguments are all-or-nothing.
     """
+
+    if (decode_centroids is None) != (codebook_cache is None):
+        raise ValueError(
+            "decode_centroids and codebook_cache must be provided together"
+        )
 
     _get_module().tq_mla_frontend_out(
         query_latent,
@@ -89,6 +142,8 @@ def tq_mla_frontend_out(
         scale_cache,
         rope_cache,
         fault_status,
+        decode_centroids,
+        codebook_cache,
         float(scale_multiplier),
         bool(rotation_fused),
         int(num_warps),
@@ -112,6 +167,8 @@ def tq_mla_frontend(
     rope_cache: torch.Tensor,
     fault_status: torch.Tensor,
     *,
+    decode_centroids: torch.Tensor | None = None,
+    codebook_cache: torch.Tensor | None = None,
     scale_multiplier: float,
     rotation_fused: bool,
     num_warps: int = 8,
@@ -140,6 +197,8 @@ def tq_mla_frontend(
         scale_cache,
         rope_cache,
         fault_status,
+        decode_centroids=decode_centroids,
+        codebook_cache=codebook_cache,
         scale_multiplier=scale_multiplier,
         rotation_fused=rotation_fused,
         num_warps=num_warps,

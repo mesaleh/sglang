@@ -1,7 +1,7 @@
-"""H41 I1 selected front-end-to-reader composition gate.
+"""H43 I2 selected front-end-to-codebook-reader composition gate.
 
 This focused test covers q1/q5 eager and graph-replay consumption of the
-material 322-byte TQ row. It is correctness evidence, not a timing result.
+material 338-byte TQ row. It is correctness evidence, not a timing result.
 """
 
 from __future__ import annotations
@@ -15,10 +15,13 @@ from typing import Any
 
 import torch
 
+from h43_aot_loader import install_h43_aot_from_environment
 from sglang.jit_kernel.tq_mla_frontend import tq_mla_frontend_out
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_tq4
+
+_H43_AOT_LOADER = install_h43_aot_from_environment()
 
 LATENT = 512
 ROPE = 64
@@ -64,16 +67,17 @@ def assert_idle_before_cuda() -> dict[str, Any]:
     )
     output = completed.stdout.strip()
     if output:
-        raise RuntimeError(f"H41 I1 requires an idle node before CUDA init; found: {output}")
+        raise RuntimeError(
+            f"H43 I2 requires an idle node before CUDA init; found: {output}"
+        )
     return {"query": fields, "rows": []}
 
 
 def reconstruct_cache(
     dense: torch.Tensor,
     packed: torch.Tensor,
-    scale: torch.Tensor,
+    codebook: torch.Tensor,
     rope: torch.Tensor,
-    centroids: torch.Tensor,
     *,
     chunk_pages: int = 128,
 ) -> None:
@@ -87,7 +91,9 @@ def reconstruct_cache(
         )
         indices[..., 0::2] = packed_chunk & 0x0F
         indices[..., 1::2] = packed_chunk >> 4
-        decoded = centroids[indices.long()] * scale[first:last, ..., None].float()
+        decoded = torch.gather(
+            codebook[first:last].view(FP8).float(), -1, indices.long()
+        )
         dense[first:last, ..., :LATENT].copy_(decoded)
         dense[first:last, ..., LATENT:].copy_(rope[first:last])
 
@@ -95,9 +101,8 @@ def reconstruct_cache(
 def reconstruct_rows(
     dense: torch.Tensor,
     packed: torch.Tensor,
-    scale: torch.Tensor,
+    codebook: torch.Tensor,
     rope: torch.Tensor,
-    centroids: torch.Tensor,
     locations: torch.Tensor,
 ) -> None:
     packed_rows = packed.view(CACHE_ROWS, LATENT // 2)[locations]
@@ -106,8 +111,8 @@ def reconstruct_rows(
     )
     indices[:, 0::2] = packed_rows & 0x0F
     indices[:, 1::2] = packed_rows >> 4
-    scale_rows = scale.view(CACHE_ROWS)[locations]
-    decoded = (centroids[indices.long()] * scale_rows[:, None].float()).to(FP8)
+    codebook_rows = codebook.view(CACHE_ROWS, 16)[locations].view(FP8).float()
+    decoded = torch.gather(codebook_rows, -1, indices.long()).to(FP8)
     dense_rows = dense.view(CACHE_ROWS, LATENT + ROPE)
     dense_rows[locations, :LATENT] = decoded
     dense_rows[locations, LATENT:] = rope.view(CACHE_ROWS, ROPE)[locations]
@@ -142,9 +147,9 @@ def main() -> None:
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     if torch.cuda.get_device_capability(device) != (10, 0):
-        raise RuntimeError("H41 I1 requires SM100")
+        raise RuntimeError("H43 I2 requires SM100")
     if not is_arch_support_pdl():
-        raise RuntimeError("H41 I1 requires the SM100 PDL path")
+        raise RuntimeError("H43 I2 requires the SM100 PDL path")
 
     import flashinfer.rope
 
@@ -157,16 +162,19 @@ def main() -> None:
     scale = torch.empty(
         CACHE_PAGES, PAGE, dtype=torch.bfloat16, device=device
     ).uniform_(0.05, 0.20, generator=generator)
+    codebook = (
+        (scale.float()[..., None] * centroids).to(FP8).view(torch.uint8).contiguous()
+    )
+    if codebook.data_ptr() % 16:
+        raise AssertionError("codebook allocation must be 16-byte aligned")
     rope = torch.empty(CACHE_PAGES, PAGE, ROPE, dtype=FP8, device=device)
     rope_scratch = torch.empty_like(rope, dtype=torch.bfloat16).normal_(
         0.0, 0.1, generator=generator
     )
     rope.copy_(rope_scratch)
     del rope_scratch
-    dense = torch.empty(
-        CACHE_PAGES, PAGE, LATENT + ROPE, dtype=FP8, device=device
-    )
-    reconstruct_cache(dense, packed, scale, rope, centroids)
+    dense = torch.empty(CACHE_PAGES, PAGE, LATENT + ROPE, dtype=FP8, device=device)
+    reconstruct_cache(dense, packed, codebook, rope)
 
     page_table = torch.randperm(
         REQUEST_PAGES,
@@ -200,9 +208,7 @@ def main() -> None:
     cache_rope_raw = make_bf16(args.q_len, 1, ROPE)
     selected_query_rope = torch.empty_like(query_rope_raw)
     selected_cache_rope = torch.empty_like(cache_rope_raw)
-    query = torch.empty(
-        args.q_len, HEADS, LATENT + ROPE, dtype=FP8, device=device
-    )
+    query = torch.empty(args.q_len, HEADS, LATENT + ROPE, dtype=FP8, device=device)
     cos_sin_cache = torch.empty(
         MAX_CONTEXT, ROPE, dtype=torch.float32, device=device
     ).uniform_(-1.0, 1.0, generator=generator)
@@ -252,6 +258,8 @@ def main() -> None:
             scale.view(CACHE_ROWS, 1),
             rope.view(CACHE_ROWS, 1, ROPE),
             status,
+            decode_centroids=config.k_centroids,
+            codebook_cache=codebook.view(CACHE_ROWS, 1, 16),
             scale_multiplier=config.k_dequant_scale_multiplier,
             rotation_fused=True,
             num_warps=8,
@@ -276,7 +284,7 @@ def main() -> None:
             causal_mask=True,
             enable_pdl=True,
             split_kv_override=args.split_kv,
-            kv_nope_codebook=None,
+            kv_nope_codebook=codebook,
             fp8_rope=True,
         )
 
@@ -301,7 +309,7 @@ def main() -> None:
         return tq_call()
 
     def check(label: str) -> dict[str, Any]:
-        reconstruct_rows(dense, packed, scale, rope, centroids, locations)
+        reconstruct_rows(dense, packed, codebook, rope, locations)
         dense_call()
         torch.cuda.synchronize()
         max_abs_diff = float((tq_out.float() - dense_out.float()).abs().max())
@@ -332,7 +340,7 @@ def main() -> None:
     replay = check("graph_replay")
     result = {
         "status": "PASS",
-        "experiment": "H41_I1_WRITER_READER_COMPOSITION",
+        "experiment": "H43_I2_WRITER_CODEBOOK_READER_COMPOSITION",
         "context": args.context,
         "q_len": args.q_len,
         "split_kv": args.split_kv,
@@ -348,9 +356,9 @@ def main() -> None:
             )
         ),
         "selected_warps": 8,
-        "selected_row_bytes": 322,
+        "selected_row_bytes": 338,
         "fp8_rope": True,
-        "codebook_materialized": False,
+        "codebook_materialized": True,
         "sticky_status": int(status.item()),
         "correctness_atol": args.correctness_atol,
         "checks": [eager, replay],

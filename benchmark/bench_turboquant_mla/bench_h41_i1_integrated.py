@@ -1,4 +1,4 @@
-"""H41 I1 complete 61-layer four-family CUDA-graph falsifier.
+"""H43 I2 complete 61-layer codebook CUDA-graph falsifier.
 
 This is isolated graph evidence. It is not an endpoint or quality result.
 """
@@ -10,7 +10,6 @@ import json
 import math
 import os
 import platform
-import statistics
 import subprocess
 import time
 from collections.abc import Callable
@@ -19,11 +18,14 @@ from typing import Any
 
 import torch
 
+from h43_aot_loader import install_h43_aot_from_environment
 from sglang.jit_kernel.tq_mla_frontend import tq_mla_frontend_out
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 from sglang.srt.mem_cache.triton_ops.mla_buffer import set_mla_kv_buffer_triton
 from tokenspeed_mla import tokenspeed_mla_decode, tokenspeed_mla_decode_tq4
+
+_H43_AOT_LOADER = install_h43_aot_from_environment()
 
 LATENT = 512
 ROPE = 64
@@ -58,27 +60,9 @@ E2M1_CENTROIDS = (
     -4.0,
     -6.0,
 )
-
-
-def percentile(values: list[float], q: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * q
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return ordered[lower]
-    fraction = position - lower
-    return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
-
-
-def summarize(values: list[float]) -> dict[str, float]:
-    return {
-        "mean": statistics.fmean(values),
-        "p20": percentile(values, 0.20),
-        "median": percentile(values, 0.50),
-        "p80": percentile(values, 0.80),
-        "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
-    }
+GPU_UUID = "GPU-9f90e004-9332-4d9d-fa34-018fb9f07fca"
+EXPECTED_SM_CLOCK_MHZ = "1965"
+SENTINEL_MAX_DRIFT_FRACTION = 0.005
 
 
 def command_output(command: list[str]) -> str:
@@ -98,15 +82,20 @@ def assert_idle_before_cuda() -> dict[str, Any]:
         ]
     )
     if output:
-        raise RuntimeError(f"H41 I1 requires an idle node before CUDA init; found: {output}")
+        raise RuntimeError(
+            f"H43 I2 requires an idle node before CUDA init; found: {output}"
+        )
     return {"query": fields, "rows": []}
 
 
 def gpu_covariates() -> dict[str, Any]:
     fields = (
-        "timestamp,index,pstate,clocks.current.graphics,clocks.max.graphics,"
-        "temperature.gpu,power.draw,utilization.gpu,memory.used,"
-        "ecc.errors.uncorrected.volatile.total,gpu_recovery_action"
+        "timestamp,index,uuid,name,pstate,clocks.sm,clocks.max.sm,"
+        "clocks_event_reasons.hw_slowdown,"
+        "clocks_event_reasons.sw_thermal_slowdown,temperature.gpu,"
+        "power.draw.instant,power.limit,ecc.errors.uncorrected.volatile.total,"
+        "ecc.errors.uncorrected.aggregate.total,gpu_recovery_action,"
+        "fabric.state,fabric.status"
     )
     try:
         output = command_output(
@@ -126,6 +115,56 @@ def gpu_covariates() -> dict[str, Any]:
             strict=False,
         )
     )
+
+
+def telemetry_reasons(sample: dict[str, Any]) -> list[str]:
+    if "error" in sample:
+        return [str(sample["error"])]
+    expected = {
+        "index": "0",
+        "uuid": GPU_UUID,
+        "pstate": "P0",
+        "clocks.sm": EXPECTED_SM_CLOCK_MHZ,
+        "clocks.max.sm": EXPECTED_SM_CLOCK_MHZ,
+        "clocks_event_reasons.hw_slowdown": "Not Active",
+        "clocks_event_reasons.sw_thermal_slowdown": "Not Active",
+        "ecc.errors.uncorrected.volatile.total": "0",
+        "gpu_recovery_action": "None",
+        "fabric.state": "state  Completed",
+        "fabric.status": "status Success",
+    }
+    return [
+        f"{key}={sample.get(key)!r}, expected {value!r}"
+        for key, value in expected.items()
+        if sample.get(key) != value
+    ]
+
+
+def timed_replays(graph: torch.cuda.CUDAGraph, replays: int) -> float:
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(replays):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000.0 / replays
+
+
+def timed_with_telemetry(
+    graph: torch.cuda.CUDAGraph, *, replays: int
+) -> dict[str, Any]:
+    before = gpu_covariates()
+    graph_us = timed_replays(graph, replays)
+    after = gpu_covariates()
+    reasons = telemetry_reasons(before) + telemetry_reasons(after)
+    return {
+        "graph_us": graph_us,
+        "telemetry_before": before,
+        "telemetry_after": after,
+        "telemetry_reasons": reasons,
+        "telemetry_valid": not reasons,
+    }
 
 
 def capture_graph(
@@ -152,43 +191,6 @@ def capture_graph(
     return graph
 
 
-def time_graph(
-    graph: torch.cuda.CUDAGraph,
-    *,
-    samples: int,
-    replays_per_sample: int,
-    output: torch.Tensor,
-    status: torch.Tensor | None,
-) -> dict[str, Any]:
-    before = gpu_covariates()
-    sample_us: list[float] = []
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    for _ in range(samples):
-        start.record()
-        for _ in range(replays_per_sample):
-            graph.replay()
-        end.record()
-        end.synchronize()
-        sample_us.append(start.elapsed_time(end) * 1000.0 / replays_per_sample)
-    after = gpu_covariates()
-    status_value = int(status.item()) if status is not None else None
-    if status_value not in (None, 0):
-        raise AssertionError(f"candidate sticky status changed to {status_value}")
-    return {
-        "sample_graph_us": sample_us,
-        "graph_us": summarize(sample_us),
-        "per_total_layer_us": summarize(
-            [value / TOTAL_LAYERS for value in sample_us]
-        ),
-        "replays": samples * replays_per_sample,
-        "gpu_before": before,
-        "gpu_after": after,
-        "output_checksum": float(output.float().sum()),
-        "sticky_status": status_value,
-    }
-
-
 def operation_traces() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     control = [
         {
@@ -211,8 +213,8 @@ def operation_traces() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
                     "representation": "tq4_e2m1_fp8_rope",
                     "operations": [
                         "selected_bf16_rope",
-                        "h41_combined_query_material_writer",
-                        "tokenspeed_tq4_attention",
+                        "h43_combined_query_material_codebook_writer",
+                        "tokenspeed_tq4_codebook_attention",
                     ],
                 }
             )
@@ -220,7 +222,9 @@ def operation_traces() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             candidate.append(control[layer].copy())
     assert len(control) == TOTAL_LAYERS
     assert len(candidate) == TOTAL_LAYERS
-    assert sum(item["representation"] == "dense_fp8" for item in candidate) == DENSE_LAYERS
+    assert (
+        sum(item["representation"] == "dense_fp8" for item in candidate) == DENSE_LAYERS
+    )
     assert (
         sum(item["representation"] == "tq4_e2m1_fp8_rope" for item in candidate)
         == SELECTED_LAYERS
@@ -241,9 +245,8 @@ def fill_dense_layer(
 def reconstruct_tq_layer(
     destination: torch.Tensor,
     packed: torch.Tensor,
-    scale: torch.Tensor,
+    codebook: torch.Tensor,
     rope: torch.Tensor,
-    centroids: torch.Tensor,
     *,
     chunk_pages: int = 128,
 ) -> None:
@@ -257,7 +260,9 @@ def reconstruct_tq_layer(
         )
         indices[..., 0::2] = packed_chunk & 0x0F
         indices[..., 1::2] = packed_chunk >> 4
-        decoded = centroids[indices.long()] * scale[first:last, ..., None].float()
+        decoded = torch.gather(
+            codebook[first:last].view(FP8).float(), -1, indices.long()
+        )
         destination[first:last, ..., :LATENT].copy_(decoded)
         destination[first:last, ..., LATENT:].copy_(rope[first:last])
 
@@ -275,6 +280,7 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--replays-per-sample", type=int, default=100)
     parser.add_argument("--seed", type=int, default=20260729)
+    parser.add_argument("--sequence", type=int, choices=range(1, 11), required=True)
     parser.add_argument("--correctness-atol", type=float, default=0.002)
     parser.add_argument("--graph-debug-dir", type=Path)
     args = parser.parse_args()
@@ -285,9 +291,16 @@ def main() -> None:
             f"context {args.context} requires frozen split-kv {expected_split}"
         )
     if args.warmups < 100:
-        raise ValueError("H41 I1 requires at least 100 graph warmups per arm")
-    if args.samples * args.replays_per_sample < 2000:
-        raise ValueError("H41 I1 requires at least 2,000 timed replays per arm")
+        raise ValueError("H43 I2 requires at least 100 graph warmups per arm")
+    if args.samples != 20 or args.replays_per_sample != 100:
+        raise ValueError("H43 I2 requires exactly 20 pairs of 100 replays")
+    expected_allocation_order = (
+        "candidate-first" if args.sequence == 2 else "control-first"
+    )
+    if args.allocation_order != expected_allocation_order:
+        raise ValueError(
+            f"sequence {args.sequence} requires {expected_allocation_order} allocation"
+        )
 
     idle_proof = assert_idle_before_cuda()
     import flashinfer.rope
@@ -295,13 +308,13 @@ def main() -> None:
     device = torch.device("cuda", 0)
     torch.cuda.set_device(device)
     if torch.cuda.get_device_capability(device) != (10, 0):
-        raise RuntimeError("H41 I1 requires SM100")
+        raise RuntimeError("H43 I2 requires SM100")
     if not is_arch_support_pdl():
-        raise RuntimeError("H41 I1 requires the SM100 PDL path")
+        raise RuntimeError("H43 I2 requires the SM100 PDL path")
     free_before, total_bytes = torch.cuda.mem_get_info(device)
     if free_before < (40 << 30):
         raise RuntimeError(
-            f"H41 I1 requires 40 GiB free; found {free_before / 2**30:.2f} GiB"
+            f"H43 I2 requires 40 GiB free; found {free_before / 2**30:.2f} GiB"
         )
 
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -354,6 +367,14 @@ def main() -> None:
                 dtype=FP8,
                 device=device,
             ),
+            torch.empty(
+                SELECTED_LAYERS,
+                CACHE_PAGES,
+                PAGE,
+                16,
+                dtype=torch.uint8,
+                device=device,
+            ),
             torch.empty(64 << 20, dtype=torch.int8, device=device),
         )
 
@@ -368,12 +389,18 @@ def main() -> None:
         candidate_packed,
         candidate_scale,
         candidate_rope,
+        candidate_codebook,
         candidate_workspace,
     ) = candidate_allocations
 
     centroids = torch.tensor(E2M1_CENTROIDS, dtype=torch.float32, device=device)
     candidate_packed.random_(0, 256, generator=generator)
     candidate_scale.uniform_(0.05, 0.20, generator=generator)
+    candidate_codebook.copy_(
+        (candidate_scale.float()[..., None] * centroids).to(FP8).view(torch.uint8)
+    )
+    if candidate_codebook.data_ptr() % 16:
+        raise AssertionError("candidate codebook must be 16-byte aligned")
     rope_scratch = torch.empty(
         CACHE_PAGES, PAGE, ROPE, dtype=torch.bfloat16, device=device
     )
@@ -386,16 +413,13 @@ def main() -> None:
         reconstruct_tq_layer(
             control_dense[DENSE_BEFORE + layer],
             candidate_packed[layer],
-            candidate_scale[layer],
+            candidate_codebook[layer],
             candidate_rope[layer],
-            centroids,
         )
     for dense_index in range(DENSE_LAYERS):
         fill_dense_layer(candidate_dense[dense_index], dense_scratch, generator)
         control_index = (
-            dense_index
-            if dense_index < DENSE_BEFORE
-            else dense_index + SELECTED_LAYERS
+            dense_index if dense_index < DENSE_BEFORE else dense_index + SELECTED_LAYERS
         )
         control_dense[control_index].copy_(candidate_dense[dense_index])
     del dense_scratch, rope_scratch
@@ -433,9 +457,7 @@ def main() -> None:
         MAX_CONTEXT, ROPE, dtype=torch.float32, device=device
     ).uniform_(-1.0, 1.0, generator=generator)
 
-    control_query = torch.empty(
-        TOKENS, HEADS, LATENT + ROPE, dtype=FP8, device=device
-    )
+    control_query = torch.empty(TOKENS, HEADS, LATENT + ROPE, dtype=FP8, device=device)
     control_k = torch.empty(TOKENS, LATENT, dtype=FP8, device=device)
     control_rope = torch.empty(TOKENS, ROPE, dtype=FP8, device=device)
     candidate_query = torch.empty_like(control_query)
@@ -484,7 +506,9 @@ def main() -> None:
             enable_pdl=True,
         )
 
-    def tq_attention(layer: int, query: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    def tq_attention(
+        layer: int, query: torch.Tensor, output: torch.Tensor
+    ) -> torch.Tensor:
         return tokenspeed_mla_decode_tq4(
             query=query.view(1, TOKENS, HEADS, LATENT + ROPE),
             kv_nope_packed=candidate_packed[layer],
@@ -502,7 +526,7 @@ def main() -> None:
             causal_mask=True,
             enable_pdl=True,
             split_kv_override=args.split_kv,
-            kv_nope_codebook=None,
+            kv_nope_codebook=candidate_codebook[layer],
             fp8_rope=True,
         )
 
@@ -530,9 +554,7 @@ def main() -> None:
             quant_scale_kv=1.0,
             enable_pdl=True,
         )
-        set_mla_kv_buffer_triton(
-            cache.view(CACHE_ROWS, -1), locations, k_out, rope_out
-        )
+        set_mla_kv_buffer_triton(cache.view(CACHE_ROWS, -1), locations, k_out, rope_out)
 
     def selected_frontend(layer: int, query_latent_input: torch.Tensor) -> None:
         flashinfer.rope._apply_rope_pos_ids_cos_sin_cache(
@@ -560,6 +582,8 @@ def main() -> None:
             candidate_scale[layer].view(CACHE_ROWS, 1),
             candidate_rope[layer].view(CACHE_ROWS, 1, ROPE),
             status,
+            decode_centroids=config.k_centroids,
+            codebook_cache=candidate_codebook[layer].view(CACHE_ROWS, 1, 16),
             scale_multiplier=config.k_dequant_scale_multiplier,
             rotation_fused=True,
             num_warps=8,
@@ -567,23 +591,19 @@ def main() -> None:
         )
 
     def reconstruct_current_rows(layer: int, control_layer: int) -> None:
-        packed_rows = candidate_packed[layer].view(CACHE_ROWS, LATENT // 2)[
-            locations
-        ]
-        indices = torch.empty(
-            TOKENS, LATENT, dtype=torch.uint8, device=device
-        )
+        packed_rows = candidate_packed[layer].view(CACHE_ROWS, LATENT // 2)[locations]
+        indices = torch.empty(TOKENS, LATENT, dtype=torch.uint8, device=device)
         indices[:, 0::2] = packed_rows & 0x0F
         indices[:, 1::2] = packed_rows >> 4
-        scale_rows = candidate_scale[layer].view(CACHE_ROWS)[locations]
-        decoded = (centroids[indices.long()] * scale_rows[:, None].float()).to(FP8)
-        dense_rows = control_dense[control_layer].view(
-            CACHE_ROWS, LATENT + ROPE
+        codebook_rows = (
+            candidate_codebook[layer].view(CACHE_ROWS, 16)[locations].view(FP8).float()
         )
+        decoded = torch.gather(codebook_rows, -1, indices.long()).to(FP8)
+        dense_rows = control_dense[control_layer].view(CACHE_ROWS, LATENT + ROPE)
         dense_rows[locations, :LATENT] = decoded
-        dense_rows[locations, LATENT:] = candidate_rope[layer].view(
-            CACHE_ROWS, ROPE
-        )[locations]
+        dense_rows[locations, LATENT:] = candidate_rope[layer].view(CACHE_ROWS, ROPE)[
+            locations
+        ]
 
     check_query = make_bf16(1, TOKENS, HEADS, LATENT + ROPE).to(FP8)
     dense_attention(
@@ -709,12 +729,20 @@ def main() -> None:
         if args.graph_debug_dir is not None
         else None
     )
-    control_graph = capture_graph(
-        run_control, warmups=args.warmups, debug_path=debug_control
+    graph_functions = {"control": run_control, "candidate": run_candidate}
+    graph_debug_paths = {"control": debug_control, "candidate": debug_candidate}
+    capture_order = (
+        ("control", "candidate") if args.sequence % 2 else ("candidate", "control")
     )
-    candidate_graph = capture_graph(
-        run_candidate, warmups=args.warmups, debug_path=debug_candidate
-    )
+    graphs: dict[str, torch.cuda.CUDAGraph] = {}
+    for arm in capture_order:
+        graphs[arm] = capture_graph(
+            graph_functions[arm],
+            warmups=args.warmups,
+            debug_path=graph_debug_paths[arm],
+        )
+    control_graph = graphs["control"]
+    candidate_graph = graphs["candidate"]
     allocation_before_replay = torch.cuda.memory_allocated(device)
     for _ in range(100):
         control_graph.replay()
@@ -727,39 +755,42 @@ def main() -> None:
             f"{allocation_before_replay} -> {allocation_after_replay}"
         )
 
-    sequence: list[dict[str, Any]] = []
-    for kind, graph, output, graph_status in (
-        ("control", control_graph, control_out, None),
-        ("candidate", candidate_graph, candidate_out, status),
-        ("control", control_graph, control_out, None),
-    ):
-        control_number = sum(item["kind"] == "control" for item in sequence) + 1
-        arm = f"control_{control_number}" if kind == "control" else "candidate"
-        sequence.append(
+    sentinel_before = timed_with_telemetry(
+        control_graph, replays=args.replays_per_sample
+    )
+    pairs: list[dict[str, Any]] = []
+    for pair_index in range(args.samples):
+        control_first = (pair_index % 2 == 0) == (args.sequence % 2 == 1)
+        order = ("control", "candidate") if control_first else ("candidate", "control")
+        before = gpu_covariates()
+        durations_us = {
+            arm: timed_replays(graphs[arm], args.replays_per_sample) for arm in order
+        }
+        after = gpu_covariates()
+        reasons = telemetry_reasons(before) + telemetry_reasons(after)
+        pairs.append(
             {
-                "arm": arm,
-                "kind": kind,
-                **time_graph(
-                    graph,
-                    samples=args.samples,
-                    replays_per_sample=args.replays_per_sample,
-                    output=output,
-                    status=graph_status,
-                ),
+                "pair_index": pair_index,
+                "order": list(order),
+                "durations_us": durations_us,
+                "telemetry_before": before,
+                "telemetry_after": after,
+                "telemetry_reasons": reasons,
+                "telemetry_valid": not reasons,
             }
         )
-
-    control_1 = sequence[0]["graph_us"]["mean"]
-    candidate_us = sequence[1]["graph_us"]["mean"]
-    control_2 = sequence[2]["graph_us"]["mean"]
-    control_mean = (control_1 + control_2) / 2.0
-    graph_delta = candidate_us - control_mean
+    sentinel_after = timed_with_telemetry(
+        control_graph, replays=args.replays_per_sample
+    )
+    if int(status.item()) != 0:
+        raise AssertionError("candidate sticky status changed during paired timing")
     control_persistent_cache_bytes = control_dense.nbytes
     candidate_persistent_cache_bytes = (
         candidate_dense.nbytes
         + candidate_packed.nbytes
         + candidate_scale.nbytes
         + candidate_rope.nbytes
+        + candidate_codebook.nbytes
     )
     gross_persistent_cache_savings_bytes = (
         control_persistent_cache_bytes - candidate_persistent_cache_bytes
@@ -767,7 +798,7 @@ def main() -> None:
 
     result = {
         "status": "TIMING_ONLY",
-        "experiment": "H41_I1_INTEGRATED_FOUR_FAMILY",
+        "experiment": "H43_I2_INTEGRATED_CODEBOOK_FOUR_FAMILY",
         "timestamp_unix": time.time(),
         "pid": os.getpid(),
         "hostname": platform.node(),
@@ -783,26 +814,27 @@ def main() -> None:
         "heads": HEADS,
         "total_layers": TOTAL_LAYERS,
         "selected_layers": SELECTED_LAYERS,
-        "selected_layer_ids": list(
-            range(DENSE_BEFORE, DENSE_BEFORE + SELECTED_LAYERS)
-        ),
+        "selected_layer_ids": list(range(DENSE_BEFORE, DENSE_BEFORE + SELECTED_LAYERS)),
         "dense_before": DENSE_BEFORE,
         "dense_after": DENSE_AFTER,
         "selected_warps": 8,
-        "selected_row_bytes": 322,
+        "selected_row_bytes": 338,
         "selected_fp8_rope": True,
-        "selected_codebook_materialized": False,
+        "selected_codebook_materialized": True,
         "split_kv": args.split_kv,
         "allocation_order": args.allocation_order,
+        "sequence_number": args.sequence,
+        "capture_order": list(capture_order),
         "warmups_per_graph": args.warmups,
         "samples_per_arm": args.samples,
         "replays_per_sample": args.replays_per_sample,
-        "sequence": sequence,
-        "control_mean_graph_us": control_mean,
-        "candidate_mean_graph_us": candidate_us,
-        "candidate_minus_control_graph_us": graph_delta,
-        "integrated_delta_per_selected_layer_us": graph_delta / SELECTED_LAYERS,
-        "control_flank_drift_fraction": (control_2 - control_1) / control_mean,
+        "sentinel_before": sentinel_before,
+        "pairs": pairs,
+        "sentinel_after": sentinel_after,
+        "sentinel_max_drift_fraction": SENTINEL_MAX_DRIFT_FRACTION,
+        "control_output_checksum": float(control_out.float().sum()),
+        "candidate_output_checksum": float(candidate_out.float().sum()),
+        "sticky_status": int(status.item()),
         "operation_traces": {
             "control": control_trace,
             "candidate": candidate_trace,
@@ -834,7 +866,7 @@ def main() -> None:
         "candidate_tq_packed_bytes": candidate_packed.nbytes,
         "candidate_tq_scale_bytes": candidate_scale.nbytes,
         "candidate_tq_rope_bytes": candidate_rope.nbytes,
-        "candidate_tq_codebook_bytes": 0,
+        "candidate_tq_codebook_bytes": candidate_codebook.nbytes,
         "control_persistent_cache_bytes": control_persistent_cache_bytes,
         "candidate_persistent_cache_bytes": candidate_persistent_cache_bytes,
         "gross_persistent_cache_savings_bytes": gross_persistent_cache_savings_bytes,

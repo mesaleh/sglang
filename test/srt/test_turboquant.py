@@ -1770,11 +1770,11 @@ class TestTurboQuantGPU(unittest.TestCase):
         from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
 
         torch.manual_seed(20260728)
-        tokens = 11
-        pool_size = 48
+        tokens = 128
+        pool_size = 192
         lora_rank = 512
         rope_dim = 64
-        loc = torch.tensor([1, 3, 7, 8, 13, 17, 19, 26, 31, 38, 45], device=self.device)
+        loc = torch.randperm(pool_size, device=self.device)[:tokens].to(torch.int64)
         cache = torch.randn(
             tokens,
             1,
@@ -1805,9 +1805,11 @@ class TestTurboQuantGPU(unittest.TestCase):
                 )
 
         full_pool = make_pool(tokens)
-        chunked_pool = make_pool(4)
-        strided_loc_pool = make_pool(4)
-        strided_loc_fallback_pool = make_pool(4)
+        # A 31-row workspace forces five chunks (31/31/31/31/4), exercising
+        # both full boundaries and a trailing partial chunk for q128 prefill.
+        chunked_pool = make_pool(31)
+        strided_loc_pool = make_pool(31)
+        strided_loc_fallback_pool = make_pool(31)
         with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(True):
             with envs.SGLANG_TQ_MLA_FUSED_ROPE_WRITE.override(True):
                 full_pool.set_kv_buffer(layer, loc, cache, cache)
@@ -1839,7 +1841,7 @@ class TestTurboQuantGPU(unittest.TestCase):
                 layer, strided_loc, cache[: strided_loc.numel()], cache
             )
 
-        self.assertEqual(chunked_pool._fused_kv_write_chunk_capacity(), 4)
+        self.assertEqual(chunked_pool._fused_kv_write_chunk_capacity(), 31)
         torch.testing.assert_close(
             chunked_pool.kv_nope_packed_buffer[0],
             full_pool.kv_nope_packed_buffer[0],
@@ -2753,6 +2755,39 @@ class TestTurboQuantGPU(unittest.TestCase):
         pool.move_kv_cache(dst, src)
         torch.testing.assert_close(pool.kv_fp8_buffer[0][dst], expected_dense)
         torch.testing.assert_close(pool.kv_nope_packed_buffer[1][dst], expected_tq)
+
+    def test_mla_layerwise_codebook_allocates_only_selected_slots(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            pool = MLATokenToKVPoolTurboQuant(
+                size=64,
+                page_size=0,
+                dtype=torch.bfloat16,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=3,
+                device=self.device,
+                enable_memory_saver=False,
+                turboquant_bits=4,
+                turboquant_e2m1=True,
+                enable_fp8_codebook=True,
+                start_layer=10,
+                end_layer=13,
+                turboquant_layer_ids=(11,),
+            )
+
+        self.assertEqual(pool.get_per_token_all_layer_bytes(), 402 + 2 * 576)
+        self.assertEqual(pool.get_kv_size_bytes(), 64 * (402 + 2 * 576))
+        self.assertIsNotNone(pool.kv_nope_codebook_buffer)
+        self.assertIsNone(pool.kv_nope_codebook_buffer[0])
+        self.assertIsNotNone(pool.kv_nope_codebook_buffer[1])
+        self.assertIsNone(pool.kv_nope_codebook_buffer[2])
+        self.assertEqual(
+            tuple(pool.kv_nope_codebook_buffer[1].shape),
+            (64, 1, 16),
+        )
 
     def test_non_128_head_dim(self):
         """Verify TurboQuant works with head_dim=64 and head_dim=256."""

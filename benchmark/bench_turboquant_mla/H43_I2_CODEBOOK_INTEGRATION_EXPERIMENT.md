@@ -210,3 +210,17 @@ and again before any qualification or decision window.
   decision rules, rollback, evidence custody, and the CT13+CT14-only machine
   boundary. No unresolved issue remains. Verdict: `LGTM`; implementation is
   authorized.
+
+Implementation self-review:
+
+- Pass 1 isolated the PDL sensitivity variable to mutable cache state, made
+  sealed H43 AOT loading mandatory for reader-bearing tests, and introduced a
+  digest-bound prebuilt native extension path. Verdict: `CHANGES_REQUIRED`.
+- Pass 2 removed obsolete H41 timing logic, froze 20 x 100 paired execution and
+  allocation reversal in the producer, hardened prebuilt path/digest checks,
+  and compiled the extension successfully against the accepted image while
+  the endpoint remained healthy. Verdict: `CHANGES_REQUIRED`.
+- Pass 3 removed a stale analyzer arm reference, made telemetry validity a
+  recomputation from raw samples, froze exact evidence inventory, and passed
+  Python compilation, diff hygiene, and Black checks. Verdict: source-level
+  `LGTM`; GPU qualification and performance acceptance remain pending.
