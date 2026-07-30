@@ -348,7 +348,7 @@ def test_graph_replay(
         launch(inputs, locations, config, buffers, True, 8)
         torch.cuda.synchronize()
         eager_before = torch.cuda.memory_allocated(device)
-        for _ in range(100):
+        for _iteration in range(100):
             launch(inputs, locations, config, buffers, True, 8)
         torch.cuda.synchronize()
         eager_after = torch.cuda.memory_allocated(device)
@@ -359,19 +359,20 @@ def test_graph_replay(
         graph.replay()
         torch.cuda.synchronize()
         replay_before = torch.cuda.memory_allocated(device)
-        for _ in range(100):
+        for _iteration in range(100):
             graph.replay()
         torch.cuda.synchronize()
         replay_after = torch.cuda.memory_allocated(device)
         assert replay_after == replay_before
         expected = query_reference(inputs[0], inputs[1], config, True)
-        _, _, _, expected_codebook = writer_reference(
+        expected_codebook = writer_reference(
             inputs[2], inputs[3], locations, config, pool_size
-        )
+        )[3]
         assert torch.equal(raw_fp8(buffers.query), raw_fp8(expected))
         assert torch.equal(buffers.codebook[locations], expected_codebook[locations])
         assert int(buffers.status.item()) == 0
         assert_guards(buffers)
+        del expected, expected_codebook
 
 
 def test_invalid_sticky(

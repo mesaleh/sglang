@@ -27,6 +27,7 @@ class WriterExactSequenceDiagnostic(WriterAllocationDiagnostic):
                 "h40_contract",
                 "pdl_source_order",
                 "gpu_stage_surface",
+                "writer_test_cli",
             )
         } | {
             "diagnostic_cli": {

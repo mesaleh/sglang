@@ -78,6 +78,7 @@ MEMORY_CONTRACT = {
     "retained_fraction_of_no_codebook_gross_saving": 0.937008,
     "meets_old_ten_percent_target_kv_bar": False,
 }
+QUALIFICATION_FRONTEND_TEST = "test_h41_w2_frontend.py"
 
 
 def parse_args() -> argparse.Namespace:
@@ -151,6 +152,7 @@ class I2Qualification(h43.Campaign):
         self.source_manifest: list[dict[str, str]] = []
         self.source_manifest_digest = ""
         self.native_build_ninja = ""
+        self.qualification_frontend_test_sha256 = ""
         self.records: dict[str, dict[str, Any]] = {}
         self.reference_container_name = f"ct13-h43-i2-reference-{self.campaign}"
 
@@ -191,6 +193,12 @@ class I2Qualification(h43.Campaign):
             },
             "gpu_stage_surface": {
                 "timeout": 180,
+                "processes": 1,
+                "phase": "pre-outage",
+                "gpu_access": False,
+            },
+            "writer_test_cli": {
+                "timeout": 120,
                 "processes": 1,
                 "phase": "pre-outage",
                 "gpu_access": False,
@@ -531,6 +539,15 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
 
     def setup(self) -> None:
         super().setup()
+        test_path = Path(__file__).resolve().with_name(QUALIFICATION_FRONTEND_TEST)
+        test_payload = test_path.read_bytes()
+        self.qualification_frontend_test_sha256 = sha256_bytes(test_payload)
+        h43.write_remote_root_file(
+            self.host0,
+            f"{self.results}/{QUALIFICATION_FRONTEND_TEST}",
+            test_payload.decode("utf-8"),
+            "0444",
+        )
         self._run_preoutage_checks()
         timeout_evidence = {
             "schema_version": 1,
@@ -554,6 +571,9 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "sglang_source_manifest_digest": self.source_manifest_digest,
             "sglang_source_entries": len(self.source_manifest),
             "native_extension_sha256": I2_NATIVE_SHA256,
+            "qualification_frontend_test_sha256": (
+                self.qualification_frontend_test_sha256
+            ),
             "native_build_cache_files": NATIVE_CACHE_FILES,
             "native_build_ninja": self.native_build_ninja,
             "aot_preparation_sha256": I2_AOT_PREPARATION_SHA256,
@@ -569,6 +589,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                     "h40-contract",
                     "pdl-source-order",
                     "gpu-stage-surface",
+                    "writer-test-cli",
                 )
             },
         }
@@ -805,6 +826,21 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             timeout=180,
             expected_json_status="PASS",
         )
+        self._preoutage_run(
+            self.candidate,
+            "writer-test-cli",
+            [
+                "env",
+                "PYTHONPATH=/i2/python:/i2:/work:/results",
+                "python3",
+                f"/results/{QUALIFICATION_FRONTEND_TEST}",
+                "--help",
+            ],
+            timeout=120,
+        )
+        writer_test_help = self._read_remote_text("writer-test-cli.stdout.log")
+        if any(option not in writer_test_help for option in ("--mode", "--seed")):
+            raise RuntimeError("qualification writer test CLI is incomplete")
 
     def start_candidate(self) -> None:
         if (
@@ -1033,7 +1069,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             "writer-correctness",
             [
                 "python3",
-                "/i2/benchmark/bench_turboquant_mla/test_h41_w2_frontend.py",
+                f"/results/{QUALIFICATION_FRONTEND_TEST}",
                 "--mode",
                 "correctness",
             ],
@@ -1233,7 +1269,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
                 "--log-file",
                 f"/results/{log}",
                 "python3",
-                "/i2/benchmark/bench_turboquant_mla/test_h41_w2_frontend.py",
+                f"/results/{QUALIFICATION_FRONTEND_TEST}",
                 "--mode",
                 "sanitizer",
             ]
@@ -1566,6 +1602,9 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "candidate_image": self.candidate["image_id"],
             "reference_image": self.reference["image_id"],
             "native_extension_sha256": I2_NATIVE_SHA256,
+            "qualification_frontend_test_sha256": (
+                self.qualification_frontend_test_sha256
+            ),
             "native_build_cache_files": NATIVE_CACHE_FILES,
             "native_build_ninja": self.native_build_ninja,
             "aot_preparation": self.i2_preparation,

@@ -51,6 +51,7 @@ class WriterAllocationDiagnostic(I2Qualification):
                 "h40_contract",
                 "pdl_source_order",
                 "gpu_stage_surface",
+                "writer_test_cli",
             )
         } | {
             "diagnostic_cli": {
@@ -248,6 +249,9 @@ class WriterAllocationDiagnostic(I2Qualification):
             "tokenspeed_candidate_commit": self.candidate["commit"],
             "candidate_image": self.candidate["image_id"],
             "native_extension_sha256": I2_NATIVE_SHA256,
+            "qualification_frontend_test_sha256": (
+                self.qualification_frontend_test_sha256
+            ),
             "diagnostic_script_sha256": self.diagnostic_script_sha256,
             "memory_contract": MEMORY_CONTRACT,
             "arms": self.diagnostic_results,
