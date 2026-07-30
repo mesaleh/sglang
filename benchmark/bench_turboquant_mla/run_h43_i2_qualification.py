@@ -28,14 +28,16 @@ from run_h43_i2_aot_preparation import (
 I2_AOT_PREPARATION_SHA256 = (
     "dc1dd2b108b47953ceba170298f7cce4f1cbd3c8e05aa7162cc8a2e7d663dfb3"
 )
-NATIVE_CACHE_FILES = {
-    ".ninja_deps": "2b6e7434fd370d2de4940da464106382a92f68c1ecffeb41ee2dc878bb4f944e",
-    ".ninja_log": "b2595e97b0b69461403e1fc3622486f7cc066fe5c9d38d14b0fe5b9e2826ffc7",
-    "build.ninja": "c0e0a23779f07d6046ad490577ec9e20017e1175530bd5d2c1715e11eec2d76a",
-    "tq_mla_frontend_sm100.cuda.o": (
-        "fc8586d1730e3e4f1f4dacc7c8b89a89c3f50248072eea16e255332a13089c59"
-    ),
-    "sglang_tq_mla_frontend_sm100_h43_i2_v1.so": I2_NATIVE_SHA256,
+AOT_PREPARATION_SGLANG_COMMIT = "f443468c02b32d25472201a479a2fd064e347f08"
+AOT_PREPARATION_NATIVE_SHA256 = (
+    "e09f64bf5e169bf3f203ab673722e5721d3f459226a504c41393fd14cc1f0da7"
+)
+I2_PREPARATION_MANIFEST = f"{I2_PREPARATION}/manifest.json"
+I2_PREPARATION_MANIFEST_SHA256 = (
+    "8baad87e152ce37087170b3cba78992f477e202fdd466921cbb6ca6abc3570ee"
+)
+NATIVE_SEALED_FILES = {
+    "sglang_tq_mla_frontend_sm100_h43_i3_v2.so": I2_NATIVE_SHA256,
 }
 PINNED_READER_QUALIFICATION_SHA256 = (
     "1680b09493db8b066f37a1455e4076c47e5132b525bedf83f611c7af796de5e5"
@@ -80,6 +82,7 @@ MEMORY_CONTRACT = {
 }
 QUALIFICATION_FRONTEND_TEST = "test_h41_w2_frontend.py"
 QUALIFICATION_PDL_PROBE = "probe_h43_i2_pdl_ordering.py"
+SERVING_INTEGRATION_TEST = "test_h43_i3_serving_integration.py"
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,19 +155,20 @@ class I2Qualification(h43.Campaign):
         self.reader_ncu_proof: dict[str, Any] = {}
         self.source_manifest: list[dict[str, str]] = []
         self.source_manifest_digest = ""
-        self.native_build_ninja = ""
+        self.native_seal_attestation: dict[str, Any] = {}
         self.qualification_frontend_test_sha256 = ""
         self.qualification_pdl_probe_sha256 = ""
+        self.serving_integration_test_sha256 = ""
         self.records: dict[str, dict[str, Any]] = {}
         self.reference_container_name = f"ct13-h43-i2-reference-{self.campaign}"
 
     def maintenance_contract(self) -> tuple[dict[str, int], str]:
         return (
             {
-                "experiment": 3000,
-                "failsafe": 3060,
-                "alert": 3660,
-                "terminal": 4200,
+                "experiment": 1800,
+                "failsafe": 1860,
+                "alert": 3300,
+                "terminal": 3600,
             },
             "h43_i2_qualification",
         )
@@ -212,6 +216,7 @@ class I2Qualification(h43.Campaign):
                 "gpu_access": False,
             },
             "writer_correctness": {"timeout": 300, "observed_seconds": 54},
+            "serving_integration": {"timeout": 300, "processes": 1},
             "lifecycle": {"timeout": 300, "basis": "six focused unit methods"},
             "roundtrip_each": {"timeout": 300, "processes": 5},
             "integrated_smoke_each": {"timeout": 900, "processes": 2},
@@ -268,8 +273,9 @@ class I2Qualification(h43.Campaign):
         if (
             value.get("status") != "PASS"
             or value.get("experiment") != "H43_I2_AOT_PREPARATION"
-            or value.get("sglang_commit") != I2_COMMIT
-            or value.get("native_extension_sha256") != I2_NATIVE_SHA256
+            or value.get("sglang_commit") != AOT_PREPARATION_SGLANG_COMMIT
+            or value.get("native_extension_sha256")
+            != AOT_PREPARATION_NATIVE_SHA256
         ):
             raise ValueError("H43 I2 AOT preparation result is not the sealed PASS")
         for identity in (self.candidate, self.reference):
@@ -429,7 +435,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         )
 
     def _validate_remote_i2_artifacts(self) -> None:
-        for path in (I2_SOURCE, I2_NATIVE_SO):
+        for path in (I2_SOURCE, I2_NATIVE_SO, I2_PREPARATION_MANIFEST):
             h43.remote(self.host0, ["test", "!", "-L", path], timeout=30)
         native_digest = h43.remote(
             self.host0, ["sha256sum", I2_NATIVE_SO], timeout=60
@@ -443,28 +449,28 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                 [
                     "bash",
                     "-lc",
-                    f"cd {shlex.quote(I2_NATIVE_DIR)} && sha256sum -- * .ninja_deps .ninja_log",
+                    f"cd {shlex.quote(I2_NATIVE_DIR)} && sha256sum -- *",
                 ],
                 timeout=120,
             ).stdout.splitlines()
             if line.strip()
         }
-        if observed_native_files != NATIVE_CACHE_FILES:
-            raise ValueError("sealed H43 I2 native build-cache inventory changed")
-        self.native_build_ninja = h43.remote(
-            self.host0, ["cat", f"{I2_NATIVE_DIR}/build.ninja"], timeout=60
+        if observed_native_files != NATIVE_SEALED_FILES:
+            raise ValueError("sealed H43 I2 native inventory changed")
+        manifest_payload = h43.remote(
+            self.host0, ["cat", I2_PREPARATION_MANIFEST], timeout=60
         ).stdout
-        required_build_fragments = (
-            "nvcc = /usr/local/cuda/bin/nvcc",
-            "-O3 -lineinfo -gencode=arch=compute_100,code=sm_100",
-            "build tq_mla_frontend_sm100.cuda.o: cuda_compile",
-            "build sglang_tq_mla_frontend_sm100_h43_i2_v1.so: link",
-        )
-        if any(
-            fragment not in self.native_build_ninja
-            for fragment in required_build_fragments
+        if sha256_bytes(manifest_payload.encode()) != I2_PREPARATION_MANIFEST_SHA256:
+            raise ValueError("sealed H43 I3 preparation manifest changed")
+        manifest = json.loads(manifest_payload)
+        if (
+            manifest.get("sealed") is not True
+            or manifest.get("sglang", {}).get("commit") != I2_COMMIT
+            or manifest.get("native", {}).get("sha256") != I2_NATIVE_SHA256
+            or manifest.get("native", {}).get("gpu_qualified") is not False
         ):
-            raise ValueError("sealed native compiler command is incomplete")
+            raise ValueError("sealed H43 I3 preparation attestation is invalid")
+        self.native_seal_attestation = manifest
         writable = h43.remote(
             self.host0,
             [
@@ -553,6 +559,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                 "qualification_frontend_test_sha256",
             ),
             (QUALIFICATION_PDL_PROBE, "qualification_pdl_probe_sha256"),
+            (SERVING_INTEGRATION_TEST, "serving_integration_test_sha256"),
         )
         for filename, digest_attribute in qualification_files:
             path = Path(__file__).resolve().with_name(filename)
@@ -591,14 +598,17 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                 self.qualification_frontend_test_sha256
             ),
             "qualification_pdl_probe_sha256": self.qualification_pdl_probe_sha256,
+            "serving_integration_test_sha256": (
+                self.serving_integration_test_sha256
+            ),
             "pdl_conformance_contract": {
                 "producer_explicit_trigger": False,
                 "reference_overlap_is_opportunistic": True,
                 "candidate_mismatched_steps_required": 0,
                 "ordered_control_mismatches_required": 0,
             },
-            "native_build_cache_files": NATIVE_CACHE_FILES,
-            "native_build_ninja": self.native_build_ninja,
+            "native_sealed_files": NATIVE_SEALED_FILES,
+            "native_seal_attestation": self.native_seal_attestation,
             "aot_preparation_sha256": I2_AOT_PREPARATION_SHA256,
             "aot_preparation": self.i2_preparation,
             "pinned_reader_ncu": self.reader_ncu_proof,
@@ -653,7 +663,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "--env",
             f"H43_INSTALLED_MLA_SHA256={identity['installed_mla_sha256']}",
             "--env",
-            "SGLANG_TQ_MLA_FRONTEND_SO=/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so",
+            "SGLANG_TQ_MLA_FRONTEND_SO=/native/sglang_tq_mla_frontend_sm100_h43_i3_v2.so",
             "--env",
             f"SGLANG_TQ_MLA_FRONTEND_SO_SHA256={I2_NATIVE_SHA256}",
         ]
@@ -781,7 +791,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         if (
             value is None
             or value.get("module_path")
-            != "/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so"
+            != "/native/sglang_tq_mla_frontend_sm100_h43_i3_v2.so"
             or value.get("module_sha256") != I2_NATIVE_SHA256
         ):
             raise RuntimeError(
@@ -1163,6 +1173,32 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
         if "Ran 6 tests" not in lifecycle or not re.search(r"(?m)^OK$", lifecycle):
             raise RuntimeError("lifecycle suite did not report six passing tests")
 
+    def _run_serving_integration(self) -> None:
+        value = self._candidate(
+            "serving-integration",
+            [
+                "env",
+                "PYTHONPATH=/i2/python:/i2:/work:/results",
+                "python3",
+                f"/results/{SERVING_INTEGRATION_TEST}",
+            ],
+            timeout=300,
+            expected_json_status="PASS",
+        )
+        expected = {
+            "decode_q1": "PASS",
+            "target_verify_q5": "PASS",
+            "noncontiguous_projection_view": "PASS",
+            "prefill_writer": "PASS",
+            "absorbed_mla_path": "PASS",
+            "sticky_fault_status": "PASS",
+        }
+        if value is None or any(
+            value.get(key) != expected_value
+            for key, expected_value in expected.items()
+        ):
+            raise RuntimeError("production-call-chain integration gate failed")
+
     def _run_roundtrip_and_pdl(self) -> None:
         for context, split in ((10219, 64), (37932, 40)):
             for q_len in (1, 5):
@@ -1487,7 +1523,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             [
                 "cuobjdump",
                 "--dump-resource-usage",
-                "/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so",
+                "/native/sglang_tq_mla_frontend_sm100_h43_i3_v2.so",
             ],
             timeout=60,
             check=False,
@@ -1546,7 +1582,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             raise RuntimeError("candidate container is absent")
         before = self._cache_manifest_in_candidate()
         native_before = self.exec_candidate(
-            ["sha256sum", "/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so"],
+            ["sha256sum", "/native/sglang_tq_mla_frontend_sm100_h43_i3_v2.so"],
             timeout=60,
         ).stdout.split()[0]
         observed = h43.remote(
@@ -1581,7 +1617,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
         )
         after = self._cache_manifest_in_candidate()
         native_after = self.exec_candidate(
-            ["sha256sum", "/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so"],
+            ["sha256sum", "/native/sglang_tq_mla_frontend_sm100_h43_i3_v2.so"],
             timeout=60,
         ).stdout.split()[0]
         expected = self.i2_preparation["caches"]["candidate"]["artifact_digest"]
@@ -1614,6 +1650,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
         self._assert_no_compute_process("idle-after-candidate-start")
         self._sample_idle_gpu("qualification-gpu-start")
         self._run_writer_correctness_and_lifecycle()
+        self._run_serving_integration()
         self._run_roundtrip_and_pdl()
         self._run_writer_delta()
         self._run_integrated_smoke()
@@ -1685,8 +1722,11 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                 self.qualification_frontend_test_sha256
             ),
             "qualification_pdl_probe_sha256": self.qualification_pdl_probe_sha256,
-            "native_build_cache_files": NATIVE_CACHE_FILES,
-            "native_build_ninja": self.native_build_ninja,
+            "serving_integration_test_sha256": (
+                self.serving_integration_test_sha256
+            ),
+            "native_sealed_files": NATIVE_SEALED_FILES,
+            "native_seal_attestation": self.native_seal_attestation,
             "aot_preparation": self.i2_preparation,
             "pinned_reader_ncu": self.reader_ncu_proof,
             "writer_ncu": writer_ncu,
