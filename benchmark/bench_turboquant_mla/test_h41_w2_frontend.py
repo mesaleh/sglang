@@ -596,7 +596,7 @@ def test_wrapper_rejections(
     )[..., ::2]
     expect_error(
         lambda: invoke((noncontiguous, *inputs[1:])),
-        "non-overlapping contiguous last dimension",
+        "non-overlapping token/head rows and a contiguous last dimension",
     )
     expect_error(lambda: invoke((inputs[0].float(), *inputs[1:])), "must be bfloat16")
     expect_error(lambda: invoke(changed_locations=locations.int()), "must be int64")
