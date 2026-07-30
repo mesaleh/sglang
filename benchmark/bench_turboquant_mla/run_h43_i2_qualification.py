@@ -79,6 +79,7 @@ MEMORY_CONTRACT = {
     "meets_old_ten_percent_target_kv_bar": False,
 }
 QUALIFICATION_FRONTEND_TEST = "test_h41_w2_frontend.py"
+QUALIFICATION_PDL_PROBE = "probe_h43_i2_pdl_ordering.py"
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +154,7 @@ class I2Qualification(h43.Campaign):
         self.source_manifest_digest = ""
         self.native_build_ninja = ""
         self.qualification_frontend_test_sha256 = ""
+        self.qualification_pdl_probe_sha256 = ""
         self.records: dict[str, dict[str, Any]] = {}
         self.reference_container_name = f"ct13-h43-i2-reference-{self.campaign}"
 
@@ -539,15 +541,23 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
 
     def setup(self) -> None:
         super().setup()
-        test_path = Path(__file__).resolve().with_name(QUALIFICATION_FRONTEND_TEST)
-        test_payload = test_path.read_bytes()
-        self.qualification_frontend_test_sha256 = sha256_bytes(test_payload)
-        h43.write_remote_root_file(
-            self.host0,
-            f"{self.results}/{QUALIFICATION_FRONTEND_TEST}",
-            test_payload.decode("utf-8"),
-            "0444",
+        qualification_files = (
+            (
+                QUALIFICATION_FRONTEND_TEST,
+                "qualification_frontend_test_sha256",
+            ),
+            (QUALIFICATION_PDL_PROBE, "qualification_pdl_probe_sha256"),
         )
+        for filename, digest_attribute in qualification_files:
+            path = Path(__file__).resolve().with_name(filename)
+            payload = path.read_bytes()
+            setattr(self, digest_attribute, sha256_bytes(payload))
+            h43.write_remote_root_file(
+                self.host0,
+                f"{self.results}/{filename}",
+                payload.decode("utf-8"),
+                "0444",
+            )
         self._run_preoutage_checks()
         timeout_evidence = {
             "schema_version": 1,
@@ -574,6 +584,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "qualification_frontend_test_sha256": (
                 self.qualification_frontend_test_sha256
             ),
+            "qualification_pdl_probe_sha256": self.qualification_pdl_probe_sha256,
             "native_build_cache_files": NATIVE_CACHE_FILES,
             "native_build_ninja": self.native_build_ninja,
             "aot_preparation_sha256": I2_AOT_PREPARATION_SHA256,
@@ -801,8 +812,8 @@ grep -Fq -- '--mode' <<<"$help"
 test -f /i2/benchmark/bench_turboquant_mla/test_h41_i1_roundtrip.py
 help=$(python3 /i2/benchmark/bench_turboquant_mla/test_h41_i1_roundtrip.py --help)
 for option in --context --q-len --split-kv; do grep -Fq -- "$option" <<<"$help"; done
-test -f /i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py
-help=$(python3 /i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py --help)
+test -f /results/probe_h43_i2_pdl_ordering.py
+help=$(PYTHONPATH=/i2/python:/i2:/work:/results python3 /results/probe_h43_i2_pdl_ordering.py --help)
 for option in --context --q-len --split-kv --steps --reader; do grep -Fq -- "$option" <<<"$help"; done
 test -f /i2/benchmark/bench_turboquant_mla/bench_h43_i2_writer_delta.py
 help=$(python3 /i2/benchmark/bench_turboquant_mla/bench_h43_i2_writer_delta.py --help)
@@ -1138,7 +1149,7 @@ printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
             for q_len in (1, 5):
                 common = [
                     "python3",
-                    "/i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py",
+                    f"/results/{QUALIFICATION_PDL_PROBE}",
                     "--context",
                     str(context),
                     "--q-len",

@@ -7,6 +7,8 @@ import json
 import math
 
 import torch
+import triton
+import triton.language as tl
 
 from h43_aot_loader import install_h43_aot_from_environment
 from sglang.jit_kernel.tq_mla_frontend import tq_mla_frontend_out
@@ -22,6 +24,33 @@ PAGE = 32
 CACHE_ROWS = 256_000
 CACHE_PAGES = CACHE_ROWS // PAGE
 FP8 = torch.float8_e4m3fn
+HAZARD_BLOCK = 1024
+HAZARD_DELAY_ITERATIONS = 4096
+
+
+@triton.jit
+def early_trigger_codebook_writer(
+    codebook,
+    scratch,
+    value,
+    delay_iterations,
+    n_elements: tl.constexpr,
+    block: tl.constexpr,
+    programs: tl.constexpr,
+):
+    """Release the PDL successor, then overwrite the mutable codebook."""
+    tl.extra.cuda.gdc_launch_dependents()
+    program = tl.program_id(0)
+    offsets = program * block + tl.arange(0, block)
+    # Keep the small-resource producer resident after every CTA has released
+    # its successor.  The changing stores prevent dead-code elimination and
+    # give the pre-wait reader a deterministic window to consume stale state.
+    for iteration in range(delay_iterations):
+        tl.store(scratch + offsets, iteration)
+    iterations: tl.constexpr = tl.cdiv(n_elements, block * programs)
+    for iteration in range(iterations):
+        positions = offsets + iteration * block * programs
+        tl.store(codebook + positions, value, mask=positions < n_elements)
 
 
 def main() -> None:
@@ -42,6 +71,7 @@ def main() -> None:
     torch.cuda.set_device(device)
     if torch.cuda.get_device_capability(device) != (10, 0):
         raise RuntimeError("H43 I2 PDL ordering requires SM100")
+    hazard_programs = torch.cuda.get_device_properties(device).multi_processor_count
     generator = torch.Generator(device=device).manual_seed(args.seed)
     page_generator = torch.Generator(device=device).manual_seed(args.seed + 1)
     config = TurboQuantConfig(
@@ -112,6 +142,9 @@ def main() -> None:
     status = torch.zeros(1, dtype=torch.int32, device=device)
     pdl_workspace = torch.empty(64 << 20, dtype=torch.int8, device=device)
     ordered_workspace = torch.empty_like(pdl_workspace)
+    hazard_scratch = torch.empty(
+        hazard_programs * HAZARD_BLOCK, dtype=torch.uint8, device=device
+    )
     pdl_output = torch.empty(
         1, args.q_len, HEADS, LATENT, dtype=torch.bfloat16, device=device
     )
@@ -166,8 +199,26 @@ def main() -> None:
             fp8_rope=True,
         )
 
+    def hazard_writer(variant: int) -> None:
+        # FP8 E4M3 encodes +1.0 as 0x38 and -1.0 as 0xb8.  Writing the same
+        # value to every centroid makes the ordered attention output exactly
+        # +1 or -1, so the positive control remains visible after BF16 output
+        # rounding even at the 37,932-token qualification context.
+        value = 0x38 if variant == 0 else 0xB8
+        early_trigger_codebook_writer[(hazard_programs,)](
+            codebook,
+            hazard_scratch,
+            value,
+            HAZARD_DELAY_ITERATIONS,
+            n_elements=codebook.numel(),
+            block=HAZARD_BLOCK,
+            programs=hazard_programs,
+            num_warps=4,
+        )
+
     # Compile both dispatch keys before the unsynchronized sensitivity loop.
     writer(0)
+    hazard_writer(0)
     reader(pdl_output, pdl_workspace, True)
     reader(ordered_output, ordered_workspace, False)
     torch.cuda.synchronize()
@@ -178,6 +229,7 @@ def main() -> None:
     ordered_history = torch.empty_like(pdl_history)
     for step in range(args.steps):
         writer(step & 1)
+        hazard_writer(step & 1)
         reader(pdl_output, pdl_workspace, True)
         pdl_history[step].copy_(pdl_output)
         reader(ordered_output, ordered_workspace, False)
@@ -194,6 +246,7 @@ def main() -> None:
     control_b = torch.empty_like(ordered_history)
     for step in range(args.steps):
         writer(step & 1)
+        hazard_writer(step & 1)
         reader(ordered_output, ordered_workspace, False)
         control_a[step].copy_(ordered_output)
         reader(ordered_output, ordered_workspace, False)
@@ -220,6 +273,9 @@ def main() -> None:
                 "q_len": args.q_len,
                 "split_kv": args.split_kv,
                 "steps": args.steps,
+                "hazard_bytes_per_step": codebook.numel(),
+                "hazard_programs": hazard_programs,
+                "hazard_delay_iterations": HAZARD_DELAY_ITERATIONS,
                 "mismatched_steps": mismatched_steps,
                 "mismatched_values": mismatched_values,
                 "ordered_control_mismatches": ordered_control_mismatches,
