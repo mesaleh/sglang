@@ -131,12 +131,23 @@ __device__ __forceinline__ void write_query_head(
     const int64_t query_token_stride, const int64_t query_head_stride,
     const int64_t query_rope_token_stride,
     const int64_t query_rope_head_stride) {
-  const int64_t latent_base =
-      static_cast<int64_t>(token) * query_token_stride +
-      static_cast<int64_t>(head) * query_head_stride;
-  const int64_t rope_base =
-      static_cast<int64_t>(token) * query_rope_token_stride +
-      static_cast<int64_t>(head) * query_rope_head_stride;
+  int64_t latent_base;
+  int64_t rope_base;
+  if constexpr (kRotationFused) {
+    // The serving specialization consumes head-major or padded production
+    // views, so it must retain their runtime strides.
+    latent_base = static_cast<int64_t>(token) * query_token_stride +
+                  static_cast<int64_t>(head) * query_head_stride;
+    rope_base = static_cast<int64_t>(token) * query_rope_token_stride +
+                static_cast<int64_t>(head) * query_rope_head_stride;
+  } else {
+    // Keep the non-rotated diagnostic specialization contiguous so nvcc can
+    // fold these bases and preserve the qualified W8 register envelope.
+    latent_base =
+        (static_cast<int64_t>(token) * kQueryHeads + head) * kLatentDim;
+    rope_base =
+        (static_cast<int64_t>(token) * kQueryHeads + head) * kRopeDim;
+  }
   const int64_t out_base =
       (static_cast<int64_t>(token) * kQueryHeads + head) * kQueryDim;
 
@@ -183,7 +194,7 @@ __device__ __forceinline__ void write_query_head(
                      bf16_to_float(query_rope[rope_base + rope_index + 1]));
 }
 
-template <bool kStrict, bool kWriteCodebook>
+template <bool kRotationFused, bool kStrict, bool kWriteCodebook>
 __device__ __forceinline__ void write_cache_row(
     const __nv_bfloat16* cache_latent, const __nv_bfloat16* cache_rope,
     const int64_t* locations, const float* signs1, const float* signs2,
@@ -262,8 +273,12 @@ __device__ __forceinline__ void write_cache_row(
     scale_cache[slot] = rounded_scale;
   }
 
-  const int64_t rope_src_base =
-      static_cast<int64_t>(token) * cache_rope_token_stride;
+  int64_t rope_src_base;
+  if constexpr (kRotationFused) {
+    rope_src_base = static_cast<int64_t>(token) * cache_rope_token_stride;
+  } else {
+    rope_src_base = static_cast<int64_t>(token) * kRopeDim;
+  }
   const int64_t rope_dst_base = slot * kRopeDim;
   const int rope_index = lane * 2;
   *reinterpret_cast<__nv_fp8x2_storage_t*>(rope_cache + rope_dst_base +
@@ -312,7 +327,7 @@ __global__ void tq_mla_frontend_kernel(
   }
 
   if (warp == 0) {
-    write_cache_row<kStrict, kWriteCodebook>(
+    write_cache_row<kRotationFused, kStrict, kWriteCodebook>(
         cache_latent, cache_rope, locations, signs1, signs2, boundaries,
         quant_centroids, storage_code_lut, decode_centroids, packed_cache,
         scale_cache, rope_cache, codebook_cache, fault_status, token,
@@ -543,6 +558,12 @@ void tq_mla_frontend_out(
   TORCH_CHECK(has_non_overlapping_row_layout(cache_rope),
               "cache_rope must have non-overlapping token/head rows and a "
               "contiguous last dimension");
+  if (!rotation_fused) {
+    TORCH_CHECK(query_latent.is_contiguous() && query_rope.is_contiguous() &&
+                    cache_rope.is_contiguous(),
+                "non-rotated H43 frontend requires contiguous query and RoPE "
+                "inputs");
+  }
   TORCH_CHECK(locations.dim() == 1 && locations.size(0) == tokens,
               "locations must have shape (T,)");
   TORCH_CHECK(signs1.dim() == 1 && signs1.size(0) == kLatentDim,

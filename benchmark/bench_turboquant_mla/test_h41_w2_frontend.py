@@ -566,6 +566,7 @@ def test_wrapper_rejections(
         changed_decode_centroids=config.k_centroids,
         changed_codebook=buffers.codebook,
         warps=8,
+        rotation_fused=True,
     ) -> None:
         query_latent, query_rope, cache_latent, cache_rope = changed_inputs
         tq_mla_frontend_out(
@@ -587,7 +588,7 @@ def test_wrapper_rejections(
             decode_centroids=changed_decode_centroids,
             codebook_cache=changed_codebook,
             scale_multiplier=config.k_dequant_scale_multiplier,
-            rotation_fused=True,
+            rotation_fused=rotation_fused,
             num_warps=warps,
         )
 
@@ -597,6 +598,43 @@ def test_wrapper_rejections(
     expect_error(
         lambda: invoke((noncontiguous, *inputs[1:])),
         "non-overlapping token/head rows and a contiguous last dimension",
+    )
+    strided_query_latent = torch.empty(
+        1, HEADS, LATENT + 1, dtype=torch.bfloat16, device=device
+    )[..., :LATENT]
+    expect_error(
+        lambda: invoke(
+            (strided_query_latent, *inputs[1:]),
+            rotation_fused=False,
+        ),
+        "non-rotated H43 frontend requires contiguous query and RoPE inputs",
+    )
+    strided_query_rope = torch.empty(
+        1, HEADS, ROPE * 3, dtype=torch.bfloat16, device=device
+    )[..., -ROPE:]
+    expect_error(
+        lambda: invoke(
+            (inputs[0], strided_query_rope, *inputs[2:]),
+            rotation_fused=False,
+        ),
+        "non-rotated H43 frontend requires contiguous query and RoPE inputs",
+    )
+    inputs_t2 = make_inputs(2, device, generator, "random")
+    strided_cache_rope = torch.empty(
+        2, 1, ROPE + 1, dtype=torch.bfloat16, device=device
+    )[..., :ROPE]
+    buffers_t2 = allocate_guarded(2, 5, device)
+    locations_t2 = torch.tensor([1, 2], dtype=torch.int64, device=device)
+    expect_error(
+        lambda: launch(
+            (*inputs_t2[:3], strided_cache_rope),
+            locations_t2,
+            config,
+            buffers_t2,
+            rotation_fused=False,
+            warps=8,
+        ),
+        "non-rotated H43 frontend requires contiguous query and RoPE inputs",
     )
     expect_error(lambda: invoke((inputs[0].float(), *inputs[1:])), "must be bfloat16")
     expect_error(lambda: invoke(changed_locations=locations.int()), "must be int64")
