@@ -467,6 +467,16 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
 
     def validate_inputs(self) -> None:
         super().validate_inputs()
+        if (
+            h43.remote(
+                self.host0,
+                ["docker", "container", "inspect", self.reference_container_name],
+                timeout=30,
+                check=False,
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError("reference qualification container already exists")
         repository = self._validate_tooling_repository()
         self._validate_i2_preparation()
         self._validate_reader_ncu_pin()
@@ -752,9 +762,11 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         if pdl_source is None:
             raise RuntimeError("PDL source-order gate produced no result")
         surface_script = r"""set -euo pipefail
-command -v compute-sanitizer >/dev/null
-command -v ncu >/dev/null
-command -v cuobjdump >/dev/null
+help=$(compute-sanitizer --help)
+for option in --tool --error-exitcode --target-processes --report-api-errors --kernel-name --log-file; do grep -Fq -- "$option" <<<"$help"; done
+help=$(ncu --help)
+for option in --nvtx --metrics --csv --page --print-units --force-overwrite --nvtx-include --log-file --export; do grep -Fq -- "$option" <<<"$help"; done
+cuobjdump --help | grep -Fq -- --dump-resource-usage
 test -f /i2/benchmark/bench_turboquant_mla/test_h41_w2_frontend.py
 help=$(python3 /i2/benchmark/bench_turboquant_mla/test_h41_w2_frontend.py --help)
 grep -Fq -- '--mode' <<<"$help"
