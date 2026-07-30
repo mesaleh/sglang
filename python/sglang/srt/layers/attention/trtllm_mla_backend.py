@@ -1110,6 +1110,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         custom_mask: Optional[torch.Tensor] = None,
         custom_mask_offsets: Optional[torch.Tensor] = None,
+        forward_mode: Optional[ForwardMode] = None,
     ) -> torch.Tensor:
         """Hook for subclasses to swap the decode/spec-verify kernel.
 
@@ -1222,7 +1223,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             use_fp8_frontend = layer_frontend(layer, forward_batch)
         elif not use_fp8_frontend and getattr(self, "_tq4_hotcold_cache", False):
             use_fp8_frontend = self.should_use_hot_fp8_frontend(forward_batch)
-        if use_fp8_frontend:
+        prepared_fp8_query = bool(
+            use_fp8_frontend
+            and q.dtype == torch.float8_e4m3fn
+            and q_rope is None
+            and not save_kv_cache
+        )
+        if use_fp8_frontend and not prepared_fp8_query:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
@@ -1326,6 +1333,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             layer=layer,
             custom_mask=getattr(metadata, "custom_mask", None),
             custom_mask_offsets=getattr(metadata, "custom_mask_offsets", None),
+            forward_mode=forward_batch.forward_mode,
         )
 
         # Reshape output directly without slicing
@@ -1363,7 +1371,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             use_fp8_frontend = layer_frontend(layer, forward_batch)
         elif not use_fp8_frontend and getattr(self, "_tq4_hotcold_cache", False):
             use_fp8_frontend = self.should_use_hot_fp8_frontend(forward_batch)
-        if (use_fp8_frontend) and forward_batch.forward_mode.is_target_verify():
+        prepared_fp8_query = bool(
+            use_fp8_frontend
+            and q.dtype == torch.float8_e4m3fn
+            and q_rope is None
+            and not save_kv_cache
+        )
+        if (
+            use_fp8_frontend
+            and not prepared_fp8_query
+            and forward_batch.forward_mode.is_target_verify()
+        ):
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
@@ -1523,6 +1541,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 max_seq_len=max_seq_len,
                 layer=layer,
                 custom_mask=cmask,
+                forward_mode=forward_batch.forward_mode,
             )
 
             if needs_unpad:

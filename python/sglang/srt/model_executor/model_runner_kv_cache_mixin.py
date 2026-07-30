@@ -1021,6 +1021,15 @@ class ModelRunnerKVCacheMixin:
                     decode_backend,
                     getattr(self, "turboquant_e2m1", False),
                     envs.SGLANG_TQ_MLA_H43_FRONTEND.get(),
+                    is_draft_worker=self.is_draft_worker,
+                    disable_cuda_graph=(
+                        self.server_args.cuda_graph_config.decode.backend
+                        == Backend.DISABLED
+                    ),
+                    enable_two_batch_overlap=(
+                        self.server_args.enable_two_batch_overlap
+                    ),
+                    enable_pdmux=self.server_args.enable_pdmux,
                 )
                 if h43_frontend and hot_capacity_tokens > 0:
                     raise ValueError(

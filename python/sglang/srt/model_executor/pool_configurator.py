@@ -37,6 +37,7 @@ from sglang.srt.layers.quantization.kv_turboquant import (
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     ceil_align,
     ceil_div,
@@ -139,6 +140,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = mr.num_effective_layers
 
         self._fixed_size = 0
+        self._target_only_h43 = False
         self._cell_size = self._compute_cell_size(mr, num_layers)
 
         # EAGLE/STANDALONE: scale cell_size to account for draft model KV cache.
@@ -154,10 +156,23 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 and int(eagle_draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
-                self._cell_size = int(
-                    self._cell_size
-                    * (1 + int(eagle_draft_num_layers) / int(num_layers))
-                )
+                if self._target_only_h43:
+                    # H43 is intentionally disabled for the draft worker. Its
+                    # canonical E2M1 rows are 386 bytes when selected, while
+                    # non-selected rows remain FP8 (576 bytes). The target
+                    # runner cannot reliably map target-global layer IDs onto
+                    # every EAGLE draft architecture, so reserve the safe FP8
+                    # upper bound per draft layer instead of under-accounting
+                    # with the target's 338-byte H43 row.
+                    draft_row_bytes = (
+                        mr.model_config.kv_lora_rank + mr.model_config.qk_rope_head_dim
+                    )
+                    self._cell_size += int(eagle_draft_num_layers) * draft_row_bytes
+                else:
+                    self._cell_size = int(
+                        self._cell_size
+                        * (1 + int(eagle_draft_num_layers) / int(num_layers))
+                    )
 
         # DFLASH: scale cell_size to account for draft model KV cache
         if mr.spec_algorithm.is_dflash() and not mr.is_draft_worker:
@@ -218,7 +233,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     decode_backend,
                     getattr(mr, "turboquant_e2m1", False),
                     envs.SGLANG_TQ_MLA_H43_FRONTEND.get(),
+                    is_draft_worker=getattr(mr, "is_draft_worker", False),
+                    disable_cuda_graph=(
+                        getattr(
+                            getattr(
+                                getattr(mr.server_args, "cuda_graph_config", None),
+                                "decode",
+                                None,
+                            ),
+                            "backend",
+                            None,
+                        )
+                        == Backend.DISABLED
+                    ),
+                    enable_two_batch_overlap=getattr(
+                        mr.server_args, "enable_two_batch_overlap", False
+                    ),
+                    enable_pdmux=getattr(mr.server_args, "enable_pdmux", False),
                 )
+                self._target_only_h43 = h43_frontend
                 rope_bytes = rope if h43_frontend else rope * 2
                 codebook_bytes = 16 * should_allocate_mla_tq_fp8_codebook(
                     decode_backend,

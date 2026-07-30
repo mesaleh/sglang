@@ -36,8 +36,39 @@ def test_h43_frontend_gate_and_codebook_truth_table():
         should_use_mla_tq_h43_frontend("flashinfer", "tokenspeed_mla", True, True)
     with pytest.raises(ValueError, match="requires E2M1"):
         should_use_mla_tq_h43_frontend("tokenspeed_mla", "tokenspeed_mla", False, True)
+    with pytest.raises(ValueError, match="requires CUDA graph capture"):
+        should_use_mla_tq_h43_frontend(
+            "tokenspeed_mla",
+            "tokenspeed_mla",
+            True,
+            True,
+            disable_cuda_graph=True,
+        )
+    with pytest.raises(ValueError, match="does not support two-batch overlap"):
+        should_use_mla_tq_h43_frontend(
+            "tokenspeed_mla",
+            "tokenspeed_mla",
+            True,
+            True,
+            enable_two_batch_overlap=True,
+        )
+    with pytest.raises(ValueError, match="does not support PDMux"):
+        should_use_mla_tq_h43_frontend(
+            "tokenspeed_mla",
+            "tokenspeed_mla",
+            True,
+            True,
+            enable_pdmux=True,
+        )
     assert should_use_mla_tq_h43_frontend(
         "tokenspeed_mla", "tokenspeed_mla", True, True
+    )
+    assert not should_use_mla_tq_h43_frontend(
+        "fa4",
+        "fa4",
+        False,
+        True,
+        is_draft_worker=True,
     )
 
     assert not should_allocate_mla_tq_fp8_codebook("tokenspeed_mla", True)

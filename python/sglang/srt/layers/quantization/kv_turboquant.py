@@ -58,9 +58,16 @@ def should_use_mla_tq_h43_frontend(
     decode_backend: str,
     e2m1: bool,
     enabled: bool,
+    *,
+    is_draft_worker: bool = False,
+    disable_cuda_graph: bool = False,
+    enable_two_batch_overlap: bool = False,
+    enable_pdmux: bool = False,
 ) -> bool:
-    """Whether the default-off H43 E2M1 serving contract is selected."""
+    """Whether the target-only, default-off H43 serving contract is selected."""
     if not enabled:
+        return False
+    if is_draft_worker:
         return False
     if not e2m1:
         raise ValueError("H43 frontend requires E2M1 TurboQuant")
@@ -68,6 +75,12 @@ def should_use_mla_tq_h43_frontend(
         raise ValueError(
             "H43 frontend requires TokenSpeed MLA for both prefill and decode"
         )
+    if disable_cuda_graph:
+        raise ValueError("H43 frontend requires CUDA graph capture")
+    if enable_two_batch_overlap:
+        raise ValueError("H43 frontend does not support two-batch overlap")
+    if enable_pdmux:
+        raise ValueError("H43 frontend does not support PDMux")
     return True
 
 

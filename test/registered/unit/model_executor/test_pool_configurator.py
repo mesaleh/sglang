@@ -265,6 +265,26 @@ class TestDefaultConfigurator(unittest.TestCase):
                 num_layers,
             )
 
+        draft = _make_model_runner(use_mla_backend=True, num_layers=num_layers)
+        draft.is_draft_worker = True
+        draft.model_config.kv_lora_rank = 512
+        draft.model_config.qk_rope_head_dim = 64
+        draft.turboquant_bits = 4
+        draft.turboquant_k_bits = 4
+        draft.turboquant_e2m1 = True
+        draft.turboquant_mla_layer_ids = tuple(range(num_layers))
+        draft.server_args.get_attention_backends = lambda: (
+            "tokenspeed_mla",
+            "tokenspeed_mla",
+        )
+        with (
+            mock_cpu_env(kv_size=1),
+            envs.SGLANG_TQ_MLA_H43_FRONTEND.override(True),
+        ):
+            draft_configurator = DefaultPoolConfigurator(draft)
+        self.assertFalse(draft_configurator._target_only_h43)
+        self.assertEqual(draft_configurator._cell_size, 386 * num_layers)
+
     def test_mla_turboquant_n14_production_accounting(self):
         from sglang.srt.environ import envs
         from sglang.srt.model_executor.pool_configurator import (
@@ -317,6 +337,35 @@ class TestDefaultConfigurator(unittest.TestCase):
                 configurator._cell_size * pool_tokens,
                 expected_rank_bytes,
             )
+
+    def test_h43_rejects_resolved_disabled_decode_graph_backend(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        mr = _make_model_runner(use_mla_backend=True, num_layers=1)
+        mr.model_config.kv_lora_rank = 512
+        mr.model_config.qk_rope_head_dim = 64
+        mr.turboquant_bits = 4
+        mr.turboquant_k_bits = 4
+        mr.turboquant_e2m1 = True
+        mr.turboquant_mla_layer_ids = (0,)
+        mr.server_args.get_attention_backends = lambda: (
+            "tokenspeed_mla",
+            "tokenspeed_mla",
+        )
+        mr.server_args.cuda_graph_config = SimpleNamespace(
+            decode=SimpleNamespace(backend=Backend.DISABLED)
+        )
+
+        with (
+            mock_cpu_env(kv_size=1),
+            envs.SGLANG_TQ_MLA_H43_FRONTEND.override(True),
+            self.assertRaisesRegex(ValueError, "requires CUDA graph capture"),
+        ):
+            DefaultPoolConfigurator(mr)
 
 
 class TestHybridSWAConfigurator(unittest.TestCase):
@@ -646,6 +695,42 @@ class TestEagleConfigurator(unittest.TestCase):
         total_layers = num_layers + eagle_draft_num_layers
         used = config.max_total_num_tokens * full_pt * total_layers
         self.assertLessEqual(used, available)
+
+    def test_h43_reserves_non_h43_draft_upper_bound(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.model_executor.pool_configurator import (
+            DefaultPoolConfigurator,
+        )
+
+        num_layers = 61
+        draft_layers = 4
+        mr = _make_model_runner(use_mla_backend=True, num_layers=num_layers)
+        mr.model_config.kv_lora_rank = 512
+        mr.model_config.qk_rope_head_dim = 64
+        mr.turboquant_bits = 4
+        mr.turboquant_k_bits = 4
+        mr.turboquant_e2m1 = True
+        mr.turboquant_mla_layer_ids = tuple(range(24, 38))
+        mr.server_args.get_attention_backends = lambda: (
+            "tokenspeed_mla",
+            "tokenspeed_mla",
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.eagle_draft_num_layers = draft_layers
+
+        with (
+            mock_cpu_env(kv_size=1),
+            envs.SGLANG_TQ_MLA_H43_FRONTEND.override(True),
+        ):
+            configurator = DefaultPoolConfigurator(mr)
+
+        target_bytes = 14 * 338 + 47 * 576
+        self.assertTrue(configurator._target_only_h43)
+        self.assertEqual(
+            configurator._cell_size,
+            target_bytes + draft_layers * 576,
+        )
 
 
 class TestFactory(unittest.TestCase):

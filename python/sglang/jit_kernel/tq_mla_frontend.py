@@ -113,6 +113,43 @@ def preload_tq_mla_frontend_prebuilt() -> None:
             _MODULE_PREBUILT = True
 
 
+def get_tq_mla_frontend_module_attestation() -> dict[str, object]:
+    """Return module state without loading or compiling the native extension."""
+
+    with _MODULE_LOCK:
+        module = _MODULE
+        prebuilt = _MODULE_PREBUILT
+    if module is None:
+        return {
+            "native_loaded": False,
+            "native_prebuilt": False,
+            "native_path": None,
+            "native_sha256": None,
+        }
+
+    raw_path = getattr(module, "__file__", None)
+    if not raw_path:
+        return {
+            "native_loaded": True,
+            "native_prebuilt": prebuilt,
+            "native_path": None,
+            "native_sha256": None,
+        }
+    path = Path(raw_path)
+    safe_file = (
+        path.is_absolute()
+        and not path.is_symlink()
+        and path.resolve() == path
+        and path.is_file()
+    )
+    return {
+        "native_loaded": True,
+        "native_prebuilt": prebuilt,
+        "native_path": str(path) if safe_file else None,
+        "native_sha256": _sha256(path) if safe_file else None,
+    }
+
+
 def tq_mla_frontend_out(
     query_latent: torch.Tensor,
     query_rope: torch.Tensor,
@@ -232,6 +269,7 @@ def tq_mla_frontend(
 
 
 __all__ = [
+    "get_tq_mla_frontend_module_attestation",
     "preload_tq_mla_frontend_prebuilt",
     "tq_mla_frontend",
     "tq_mla_frontend_out",

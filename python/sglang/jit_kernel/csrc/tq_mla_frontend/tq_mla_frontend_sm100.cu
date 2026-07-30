@@ -128,12 +128,15 @@ __device__ __forceinline__ void write_query_head(
     const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
     const float* signs1, const float* signs2, uint8_t* query_out,
     const int token, const int head, const int lane,
-    const int64_t query_token_stride, const int64_t query_head_stride) {
+    const int64_t query_token_stride, const int64_t query_head_stride,
+    const int64_t query_rope_token_stride,
+    const int64_t query_rope_head_stride) {
   const int64_t latent_base =
       static_cast<int64_t>(token) * query_token_stride +
       static_cast<int64_t>(head) * query_head_stride;
   const int64_t rope_base =
-      (static_cast<int64_t>(token) * kQueryHeads + head) * kRopeDim;
+      static_cast<int64_t>(token) * query_rope_token_stride +
+      static_cast<int64_t>(head) * query_rope_head_stride;
   const int64_t out_base =
       (static_cast<int64_t>(token) * kQueryHeads + head) * kQueryDim;
 
@@ -188,7 +191,8 @@ __device__ __forceinline__ void write_cache_row(
     const uint8_t* storage_code_lut, const float* decode_centroids,
     uint8_t* packed_cache, __nv_bfloat16* scale_cache, uint8_t* rope_cache,
     uint8_t* codebook_cache, int32_t* fault_status, const int token,
-    const int64_t pool_size, const float scale_multiplier, const int lane) {
+    const int64_t pool_size, const float scale_multiplier,
+    const int64_t cache_rope_token_stride, const int lane) {
   const int64_t slot = locations[token];
   if (slot < 0 || slot >= pool_size) {
     if (lane == 0) {
@@ -258,7 +262,8 @@ __device__ __forceinline__ void write_cache_row(
     scale_cache[slot] = rounded_scale;
   }
 
-  const int64_t rope_src_base = static_cast<int64_t>(token) * kRopeDim;
+  const int64_t rope_src_base =
+      static_cast<int64_t>(token) * cache_rope_token_stride;
   const int64_t rope_dst_base = slot * kRopeDim;
   const int rope_index = lane * 2;
   *reinterpret_cast<__nv_fp8x2_storage_t*>(rope_cache + rope_dst_base +
@@ -290,7 +295,10 @@ __global__ void tq_mla_frontend_kernel(
     uint8_t* rope_cache, uint8_t* codebook_cache, int32_t* fault_status,
     const int64_t pool_size,
     const float scale_multiplier, const int64_t query_token_stride,
-    const int64_t query_head_stride) {
+    const int64_t query_head_stride,
+    const int64_t query_rope_token_stride,
+    const int64_t query_rope_head_stride,
+    const int64_t cache_rope_token_stride) {
   const int token = blockIdx.x;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
@@ -298,7 +306,9 @@ __global__ void tq_mla_frontend_kernel(
   for (int head = warp; head < kQueryHeads; head += kWarps) {
     write_query_head<kRotationFused>(query_latent, query_rope, signs1, signs2,
                                      query_out, token, head, lane,
-                                     query_token_stride, query_head_stride);
+                                     query_token_stride, query_head_stride,
+                                     query_rope_token_stride,
+                                     query_rope_head_stride);
   }
 
   if (warp == 0) {
@@ -306,7 +316,7 @@ __global__ void tq_mla_frontend_kernel(
         cache_latent, cache_rope, locations, signs1, signs2, boundaries,
         quant_centroids, storage_code_lut, decode_centroids, packed_cache,
         scale_cache, rope_cache, codebook_cache, fault_status, token,
-        pool_size, scale_multiplier, lane);
+        pool_size, scale_multiplier, cache_rope_token_stride, lane);
   }
 }
 
@@ -341,6 +351,31 @@ bool tensors_overlap(const torch::Tensor& lhs, const torch::Tensor& rhs) {
   const auto lhs_end = lhs_begin + tensor_span_bytes(lhs);
   const auto rhs_end = rhs_begin + tensor_span_bytes(rhs);
   return lhs_begin < rhs_end && rhs_begin < lhs_end;
+}
+
+bool has_non_overlapping_row_layout(const torch::Tensor& tensor) {
+  if (tensor.stride(2) != 1) {
+    return false;
+  }
+  const int64_t tokens = tensor.size(0);
+  const int64_t heads = tensor.size(1);
+  const int64_t width = tensor.size(2);
+  const int64_t token_stride = tensor.stride(0);
+  const int64_t head_stride = tensor.stride(1);
+  if (tokens <= 1 && heads <= 1) {
+    return true;
+  }
+  if (tokens <= 1) {
+    return head_stride >= width;
+  }
+  if (heads <= 1) {
+    return token_stride >= width;
+  }
+  const bool token_major =
+      head_stride >= width && token_stride >= heads * head_stride;
+  const bool head_major =
+      token_stride >= width && head_stride >= tokens * token_stride;
+  return token_major || head_major;
 }
 
 template <int kWarps, bool kRotationFused, bool kStrict, bool kWriteCodebook>
@@ -380,7 +415,9 @@ void launch_frontend(
           reinterpret_cast<uint8_t*>(rope_cache.data_ptr()),
           kWriteCodebook ? codebook_cache->data_ptr<uint8_t>() : nullptr,
           fault_status.data_ptr<int32_t>(), packed_cache.size(0),
-          scale_multiplier, query_latent.stride(0), query_latent.stride(1));
+          scale_multiplier, query_latent.stride(0), query_latent.stride(1),
+          query_rope.stride(0), query_rope.stride(1),
+          cache_rope.stride(0));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -400,9 +437,9 @@ void tq_mla_frontend_out(
     const double scale_multiplier, const bool rotation_fused,
     const int64_t num_warps, const bool strict) {
   TORCH_CHECK(query_latent.is_cuda(), "query_latent must be a CUDA tensor");
-  check_cuda_contiguous(query_rope, "query_rope");
+  TORCH_CHECK(query_rope.is_cuda(), "query_rope must be a CUDA tensor");
   check_cuda_contiguous(cache_latent, "cache_latent");
-  check_cuda_contiguous(cache_rope, "cache_rope");
+  TORCH_CHECK(cache_rope.is_cuda(), "cache_rope must be a CUDA tensor");
   check_cuda_contiguous(locations, "locations");
   check_cuda_contiguous(signs1, "signs1");
   check_cuda_contiguous(signs2, "signs2");
@@ -483,11 +520,9 @@ void tq_mla_frontend_out(
   TORCH_CHECK(query_latent.dim() == 3 && query_latent.size(1) == kQueryHeads &&
                   query_latent.size(2) == kLatentDim,
               "query_latent must have shape (T, 8, 512)");
-  TORCH_CHECK(query_latent.stride(2) == 1 &&
-                  query_latent.stride(1) >= kLatentDim &&
-                  query_latent.stride(0) >=
-                      kQueryHeads * query_latent.stride(1),
-              "query_latent must have a non-overlapping contiguous last dimension");
+  TORCH_CHECK(has_non_overlapping_row_layout(query_latent),
+              "query_latent must have non-overlapping token/head rows and a "
+              "contiguous last dimension");
   const int64_t tokens = query_latent.size(0);
   TORCH_CHECK(tokens <= std::numeric_limits<int>::max(),
               "token count exceeds the CUDA grid limit");
@@ -495,6 +530,9 @@ void tq_mla_frontend_out(
                   query_rope.size(1) == kQueryHeads &&
                   query_rope.size(2) == kRopeDim,
               "query_rope must have shape (T, 8, 64)");
+  TORCH_CHECK(has_non_overlapping_row_layout(query_rope),
+              "query_rope must have non-overlapping token/head rows and a "
+              "contiguous last dimension");
   TORCH_CHECK(cache_latent.dim() == 3 && cache_latent.size(0) == tokens &&
                   cache_latent.size(1) == 1 &&
                   cache_latent.size(2) == kLatentDim,
@@ -502,6 +540,9 @@ void tq_mla_frontend_out(
   TORCH_CHECK(cache_rope.dim() == 3 && cache_rope.size(0) == tokens &&
                   cache_rope.size(1) == 1 && cache_rope.size(2) == kRopeDim,
               "cache_rope must have shape (T, 1, 64)");
+  TORCH_CHECK(has_non_overlapping_row_layout(cache_rope),
+              "cache_rope must have non-overlapping token/head rows and a "
+              "contiguous last dimension");
   TORCH_CHECK(locations.dim() == 1 && locations.size(0) == tokens,
               "locations must have shape (T,)");
   TORCH_CHECK(signs1.dim() == 1 && signs1.size(0) == kLatentDim,

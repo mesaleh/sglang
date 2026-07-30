@@ -984,6 +984,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         self.prealloc_symmetric_memory_pool()
 
+        emit_h43_attestation = getattr(
+            self.attn_backend, "emit_h43_runtime_attestation", None
+        )
+        if emit_h43_attestation is not None:
+            emit_h43_attestation("post_cuda_graph")
+
         if self.canary_manager is not None and not self.is_draft_worker:
             self.canary_manager.mark_init_finished()
 
@@ -2679,6 +2685,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attn_backend.decode_attention_backend_str = (
             self.decode_attention_backend_str
         )
+        emit_h43_attestation = getattr(
+            self.attn_backend, "emit_h43_runtime_attestation", None
+        )
+        if emit_h43_attestation is not None:
+            emit_h43_attestation("init")
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         """Init attention kernel backend."""

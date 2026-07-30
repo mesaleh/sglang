@@ -22,12 +22,13 @@ from __future__ import annotations
 
 """Attention backend for the tokenspeed-mla CuTe DSL kernels on Blackwell.
 
-Subclasses :class:`TRTLLMMLABackend` and overrides only ``_run_decode_kernel``
-and ``_run_prefill_kernel``. All metadata, KV-cache layout, CUDA-graph
-plumbing, FP8 quantize/rope, draft-extend padding, and chunked-prefix
-dispatch are inherited unchanged from the parent.
+Subclasses :class:`TRTLLMMLABackend`, swaps its decode/prefill kernels, and
+provides an optional absorbed-MLA frontend hook. Metadata, KV-cache layout,
+CUDA-graph plumbing, draft-extend padding, and chunked-prefix dispatch remain
+inherited from the parent.
 """
 
+import json
 import logging
 from inspect import signature
 from typing import TYPE_CHECKING, Optional
@@ -39,6 +40,7 @@ import triton.language as tl
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
 from sglang.jit_kernel.tq_mla_frontend import (
+    get_tq_mla_frontend_module_attestation,
     preload_tq_mla_frontend_prebuilt,
     tq_mla_frontend_out,
 )
@@ -86,6 +88,27 @@ def _find_mla_turboquant_pool(token_to_kv_pool):
     if getattr(wrapped_pool, "is_mla_turboquant_pool", False):
         return wrapped_pool
     return None
+
+
+def _validate_h43_frontend_activation(
+    enabled: bool, is_draft_worker: bool, num_q_heads: int
+) -> None:
+    if not enabled:
+        return
+    if is_draft_worker:
+        raise RuntimeError("H43 frontend is supported only on the target model")
+    if num_q_heads != 8:
+        raise RuntimeError(
+            "H43 frontend requires exactly 8 local query heads; " f"got {num_q_heads}"
+        )
+
+
+def _has_populated_tq_codebook(
+    codebook_buffer: Optional[list[Optional[torch.Tensor]]],
+) -> bool:
+    return codebook_buffer is not None and any(
+        value is not None for value in codebook_buffer
+    )
 
 
 def _tq4_split_override(batch_size: int, max_seq_len: int, num_sms: int) -> int:
@@ -284,19 +307,45 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             and getattr(self._tq_pool, "is_mla_turboquant_hotcold_pool", False)
         )
         self._tq_config = self._tq_pool.tq_config if self._tq4_cache else None
-        self._h43_frontend = bool(
-            self._tq4_cache and getattr(self._tq_pool, "enable_h43_frontend", False)
+        local_tq_layers = (
+            bool(getattr(self._tq_pool, "_tq_layer_ids_rel", ()))
+            if self._tq4_cache
+            else False
         )
+        if self._tq4_cache and not hasattr(self._tq_pool, "_tq_layer_ids_rel"):
+            local_tq_layers = any(
+                value is not None
+                for value in getattr(self._tq_pool, "kv_rope_buffer", ())
+            )
+        self._h43_frontend = bool(
+            self._tq4_cache
+            and local_tq_layers
+            and getattr(self._tq_pool, "enable_h43_frontend", False)
+        )
+        self._h43_frontend_dispatch_count = 0
+        self._h43_reader_dispatch_count = 0
+        self._h43_frontend_dispatches_by_mode: dict[str, int] = {}
+        self._h43_reader_dispatches_by_mode: dict[str, int] = {}
+        self._h43_frontend_query_dtypes: dict[str, int] = {}
+        self._h43_reader_query_dtypes: dict[str, int] = {}
+        self._h43_first_success_events: set[tuple[str, str]] = set()
+        self._h43_model_runner = model_runner
+        self._h43_is_draft_worker = bool(model_runner.is_draft_worker)
 
         if (
             self._tq4_cache
             and bool(getattr(self._tq_config, "e2m1", False))
-            and self._tq_pool.kv_nope_codebook_buffer is not None
+            and _has_populated_tq_codebook(self._tq_pool.kv_nope_codebook_buffer)
             and not self._h43_frontend
         ):
             raise RuntimeError(
                 "TokenSpeed E2M1 must not allocate the redundant FP8 lookup row"
             )
+        _validate_h43_frontend_activation(
+            self._h43_frontend,
+            self._h43_is_draft_worker,
+            self.num_q_heads,
+        )
         if self._h43_frontend:
             if not bool(getattr(self._tq_config, "e2m1", False)):
                 raise RuntimeError("H43 frontend requires E2M1 TurboQuant")
@@ -432,6 +481,282 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                             enable_ex2_emulation=enable_ex2_emulation,
                         )
 
+    def _h43_attestation_payload(self, phase: str) -> dict[str, object]:
+        pool = getattr(self, "_tq_pool", None)
+        tq_enabled = pool is not None
+        h43_enabled = bool(getattr(self, "_h43_frontend", False))
+        tq_config = getattr(self, "_tq_config", None)
+        e2m1 = bool(getattr(tq_config, "e2m1", False))
+
+        if tq_enabled:
+            start_layer = int(getattr(pool, "start_layer", 0))
+            layer_count = int(
+                getattr(
+                    pool,
+                    "layer_num",
+                    len(getattr(pool, "kv_rope_buffer", ())),
+                )
+            )
+            configured_ids = getattr(pool, "turboquant_layer_ids", None)
+            if configured_ids is None:
+                end_layer = int(
+                    getattr(
+                        pool,
+                        "end_layer",
+                        start_layer + layer_count,
+                    )
+                )
+                selected_layer_ids = tuple(range(start_layer, end_layer))
+            else:
+                end_layer = start_layer + layer_count
+                selected_layer_ids = tuple(
+                    sorted(
+                        int(i)
+                        for i in configured_ids
+                        if start_layer <= int(i) < end_layer
+                    )
+                )
+            codebook_buffer = getattr(pool, "kv_nope_codebook_buffer", None)
+            codebook_layer_ids = (
+                tuple(
+                    start_layer + i
+                    for i, value in enumerate(codebook_buffer)
+                    if value is not None
+                )
+                if codebook_buffer is not None
+                else ()
+            )
+            rope_buffer = getattr(pool, "kv_rope_buffer", ())
+            fp8_rope_layer_ids = tuple(
+                start_layer + i
+                for i, value in enumerate(rope_buffer)
+                if value is not None and value.dtype == torch.float8_e4m3fn
+            )
+            codebook_slots = len(codebook_layer_ids)
+            fp8_rope_slots = len(fp8_rope_layer_ids)
+            rope_item_bytes = 1 if fp8_rope_layer_ids else 2
+            selected_row_bytes = (
+                int(self.kv_lora_rank) // 2
+                + 2
+                + int(self.qk_rope_head_dim) * rope_item_bytes
+                + (16 if codebook_slots else 0)
+            )
+            get_pool_bytes = getattr(pool, "get_per_token_all_layer_bytes", None)
+            pool_all_layer_bytes = (
+                int(get_pool_bytes()) if callable(get_pool_bytes) else None
+            )
+            expected_pool_all_layer_bytes = selected_row_bytes * len(
+                selected_layer_ids
+            ) + (int(self.kv_lora_rank) + int(self.qk_rope_head_dim)) * (
+                layer_count - len(selected_layer_ids)
+            )
+        else:
+            selected_layer_ids = ()
+            codebook_layer_ids = ()
+            fp8_rope_layer_ids = ()
+            codebook_slots = 0
+            fp8_rope_slots = 0
+            selected_row_bytes = int(self.kv_lora_rank) + int(self.qk_rope_head_dim)
+            pool_all_layer_bytes = None
+            expected_pool_all_layer_bytes = None
+
+        frontend_fault_status = None
+        if h43_enabled and phase == "post_cuda_graph":
+            status = getattr(pool, "tq_mla_frontend_fault_status", None)
+            if status is None or status.numel() != 1:
+                raise RuntimeError("H43 attestation requires one sticky fault word")
+            frontend_fault_status = int(status.item())
+
+        runner = getattr(self, "_h43_model_runner", None)
+        payload: dict[str, object] = {
+            "schema": 1,
+            "phase": phase,
+            "tp_rank": int(getattr(runner, "tp_rank", -1)),
+            "pp_rank": int(getattr(runner, "pp_rank", -1)),
+            "gpu_id": int(getattr(runner, "gpu_id", -1)),
+            "draft_worker": bool(getattr(self, "_h43_is_draft_worker", False)),
+            "tq_enabled": tq_enabled,
+            "h43_enabled": h43_enabled,
+            "e2m1": e2m1,
+            "selected_layer_ids": list(selected_layer_ids),
+            "selected_layer_count": len(selected_layer_ids),
+            "selected_row_bytes": selected_row_bytes,
+            "pool_all_layer_bytes": pool_all_layer_bytes,
+            "expected_pool_all_layer_bytes": expected_pool_all_layer_bytes,
+            "codebook_layer_ids": list(codebook_layer_ids),
+            "codebook_slots": codebook_slots,
+            "fp8_rope_layer_ids": list(fp8_rope_layer_ids),
+            "fp8_rope_slots": fp8_rope_slots,
+            "frontend_fault_status": frontend_fault_status,
+            "frontend_path": "mla_absorb" if h43_enabled else None,
+            "frontend_dispatches": int(
+                getattr(self, "_h43_frontend_dispatch_count", 0)
+            ),
+            "reader_dispatches": int(getattr(self, "_h43_reader_dispatch_count", 0)),
+            "frontend_dispatches_by_mode": dict(
+                getattr(self, "_h43_frontend_dispatches_by_mode", {})
+            ),
+            "reader_dispatches_by_mode": dict(
+                getattr(self, "_h43_reader_dispatches_by_mode", {})
+            ),
+            "frontend_query_dtypes": dict(
+                getattr(self, "_h43_frontend_query_dtypes", {})
+            ),
+            "reader_query_dtypes": dict(getattr(self, "_h43_reader_query_dtypes", {})),
+        }
+        payload.update(get_tq_mla_frontend_module_attestation())
+        return payload
+
+    def _validate_h43_attestation(self, payload: dict[str, object]) -> None:
+        if payload["phase"] not in {"init", "post_cuda_graph"}:
+            raise RuntimeError(f"unknown H43 attestation phase: {payload['phase']}")
+        if payload["draft_worker"]:
+            return
+
+        h43_enabled = bool(payload["h43_enabled"])
+        e2m1 = bool(payload["e2m1"])
+        tq_enabled = bool(payload["tq_enabled"])
+        if h43_enabled:
+            if not e2m1:
+                raise RuntimeError("H43 attestation requires E2M1 storage")
+            if not (
+                payload["native_loaded"]
+                and payload["native_prebuilt"]
+                and payload["native_path"]
+                and payload["native_sha256"]
+            ):
+                raise RuntimeError("H43 attestation requires a pinned prebuilt module")
+            if payload["selected_row_bytes"] != 338:
+                raise RuntimeError(
+                    "H43 attestation requires a 338-byte selected row; "
+                    f"got {payload['selected_row_bytes']}"
+                )
+            if payload["selected_layer_count"] <= 0:
+                raise RuntimeError("H43 attestation requires selected layers")
+            if payload["codebook_layer_ids"] != payload["selected_layer_ids"]:
+                raise RuntimeError("H43 attestation codebook layers do not match")
+            if payload["fp8_rope_layer_ids"] != payload["selected_layer_ids"]:
+                raise RuntimeError("H43 attestation FP8 RoPE layers do not match")
+            if (
+                payload["pool_all_layer_bytes"]
+                != payload["expected_pool_all_layer_bytes"]
+            ):
+                raise RuntimeError("H43 attestation pool byte accounting mismatch")
+            if payload["frontend_path"] != "mla_absorb":
+                raise RuntimeError("H43 frontend must use the absorbed MLA path")
+            if payload["phase"] == "post_cuda_graph" and not (
+                payload["frontend_dispatches"] > 0 and payload["reader_dispatches"] > 0
+            ):
+                raise RuntimeError(
+                    "H43 graph setup did not traverse frontend and reader paths"
+                )
+            if payload["phase"] == "post_cuda_graph":
+                if payload["frontend_fault_status"] != 0:
+                    raise RuntimeError(
+                        "H43 native frontend reported a sticky device fault"
+                    )
+                frontend_modes = payload["frontend_dispatches_by_mode"]
+                reader_modes = payload["reader_dispatches_by_mode"]
+                if (
+                    not frontend_modes
+                    or frontend_modes != reader_modes
+                    or not set(frontend_modes).issubset({"decode", "target_verify"})
+                ):
+                    raise RuntimeError(
+                        "H43 per-mode absorbed-MLA frontend and reader launches "
+                        "do not match"
+                    )
+                expected_dtype_counts = {
+                    "torch.float8_e4m3fn": payload["frontend_dispatches"]
+                }
+                if payload["frontend_query_dtypes"] != expected_dtype_counts or payload[
+                    "reader_query_dtypes"
+                ] != {"torch.float8_e4m3fn": payload["reader_dispatches"]}:
+                    raise RuntimeError("H43 attestation requires FP8 query dispatch")
+        else:
+            if payload["native_loaded"]:
+                raise RuntimeError("disabled H43 path loaded the native module")
+            if payload["frontend_dispatches"] or payload["reader_dispatches"]:
+                raise RuntimeError("disabled H43 path executed an H43 branch")
+            if any(
+                payload[key]
+                for key in (
+                    "frontend_dispatches_by_mode",
+                    "reader_dispatches_by_mode",
+                    "frontend_query_dtypes",
+                    "reader_query_dtypes",
+                )
+            ):
+                raise RuntimeError("disabled H43 path recorded H43 dispatch metadata")
+            if not tq_enabled and payload["selected_row_bytes"] != 576:
+                raise RuntimeError("FP8 MLA attestation requires a 576-byte row")
+            if e2m1 and (
+                payload["selected_row_bytes"] != 386
+                or payload["codebook_slots"]
+                or payload["fp8_rope_slots"]
+                or payload["pool_all_layer_bytes"]
+                != payload["expected_pool_all_layer_bytes"]
+            ):
+                raise RuntimeError(
+                    "E2M1 attestation requires a 386-byte row without H43 buffers"
+                )
+
+    def emit_h43_runtime_attestation(self, phase: str) -> dict[str, object]:
+        payload = self._h43_attestation_payload(phase)
+        self._validate_h43_attestation(payload)
+        if not payload["draft_worker"]:
+            logger.info("H43_RUNTIME_ATTEST %s", json.dumps(payload, sort_keys=True))
+        return payload
+
+    def _record_h43_launch(
+        self, event: str, forward_mode: object, query_dtype: torch.dtype
+    ) -> None:
+        if not getattr(self, "_h43_frontend", False):
+            return
+        mode = str(getattr(forward_mode, "name", forward_mode)).lower()
+        dtype = str(query_dtype)
+        if event == "frontend":
+            self._h43_frontend_dispatch_count = (
+                getattr(self, "_h43_frontend_dispatch_count", 0) + 1
+            )
+            mode_counts = getattr(self, "_h43_frontend_dispatches_by_mode", {})
+            dtype_counts = getattr(self, "_h43_frontend_query_dtypes", {})
+            self._h43_frontend_dispatches_by_mode = mode_counts
+            self._h43_frontend_query_dtypes = dtype_counts
+        elif event == "reader":
+            self._h43_reader_dispatch_count = (
+                getattr(self, "_h43_reader_dispatch_count", 0) + 1
+            )
+            mode_counts = getattr(self, "_h43_reader_dispatches_by_mode", {})
+            dtype_counts = getattr(self, "_h43_reader_query_dtypes", {})
+            self._h43_reader_dispatches_by_mode = mode_counts
+            self._h43_reader_query_dtypes = dtype_counts
+        else:
+            raise ValueError(f"unknown H43 launch event: {event}")
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+
+        logged = getattr(self, "_h43_first_success_events", set())
+        event_key = (event, mode)
+        if event_key not in logged:
+            logged.add(event_key)
+            self._h43_first_success_events = logged
+            runner = getattr(self, "_h43_model_runner", None)
+            logger.info(
+                "H43_RUNTIME_EVENT %s",
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "event": event,
+                        "forward_mode": mode,
+                        "query_dtype": dtype,
+                        "tp_rank": int(getattr(runner, "tp_rank", -1)),
+                        "pp_rank": int(getattr(runner, "pp_rank", -1)),
+                    },
+                    sort_keys=True,
+                ),
+            )
+
     def _is_turboquant_layer(self, layer: RadixAttention) -> bool:
         tq4_cache = getattr(
             self, "_tq4_cache", getattr(self, "_tq_pool", None) is not None
@@ -453,7 +778,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             return self.data_type == torch.float8_e4m3fn
         if getattr(self, "_tq4_hotcold_cache", False):
             return self.should_use_hot_fp8_frontend(forward_batch)
-        return not self._is_turboquant_layer(layer)
+        return self.uses_mla_absorb_frontend(
+            layer, forward_batch
+        ) or not self._is_turboquant_layer(layer)
 
     def _fused_rope_fp8_quantize(
         self,
@@ -512,6 +839,92 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         return q_fp8, k_fp8
 
+    def uses_mla_absorb_frontend(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        return bool(
+            getattr(self, "_h43_frontend", False)
+            and self._is_turboquant_layer(layer)
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        )
+
+    def prepare_mla_absorb_qkv(
+        self,
+        *,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Write an H43 row and return the combined FP8 absorbed-MLA query."""
+
+        if not self.uses_mla_absorb_frontend(layer, forward_batch):
+            return None
+        if llama_4_scaling is not None:
+            raise RuntimeError("H43 frontend does not support Llama-4 query scaling")
+        if not getattr(self._tq_config, "mla_absorb_rotation_fused", False):
+            raise RuntimeError("H43 frontend requires fused MLA absorb rotations")
+        if q_nope.shape[-1] != self.kv_lora_rank:
+            raise RuntimeError(
+                "H43 frontend requires the absorbed MLA query; "
+                f"got width {q_nope.shape[-1]}"
+            )
+        if q_rope.shape[-1] != self.qk_rope_head_dim:
+            raise RuntimeError("H43 frontend received an invalid query RoPE width")
+        if k_nope.shape[-1] != self.kv_lora_rank or k_rope.shape[-1] != (
+            self.qk_rope_head_dim
+        ):
+            raise RuntimeError("H43 frontend received an invalid latent KV shape")
+
+        query_out = torch.empty(
+            (*q_nope.shape[:-1], self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=torch.float8_e4m3fn,
+            device=q_nope.device,
+        )
+        layer_id_rel = layer.layer_id - self._tq_pool.start_layer
+        packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+        scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
+        rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
+        codebook = self._tq_pool.kv_nope_codebook_buffer[layer_id_rel]
+        status = self._tq_pool.tq_mla_frontend_fault_status
+        if any(value is None for value in (packed, scale, rope, codebook, status)):
+            raise RuntimeError("H43 selected-layer pool is incomplete")
+        storage_code_lut = self._tq_config.k_storage_code_lut
+        if storage_code_lut is None:
+            raise RuntimeError("H43 E2M1 storage-code LUT is missing")
+
+        tq_mla_frontend_out(
+            q_nope,
+            q_rope,
+            k_nope,
+            k_rope,
+            forward_batch.out_cache_loc,
+            self._tq_config.signs1,
+            self._tq_config.signs2,
+            self._tq_config.k_boundaries,
+            self._tq_config.k_quant_centroids,
+            storage_code_lut,
+            query_out,
+            packed,
+            scale,
+            rope,
+            status,
+            decode_centroids=self._tq_config.k_centroids,
+            codebook_cache=codebook,
+            scale_multiplier=self._tq_config.k_dequant_scale_multiplier,
+            rotation_fused=True,
+            num_warps=8,
+            strict=False,
+        )
+        self._record_h43_launch("frontend", forward_batch.forward_mode, query_out.dtype)
+        return query_out
+
     def prepare_prefill_qkv(
         self,
         *,
@@ -524,66 +937,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
-        if (
-            getattr(self, "_h43_frontend", False)
-            and self._is_turboquant_layer(layer.attn_mha)
-            and (
-                forward_batch.forward_mode.is_decode()
-                or forward_batch.forward_mode.is_target_verify()
-            )
-        ):
-            if not getattr(self._tq_config, "mla_absorb_rotation_fused", False):
-                raise RuntimeError("H43 frontend requires fused MLA absorb rotations")
-            q_nope = q[..., : layer.qk_nope_head_dim]
-            q_rope, cache_rope = layer.rotary_emb(positions, q_pe, k_pe)
-            cache_latent = kv_a.unsqueeze(1)
-            query_out = torch.empty(
-                (
-                    q_nope.shape[0],
-                    q_nope.shape[1],
-                    layer.qk_nope_head_dim + layer.qk_rope_head_dim,
-                ),
-                dtype=torch.float8_e4m3fn,
-                device=q_nope.device,
-            )
-            layer_id_rel = layer.attn_mha.layer_id - self._tq_pool.start_layer
-            packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
-            scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
-            rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
-            codebook = self._tq_pool.kv_nope_codebook_buffer[layer_id_rel]
-            status = self._tq_pool.tq_mla_frontend_fault_status
-            if any(value is None for value in (packed, scale, rope, codebook, status)):
-                raise RuntimeError("H43 selected-layer pool is incomplete")
-            storage_code_lut = self._tq_config.k_storage_code_lut
-            if storage_code_lut is None:
-                raise RuntimeError("H43 E2M1 storage-code LUT is missing")
-            tq_mla_frontend_out(
-                q_nope,
-                q_rope,
-                cache_latent,
-                cache_rope,
-                forward_batch.out_cache_loc,
-                self._tq_config.signs1,
-                self._tq_config.signs2,
-                self._tq_config.k_boundaries,
-                self._tq_config.k_quant_centroids,
-                storage_code_lut,
-                query_out,
-                packed,
-                scale,
-                rope,
-                status,
-                decode_centroids=self._tq_config.k_centroids,
-                codebook_cache=codebook,
-                scale_multiplier=self._tq_config.k_dequant_scale_multiplier,
-                rotation_fused=True,
-                num_warps=8,
-                strict=False,
-            )
-            # K/V are consumed only by prefill. Decode and target verification
-            # already wrote the compressed cache and run with save_kv_cache=False.
-            return query_out, None, None
-
         kv = layer.kv_b_proj(kv_a)[0]
         kv = kv.view(
             -1, layer.num_local_heads, layer.qk_nope_head_dim + layer.v_head_dim
@@ -902,6 +1255,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         layer: RadixAttention,
         custom_mask: Optional[torch.Tensor] = None,
         custom_mask_offsets: Optional[torch.Tensor] = None,
+        forward_mode: Optional[ForwardMode] = None,
     ) -> torch.Tensor:
         if self._tq4_hotcold_cache:
             query_fp8 = (
@@ -1233,6 +1587,14 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             if h43_frontend:
                 decode_kwargs["fp8_rope"] = True
             output = tokenspeed_mla.tokenspeed_mla_decode_tq4(**decode_kwargs)
+            if h43_frontend:
+                if forward_mode is None:
+                    raise RuntimeError("H43 reader requires the actual forward mode")
+                self._record_h43_launch(
+                    "reader",
+                    forward_mode,
+                    query.dtype,
+                )
             if not rotation_fused:
                 output = self._tq_config.inverse_rotate_output(output)
             return output
@@ -1283,7 +1645,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         out_buffer: torch.Tensor,
         o_sf_scale: float = 1.0,
     ):  # Q/K/V arrive already in FP8 via the model-side fused path
-        # (prepare_prefill_qkv / pack_prefix_chunk_kv); no quantize here.
+        # (prepare_prefill_qkv / prepare_mla_absorb_qkv /
+        # pack_prefix_chunk_kv); no quantize here.
         if self._is_turboquant_layer(layer) and not self._tq4_hotcold_cache:
             return TRTLLMMLABackend._run_prefill_kernel(
                 self,

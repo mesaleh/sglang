@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from unittest.mock import Mock
 
 import torch
 
@@ -16,6 +15,12 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_common.attention_backend_handler import (
+    handle_attention_tokenspeed_mla,
+)
+from sglang.srt.models.deepseek_common.attention_forward_methods import (
+    AttnForwardMethod,
+)
 
 from test_h41_w2_frontend import query_reference, raw_fp8, writer_reference
 
@@ -75,42 +80,55 @@ def main() -> None:
         backend._tq4_hotcold_cache = False
         backend._tq_pool = pool
         backend._tq_config = pool.tq_config
+        backend.kv_lora_rank = 512
+        backend.qk_rope_head_dim = 64
 
-        kv_b_proj = Mock(side_effect=AssertionError("kv_b_proj must be skipped"))
-        layer = SimpleNamespace(
-            qk_nope_head_dim=512,
-            qk_rope_head_dim=64,
-            kv_b_proj=kv_b_proj,
-            rotary_emb=lambda positions, q_pe, k_pe: (q_pe, k_pe),
-            attn_mha=SimpleNamespace(layer_id=0),
-        )
+        layer = SimpleNamespace(layer_id=0)
         generator = torch.Generator(device=device).manual_seed(20260730)
 
         for forward_mode, tokens, locations_list in (
             (ForwardMode.DECODE, 1, [7]),
             (ForwardMode.TARGET_VERIFY, 5, [11, 3, 19, 5, 23]),
         ):
-            full_query = torch.empty(
-                tokens, 8, 576, dtype=torch.bfloat16, device=device
+            assert (
+                handle_attention_tokenspeed_mla(
+                    SimpleNamespace(disable_chunked_prefix_cache=False),
+                    SimpleNamespace(
+                        forward_mode=forward_mode,
+                        extend_prefix_lens_cpu=None,
+                    ),
+                )
+                == AttnForwardMethod.MLA
+            )
+            # Mirror the absorbed-MLA production layouts exactly. q_nope_out
+            # is produced head-major and transposed to (T, H, 512), while the
+            # RoPE tensors are narrow views into wider projection outputs.
+            query_latent_storage = torch.empty(
+                8, tokens, 512, dtype=torch.bfloat16, device=device
             ).normal_(0.0, 0.125, generator=generator)
-            query_latent = full_query[..., :512]
-            assert not query_latent.is_contiguous()
-            query_rope = torch.empty(
-                tokens, 8, 64, dtype=torch.bfloat16, device=device
+            query_latent = query_latent_storage.transpose(0, 1)
+            query_rope_storage = torch.empty(
+                tokens, 8, 192, dtype=torch.bfloat16, device=device
             ).normal_(0.0, 0.125, generator=generator)
+            query_rope = query_rope_storage[..., 128:]
             cache_latent = torch.empty(
                 tokens, 512, dtype=torch.bfloat16, device=device
             ).normal_(0.0, 0.125, generator=generator)
-            cache_rope = torch.empty(
-                tokens, 1, 64, dtype=torch.bfloat16, device=device
+            cache_rope_storage = torch.empty(
+                tokens, 576, dtype=torch.bfloat16, device=device
             ).normal_(0.0, 0.125, generator=generator)
+            cache_rope = cache_rope_storage[..., 512:].unsqueeze(1)
+            assert query_latent.stride() == (512, tokens * 512, 1)
+            assert query_rope.stride() == (8 * 192, 192, 1)
+            assert cache_rope.stride() == (576, 64, 1)
+            assert not query_rope.is_contiguous()
+            assert not cache_rope.is_contiguous()
             locations = torch.tensor(locations_list, dtype=torch.int64, device=device)
-            query, key, value = backend.prepare_prefill_qkv(
-                q=full_query,
-                q_pe=query_rope,
-                kv_a=cache_latent,
-                k_pe=cache_rope,
-                positions=torch.arange(tokens, dtype=torch.int64, device=device),
+            query = backend.prepare_mla_absorb_qkv(
+                q_nope=query_latent,
+                q_rope=query_rope,
+                k_nope=cache_latent.unsqueeze(1),
+                k_rope=cache_rope,
                 layer=layer,
                 forward_batch=SimpleNamespace(
                     forward_mode=forward_mode,
@@ -140,7 +158,6 @@ def main() -> None:
                 expected_cache,
                 locations,
             )
-            assert key is None and value is None
 
         prefill_locations = torch.tensor(
             [29, 31, 37, 41, 43, 47, 53], dtype=torch.int64, device=device
@@ -178,13 +195,12 @@ def main() -> None:
         invalid_location = torch.tensor(
             [pool.size + pool.page_size], dtype=torch.int64, device=device
         )
-        invalid_query = torch.zeros(1, 8, 576, dtype=torch.bfloat16, device=device)
-        backend.prepare_prefill_qkv(
-            q=invalid_query,
-            q_pe=torch.zeros(1, 8, 64, dtype=torch.bfloat16, device=device),
-            kv_a=torch.zeros(1, 512, dtype=torch.bfloat16, device=device),
-            k_pe=torch.zeros(1, 1, 64, dtype=torch.bfloat16, device=device),
-            positions=torch.zeros(1, dtype=torch.int64, device=device),
+        invalid_query = torch.zeros(1, 8, 512, dtype=torch.bfloat16, device=device)
+        backend.prepare_mla_absorb_qkv(
+            q_nope=invalid_query,
+            q_rope=torch.zeros(1, 8, 64, dtype=torch.bfloat16, device=device),
+            k_nope=torch.zeros(1, 1, 512, dtype=torch.bfloat16, device=device),
+            k_rope=torch.zeros(1, 1, 64, dtype=torch.bfloat16, device=device),
             layer=layer,
             forward_batch=SimpleNamespace(
                 forward_mode=ForwardMode.DECODE,
@@ -193,7 +209,6 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         assert int(pool.tq_mla_frontend_fault_status.item()) == 1
-        kv_b_proj.assert_not_called()
 
     print(
         json.dumps(
@@ -207,7 +222,7 @@ def main() -> None:
                 "target_verify_q5": "PASS",
                 "noncontiguous_projection_view": "PASS",
                 "prefill_writer": "PASS",
-                "kv_b_proj_skipped": "PASS",
+                "absorbed_mla_path": "PASS",
                 "sticky_fault_status": "PASS",
             },
             sort_keys=True,

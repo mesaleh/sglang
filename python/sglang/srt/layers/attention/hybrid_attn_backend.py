@@ -85,6 +85,32 @@ class HybridAttnBackend(AttentionBackend):
             forward_batch
         )
 
+    def emit_h43_runtime_attestation(self, phase: str) -> list[dict[str, object]]:
+        payloads = []
+        seen = set()
+        for backend in (self.prefill_backend, self.decode_backend):
+            if id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            emit = getattr(backend, "emit_h43_runtime_attestation", None)
+            if emit is not None:
+                payloads.append(emit(phase))
+        return payloads
+
+    def prepare_mla_absorb_qkv(self, *, forward_batch: ForwardBatch, **kwargs):
+        backend = self._select_backend(forward_batch.forward_mode)
+        prepare = getattr(backend, "prepare_mla_absorb_qkv", None)
+        if prepare is None:
+            return None
+        return prepare(forward_batch=forward_batch, **kwargs)
+
+    def uses_mla_absorb_frontend(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> bool:
+        backend = self._select_backend(forward_batch.forward_mode)
+        predicate = getattr(backend, "uses_mla_absorb_frontend", None)
+        return bool(predicate and predicate(layer, forward_batch))
+
     def forward(
         self,
         q: Optional[torch.Tensor] = None,  # For full attention

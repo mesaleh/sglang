@@ -703,7 +703,54 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                if fusion_plan is not None:
+                active_backend = get_attn_backend()
+                uses_absorb_frontend = getattr(
+                    active_backend, "uses_mla_absorb_frontend", None
+                )
+                use_absorb_frontend = bool(
+                    uses_absorb_frontend
+                    and uses_absorb_frontend(self.attn_mqa, forward_batch)
+                )
+                if use_absorb_frontend:
+                    if fusion_plan is not None:
+                        raise RuntimeError(
+                            "backend MLA absorb frontend is incompatible with "
+                            "fused BMM-attention"
+                        )
+                    if dcp_enabled():
+                        raise RuntimeError(
+                            "backend MLA absorb frontend does not support decode "
+                            "context parallelism"
+                        )
+                    prepare_absorb = active_backend.prepare_mla_absorb_qkv
+                    prepared_query = prepare_absorb(
+                        q_nope=q_nope_out,
+                        q_rope=q_pe,
+                        k_nope=k_nope,
+                        k_rope=k_pe,
+                        layer=self.attn_mqa,
+                        forward_batch=forward_batch,
+                        llama_4_scaling=llama_4_scaling,
+                    )
+                    if prepared_query is None:
+                        raise RuntimeError(
+                            "backend claimed an MLA absorb frontend but returned no query"
+                        )
+                    attn_output = self.attn_mqa(
+                        prepared_query,
+                        None,
+                        None,
+                        forward_batch,
+                        q_rope=None,
+                        k_rope=None,
+                        save_kv_cache=False,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
+                elif fusion_plan is not None:
                     bmm_attention_fn = (
                         bcg_mla_bmm_then_unified_attention
                         if is_in_breakable_cuda_graph()
@@ -1019,6 +1066,12 @@ class DeepseekMLAForwardMixin:
         active_backend = getattr(forward_batch, "attn_backend", None)
         if active_backend is None:
             active_backend = get_attn_backend()
+        uses_absorb_frontend = getattr(active_backend, "uses_mla_absorb_frontend", None)
+        if uses_absorb_frontend and uses_absorb_frontend(self.attn_mha, forward_batch):
+            # H43 consumes already-positionally-rotated RoPE in its native
+            # absorbed-MLA hook. Do not route it through the ordinary fused
+            # FP8 RoPE frontend merely because its final query is FP8.
+            return False
         backend_uses_fp8 = (
             getattr(active_backend, "data_type", None) == torch.float8_e4m3fn
         )
