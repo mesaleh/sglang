@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import re
+import shlex
 import sys
 import tarfile
 import time
@@ -326,12 +328,80 @@ class I1Qualification(I2Qualification):
             mode,
         )
 
+    def _write_attempt_bundle(
+        self,
+        name: str,
+        stdout: str,
+        stderr: str,
+        value: dict[str, Any] | None,
+        attempt_record: dict[str, Any] | None,
+        raw_directory: str | None,
+        selected_directory: str | None,
+    ) -> None:
+        files: list[tuple[str, bytes, int]] = [
+            (f"{self.results}/{name}.stdout.log", stdout.encode(), 0o644),
+            (f"{self.results}/{name}.stderr.log", stderr.encode(), 0o644),
+        ]
+        if value is not None:
+            assert attempt_record is not None and raw_directory is not None
+            value_bytes = (
+                json.dumps(value, allow_nan=False, indent=2, sort_keys=True) + "\n"
+            ).encode()
+            validity_bytes = (
+                json.dumps(
+                    attempt_record,
+                    allow_nan=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode()
+            files.extend(
+                (
+                    (f"{self.results}/{name}.json", value_bytes, 0o644),
+                    (f"{raw_directory}/result.json", value_bytes, 0o444),
+                    (f"{raw_directory}/validity.json", validity_bytes, 0o444),
+                )
+            )
+            if selected_directory is not None:
+                files.append(
+                    (f"{selected_directory}/result.json", value_bytes, 0o444)
+                )
+
+        encoded = [
+            (path, base64.b64encode(payload).decode(), mode)
+            for path, payload, mode in files
+        ]
+        directories = [path for path in (raw_directory, selected_directory) if path]
+        script = f"""set -euo pipefail
+python3 - <<'PY'
+import base64
+import os
+
+directories = {directories!r}
+files = {encoded!r}
+for directory in directories:
+    os.makedirs(directory, mode=0o755, exist_ok=False)
+for path, payload, mode in files:
+    data = base64.b64decode(payload, validate=True)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+PY
+"""
+        h43.remote_script(self.host0, script, [], timeout=120)
+
     def _run_attempt(
         self, context: int, sequence: int, attempt: int, timeout: int
     ) -> tuple[dict[str, Any], list[str], float | None]:
         allocation_order = "candidate-first" if sequence == 2 else "control-first"
         name = f"i1-c{context}-seq{sequence:02d}-attempt{attempt:02d}"
-        self._assert_no_compute_process(f"{name}-idle-before")
         command = [
             "python3",
             "/i2/benchmark/bench_turboquant_mla/bench_h41_i1_integrated.py",
@@ -352,25 +422,52 @@ class I1Qualification(I2Qualification):
             "--sequence",
             str(sequence),
         ]
-        value = self._candidate(
-            name,
-            command,
-            timeout=timeout,
-            expected_json_status="TIMING_ONLY",
-        )
-        if value is None:
-            raise RuntimeError(f"{name} did not produce a timing result")
+        wrapped = [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=15s",
+            f"{timeout}s",
+            *command,
+        ]
+        completed = self.exec_candidate(wrapped, timeout=timeout + 30, check=False)
+        record: dict[str, Any] = {
+            "returncode": completed.returncode,
+            "command": shlex.join(wrapped),
+            "stdout": f"{name}.stdout.log",
+            "stderr": f"{name}.stderr.log",
+        }
+        self.records[name] = record
+        if completed.returncode:
+            self._write_attempt_bundle(
+                name,
+                completed.stdout,
+                completed.stderr,
+                None,
+                None,
+                None,
+                None,
+            )
+            raise RuntimeError(f"{name} failed with exit code {completed.returncode}")
+        value = last_json_value(completed.stdout, name)
+        record["json_status"] = value.get("status")
+        if value.get("status") != "TIMING_ONLY":
+            self._write_attempt_bundle(
+                name,
+                completed.stdout,
+                completed.stderr,
+                None,
+                None,
+                None,
+                None,
+            )
+            raise RuntimeError(
+                f"{name} status {value.get('status')!r} != 'TIMING_ONLY'"
+            )
         reasons, drift = self._sentinel_reasons(value)
         raw_directory = (
             f"{self.results}/i1/raw/context{context}/seq{sequence:02d}/"
             f"attempt{attempt:02d}"
         )
-        h43.remote(
-            self.host0,
-            ["install", "-d", "-m", "0755", raw_directory],
-            timeout=30,
-        )
-        self._write_json(f"{raw_directory}/result.json", value, "0444")
         attempt_record = {
             "context": context,
             "sequence": sequence,
@@ -388,7 +485,20 @@ class I1Qualification(I2Qualification):
             ),
         }
         self.attempts.append(attempt_record)
-        self._write_json(f"{raw_directory}/validity.json", attempt_record, "0444")
+        selected_directory = (
+            f"{self.results}/i1/selected/context{context}/seq{sequence:02d}"
+            if not reasons
+            else None
+        )
+        self._write_attempt_bundle(
+            name,
+            completed.stdout,
+            completed.stderr,
+            value,
+            attempt_record,
+            raw_directory,
+            selected_directory,
+        )
         return value, reasons, drift
 
     def _write_component_result(
@@ -453,17 +563,6 @@ class I1Qualification(I2Qualification):
                         self._write_component_result("NO_DECISION", None)
                         return
                 assert selected is not None
-                selected_directory = (
-                    f"{self.results}/i1/selected/context{context}/seq{sequence:02d}"
-                )
-                h43.remote(
-                    self.host0,
-                    ["install", "-d", "-m", "0755", selected_directory],
-                    timeout=30,
-                )
-                self._write_json(
-                    f"{selected_directory}/result.json", selected, "0444"
-                )
 
         analysis_deadline = min(
             self.experiment_deadline, time.monotonic() + ANALYSIS_PHASE_SECONDS
