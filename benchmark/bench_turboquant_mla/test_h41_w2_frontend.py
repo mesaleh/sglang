@@ -22,6 +22,7 @@ LATENT = 512
 ROPE = 64
 HEADS = 8
 FP8 = torch.float8_e4m3fn
+FP8_MAX = float(torch.finfo(FP8).max)
 
 
 @dataclass
@@ -227,6 +228,7 @@ def cpu_codebook_reference(
             rounded_scale.detach().cpu().float()[..., None]
             * decode_centroids.detach().cpu().float()
         )
+        .clamp(min=-FP8_MAX, max=FP8_MAX)
         .to(FP8)
         .view(torch.uint8)
         .contiguous()
@@ -682,7 +684,8 @@ def test_codebook_scale_boundaries(
     location = torch.tensor([2], dtype=torch.int64, device=device)
     observed_subnormal = False
     observed_saturation = False
-    for exponent in range(-12, 11):
+    max_codebook_abs = 0.0
+    for exponent in range(-12, 16):
         cache_latent = (base[2].float() * (2.0**exponent)).to(torch.bfloat16)
         inputs = (base[0], base[1], cache_latent, base[3])
         buffers = allocate_guarded(1, 5, device)
@@ -692,15 +695,16 @@ def test_codebook_scale_boundaries(
         actual = buffers.codebook[location].detach().cpu()
         assert torch.equal(actual, expected)
         values = actual.view(FP8).float().abs()
+        max_codebook_abs = max(max_codebook_abs, float(values.max().item()))
         observed_subnormal |= bool(((values > 0) & (values < 2.0**-6)).any())
-        observed_saturation |= bool((values == 448.0).any())
+        observed_saturation |= bool((values == FP8_MAX).any())
         # Storage-order E2M1 has both +0 and -0 entries.
         assert int(actual[0, 0, 0]) == 0x00
         assert int(actual[0, 0, 8]) == 0x80
         assert int(buffers.status.item()) == 0
         assert_guards(buffers)
     assert observed_subnormal
-    assert observed_saturation
+    assert observed_saturation, max_codebook_abs
 
 
 def test_special_fp8(
