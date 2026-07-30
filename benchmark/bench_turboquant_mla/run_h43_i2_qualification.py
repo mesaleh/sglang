@@ -475,6 +475,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
 
     def setup(self) -> None:
         super().setup()
+        self._run_preoutage_checks()
         timeout_evidence = {
             "schema_version": 1,
             "status": "PASS",
@@ -484,11 +485,25 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "commands": {
                 "gpu_identity_sample": {"timeout": 60, "processes": 2},
                 "idle_compute_check": {"timeout": 60, "processes": 1},
-                "tokenspeed_source_manifest_each": {"timeout": 180, "processes": 2},
-                "native_prebuilt_load": {"timeout": 120, "processes": 1},
+                "tokenspeed_source_manifest_each": {
+                    "timeout": 180,
+                    "processes": 2,
+                    "phase": "pre-outage",
+                },
+                "native_prebuilt_load": {
+                    "timeout": 120,
+                    "processes": 1,
+                    "phase": "pre-outage",
+                },
                 "h40_contract": {
                     "timeout": 180,
-                    "basis": "accepted H43 CPU/GPU contract suite",
+                    "phase": "pre-outage",
+                    "basis": "pinned 31-test static contract suite",
+                },
+                "pdl_source_order": {
+                    "timeout": 120,
+                    "processes": 1,
+                    "phase": "pre-outage",
                 },
                 "writer_correctness": {"timeout": 300, "observed_seconds": 54},
                 "lifecycle": {"timeout": 300, "basis": "six focused unit methods"},
@@ -522,6 +537,16 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "aot_preparation": self.i2_preparation,
             "pinned_reader_ncu": self.reader_ncu_proof,
             "memory_contract": MEMORY_CONTRACT,
+            "preoutage_checks": {
+                name: self.records[name]
+                for name in (
+                    "tokenspeed-candidate-source-manifest",
+                    "tokenspeed-reference-source-manifest",
+                    "native-prebuilt-load",
+                    "h40-contract",
+                    "pdl-source-order",
+                )
+            },
         }
         files = {
             "H43_I2_TIMEOUT_BUDGET.json": timeout_evidence,
@@ -582,6 +607,143 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             "--volume",
             f"{self.results}:/results",
         ]
+
+    def _preoutage_run(
+        self,
+        identity: dict[str, Any],
+        name: str,
+        arguments: list[str],
+        *,
+        timeout: int,
+        expected_json_status: str | None = None,
+    ) -> dict[str, Any] | None:
+        suffix = sha256_bytes(f"{self.campaign}:{identity['role']}:{name}".encode())[
+            :12
+        ]
+        container_name = f"ct13-h43-i2pf-{identity['role']}-{suffix}"
+        if (
+            h43.remote(
+                self.host0,
+                ["docker", "container", "inspect", container_name],
+                timeout=30,
+                check=False,
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError(f"pre-outage container already exists: {container_name}")
+        command = [
+            "timeout",
+            "--signal=TERM",
+            "--kill-after=15s",
+            f"{timeout}s",
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            container_name,
+            "--network",
+            "none",
+            *self._container_environment(identity),
+            *self._container_volumes(identity),
+            identity["image_id"],
+            *arguments,
+        ]
+        try:
+            result = h43.remote(self.host0, command, timeout=timeout + 30, check=False)
+        finally:
+            h43.remote(
+                self.host0,
+                ["docker", "rm", "--force", container_name],
+                timeout=60,
+                check=False,
+            )
+        try:
+            return self._record_result(
+                name,
+                result,
+                command=command,
+                expected_json_status=expected_json_status,
+            )
+        finally:
+            if name in self.records:
+                self.records[name].update(
+                    {"phase": "pre-outage", "gpu_access": False, "network": "none"}
+                )
+
+    def _run_preoutage_checks(self) -> None:
+        source_check = [
+            "bash",
+            "-lc",
+            "sha256sum --check --strict /work/H43_D1_SOURCE_MANIFEST.sha256 "
+            "&& cat /work/H43_D1_SOURCE_MANIFEST.sha256",
+        ]
+        self._preoutage_run(
+            self.candidate,
+            "tokenspeed-candidate-source-manifest",
+            source_check,
+            timeout=180,
+        )
+        self._preoutage_run(
+            self.reference,
+            "tokenspeed-reference-source-manifest",
+            source_check,
+            timeout=180,
+        )
+        prebuilt_probe = [
+            "python3",
+            "-c",
+            (
+                "import hashlib,json;"
+                "import sglang.jit_kernel.tq_mla_frontend as frontend;"
+                "path=frontend._get_module().__file__;"
+                "digest=hashlib.sha256(open(path,'rb').read()).hexdigest();"
+                f"expected='{I2_NATIVE_SHA256}';"
+                "print(json.dumps({'status':'PASS' if digest==expected else 'FAIL',"
+                "'module_path':path,'module_sha256':digest}))"
+            ),
+        ]
+        value = self._preoutage_run(
+            self.candidate,
+            "native-prebuilt-load",
+            prebuilt_probe,
+            timeout=120,
+            expected_json_status="PASS",
+        )
+        if (
+            value is None
+            or value.get("module_path")
+            != "/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so"
+            or value.get("module_sha256") != I2_NATIVE_SHA256
+        ):
+            raise RuntimeError(
+                "native prebuilt loader did not resolve the sealed module"
+            )
+        self._preoutage_run(
+            self.candidate,
+            "h40-contract",
+            [
+                "python3",
+                "-m",
+                "pytest",
+                "/tokenspeed-source/tokenspeed-mla/test/test_tq4_contract.py",
+                "-q",
+            ],
+            timeout=180,
+        )
+        contract_stdout = h43.remote(
+            self.host0, ["cat", f"{self.results}/h40-contract.stdout.log"], timeout=30
+        ).stdout
+        if not re.search(r"\b31 passed\b", contract_stdout):
+            raise RuntimeError("H40 contract did not report exactly 31 passing tests")
+        pdl_source = self._preoutage_run(
+            self.candidate,
+            "pdl-source-order",
+            ["python3", "/work/check_h43_pdl_source.py"],
+            timeout=120,
+            expected_json_status="PASS",
+        )
+        if pdl_source is None:
+            raise RuntimeError("PDL source-order gate produced no result")
 
     def start_candidate(self) -> None:
         if (
@@ -805,21 +967,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         if result.stdout.strip():
             raise RuntimeError(f"{name} found an unexpected GPU compute process")
 
-    def _run_contract_and_lifecycle(self) -> None:
-        contract_command = [
-            "python3",
-            "-m",
-            "pytest",
-            "/tokenspeed-source/tokenspeed-mla/test/test_tq4_contract.py",
-            "-q",
-        ]
-        self._candidate("h40-contract", contract_command, timeout=180)
-        contract_stdout = h43.remote(
-            self.host0, ["cat", f"{self.results}/h40-contract.stdout.log"], timeout=30
-        ).stdout
-        if not re.search(r"\b31 passed\b", contract_stdout):
-            raise RuntimeError("H40 contract did not report exactly 31 passing tests")
-
+    def _run_writer_correctness_and_lifecycle(self) -> None:
         correctness = self._candidate(
             "writer-correctness",
             [
@@ -857,48 +1005,6 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         if "Ran 6 tests" not in lifecycle or not re.search(r"(?m)^OK$", lifecycle):
             raise RuntimeError("lifecycle suite did not report six passing tests")
 
-    def _run_source_identity(self) -> None:
-        source_check = [
-            "bash",
-            "-lc",
-            "sha256sum --check --strict /work/H43_D1_SOURCE_MANIFEST.sha256 "
-            "&& cat /work/H43_D1_SOURCE_MANIFEST.sha256",
-        ]
-        self._candidate(
-            "tokenspeed-candidate-source-manifest", source_check, timeout=180
-        )
-        self._reference(
-            "tokenspeed-reference-source-manifest", source_check, timeout=180
-        )
-        prebuilt_probe = [
-            "python3",
-            "-c",
-            (
-                "import hashlib,json;"
-                "import sglang.jit_kernel.tq_mla_frontend as frontend;"
-                "path=frontend._get_module().__file__;"
-                "digest=hashlib.sha256(open(path,'rb').read()).hexdigest();"
-                f"expected='{I2_NATIVE_SHA256}';"
-                "print(json.dumps({'status':'PASS' if digest==expected else 'FAIL',"
-                "'module_path':path,'module_sha256':digest}))"
-            ),
-        ]
-        value = self._candidate(
-            "native-prebuilt-load",
-            prebuilt_probe,
-            timeout=120,
-            expected_json_status="PASS",
-        )
-        if (
-            value is None
-            or value.get("module_path")
-            != "/native/sglang_tq_mla_frontend_sm100_h43_i2_v1.so"
-            or value.get("module_sha256") != I2_NATIVE_SHA256
-        ):
-            raise RuntimeError(
-                "native prebuilt loader did not resolve the sealed module"
-            )
-
     def _run_roundtrip_and_pdl(self) -> None:
         for context, split in ((10219, 64), (37932, 40)):
             for q_len in (1, 5):
@@ -922,15 +1028,6 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                     "before"
                 ) != value.get("graph_replay_allocation_bytes", {}).get("after"):
                     raise RuntimeError("roundtrip graph replay allocation changed")
-
-        pdl_source = self._candidate(
-            "pdl-source-order",
-            ["python3", "/work/check_h43_pdl_source.py"],
-            timeout=120,
-            expected_json_status="PASS",
-        )
-        if pdl_source is None:
-            raise RuntimeError("PDL source-order gate produced no result")
 
         for context, split in ((10219, 64), (37932, 40)):
             for q_len in (1, 5):
@@ -1332,8 +1429,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
     def qualification(self) -> None:
         self._assert_no_compute_process("idle-after-candidate-start")
         self._sample_idle_gpu("qualification-gpu-start")
-        self._run_source_identity()
-        self._run_contract_and_lifecycle()
+        self._run_writer_correctness_and_lifecycle()
         self._run_roundtrip_and_pdl()
         self._run_writer_delta()
         self._run_integrated_smoke()
