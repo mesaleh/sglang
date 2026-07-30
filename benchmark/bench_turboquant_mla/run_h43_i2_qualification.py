@@ -749,7 +749,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             expected_json_status=expected_json_status,
         )
 
-    def _sample_gpu(self, name: str) -> None:
+    def _sample_idle_gpu(self, name: str) -> None:
         query = ",".join(self.contract["telemetry"]["query_fields"])
         result = h43.remote(
             self.host0,
@@ -769,11 +769,21 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             )
         )
         mismatches = h43.gpu_health_mismatches(row, self.contract, self.aggregate_ecc)
-        if mismatches:
-            raise RuntimeError(f"{name} GPU health mismatch: {mismatches}")
+        current_sm_clock = mismatches.pop("clocks.sm", None)
+        if current_sm_clock is not None:
+            try:
+                observed_clock = float(row["clocks.sm"])
+                maximum_clock = float(row["clocks.max.sm"])
+            except (KeyError, ValueError):
+                mismatches["clocks.sm"] = current_sm_clock
+            else:
+                if not 0 < observed_clock <= maximum_clock:
+                    mismatches["clocks.sm"] = current_sm_clock
         h43.write_remote_root_file(
             self.host0, f"{self.results}/{name}.csv", result.stdout, "0644"
         )
+        if mismatches:
+            raise RuntimeError(f"{name} GPU health mismatch: {mismatches}")
 
     def _assert_no_compute_process(self, name: str) -> None:
         result = h43.remote(
@@ -1318,7 +1328,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
 
     def qualification(self) -> None:
         self._assert_no_compute_process("idle-after-candidate-start")
-        self._sample_gpu("qualification-gpu-start")
+        self._sample_idle_gpu("qualification-gpu-start")
         self._run_source_identity()
         self._run_contract_and_lifecycle()
         self._run_roundtrip_and_pdl()
@@ -1328,7 +1338,8 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         self._run_reader_racecheck()
         self._run_writer_ncu()
         self._cache_persistence()
-        self._sample_gpu("qualification-gpu-end")
+        self._assert_no_compute_process("idle-before-qualification-end")
+        self._sample_idle_gpu("qualification-gpu-end")
 
     def finalize_qualification(self) -> None:
         xid_evidence: dict[str, str] = {}
