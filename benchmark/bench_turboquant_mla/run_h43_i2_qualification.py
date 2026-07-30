@@ -35,25 +35,25 @@ AOT_PREPARATION_NATIVE_SHA256 = (
 )
 I2_PREPARATION_MANIFEST = f"{I2_PREPARATION}/manifest-v2.json"
 I2_PREPARATION_MANIFEST_SHA256 = (
-    "21415979d6e8e8458584f953c6124b500c03eb1376c9349a98892355f2c60cc6"
+    "9a6c0e53be769623855b9b81c05077cf81eba6aa43e4087c2ccdb1444f4b1c3e"
 )
 I2_NATIVE_BUILD_DIR = (
     f"{I2_PREPARATION}/native-build-cache/"
     "sglang_tq_mla_frontend_sm100_h43_i3_v2"
 )
 I2_NATIVE_SOURCE_SHA256 = (
-    "819ed01e06b1181ae02a346402d105e484ab0927574710e207770e4b70d8083b"
+    "e9c5d5e09e04380188b605ea8e941b68bdca427c9bab7b59cd1d130e198305b0"
 )
 NATIVE_SEALED_FILES = {
     "sglang_tq_mla_frontend_sm100_h43_i3_v2.so": I2_NATIVE_SHA256,
 }
 NATIVE_BUILD_FILES = {
-    ".ninja_deps": "b26ec7a25fb6d8aab42ab261ad4c9b3c36ea6c59b3c9f08f95fe330af2ebec56",
-    ".ninja_log": "087e4bebf3a94c21b40b99d293b2a94d9e39630cb74e040773b355372737b716",
+    ".ninja_deps": "bac0410e951c057fe0dcd4ab802c4152c9c9a0aff4d46295b2414f3f3965269b",
+    ".ninja_log": "99b877f9216f2b43ec3010882877f8d8ba2507d461c3c8923123a8bed302bdb1",
     "build.ninja": "ee001cc30f86ef174217b2b3fc939098314b9dccfef313928f83f5b14c5f30dc",
     "sglang_tq_mla_frontend_sm100_h43_i3_v2.so": I2_NATIVE_SHA256,
     "tq_mla_frontend_sm100.cuda.o": (
-        "c89e914714c03b195c4cc152f05202790a9950329797d684207d35056238a85c"
+        "760242a7aeb614b70f78e50264a780e815162c905c0da1300605c9db4abf2705"
     ),
 }
 PINNED_READER_QUALIFICATION_SHA256 = (

@@ -14,20 +14,20 @@ from typing import Any
 import run_h43_maintenance as h43
 
 I2_PREPARATION = (
-    "/var/lib/h43/h43-i3-postreview-20260730-1de12b79/preparation"
+    "/var/lib/h43/h43-i3-w8fix-20260730-3f7d419a/preparation"
 )
 I2_SOURCE = f"{I2_PREPARATION}/source/sglang"
 I2_NATIVE_DIR = f"{I2_PREPARATION}/native"
 I2_NATIVE_SO = f"{I2_NATIVE_DIR}/sglang_tq_mla_frontend_sm100_h43_i3_v2.so"
 I2_CACHE_PARENT = "/var/lib/h43-i2-codebook-cache"
-I2_COMMIT = "1de12b79a5e0272917c0ae88af789772f173728d"
-I2_NATIVE_SHA256 = "990fecac6a5dfc02178aebd808d11fa50964457b88702dc123800b25b4db46d8"
+I2_COMMIT = "3f7d419a5b8036328e9c1e4bae13b6d2fe8cc2b6"
+I2_NATIVE_SHA256 = "2dde881c30c44d2fdbbdda050bf641cdd31ffdf2e7256de1b729699728f65dd2"
 I2_KEY_FILES = {
     "python/sglang/jit_kernel/tq_mla_frontend.py": (
         "b71e967f1132e8c2492d29aa2262398662a5080fa9397772b6b409a2cf753af1"
     ),
     "python/sglang/jit_kernel/csrc/tq_mla_frontend/tq_mla_frontend_sm100.cu": (
-        "819ed01e06b1181ae02a346402d105e484ab0927574710e207770e4b70d8083b"
+        "e9c5d5e09e04380188b605ea8e941b68bdca427c9bab7b59cd1d130e198305b0"
     ),
     "benchmark/bench_turboquant_mla/prebuild_h43_i2_aot_cache.py": (
         "fbaa8628f8ef1003595e165440a1641a28fcaba4fd28fdcf8dbc8ed84efb972f"
