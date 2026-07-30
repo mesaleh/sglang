@@ -3259,6 +3259,7 @@ class Scheduler(
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
+                        self._attach_tq_mla_fault_status(batch_result)
                         if batch.spec_algorithm.is_none():
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
@@ -3318,6 +3319,7 @@ class Scheduler(
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                self._attach_tq_mla_fault_status(batch_result)
                 self._relay_forward_payload(batch.req_pool_indices, batch_result)
                 batch.input_ids = None
             elif not batch.spec_algorithm.is_none():
@@ -3336,6 +3338,7 @@ class Scheduler(
                     batch_result = self.model_worker.forward_batch_generation(
                         batch, **kwargs
                     )
+                self._attach_tq_mla_fault_status(batch_result)
                 if not defer_dflash_pp_result:
                     # The isolation restore reverted the worker's in-forward SB edits;
                     # re-apply what must carry to the next iter.
@@ -3361,6 +3364,7 @@ class Scheduler(
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
+                self._attach_tq_mla_fault_status(batch_result)
                 if batch_result.has_sampled_token_ids:
                     # Non-spec: relay via future_map, gathered next iter.
                     self._relay_forward_payload(batch.req_pool_indices, batch_result)
@@ -3407,6 +3411,15 @@ class Scheduler(
 
         return ret
 
+    def _attach_tq_mla_fault_status(
+        self, batch_result: GenerationBatchResult
+    ) -> None:
+        """Attach the rank-local sticky word before the existing result D2H."""
+        pool = self.token_to_kv_pool_allocator.get_kvcache()
+        batch_result.tq_mla_fault_status = getattr(
+            pool, "tq_mla_frontend_fault_status", None
+        )
+
     def _maybe_report_active_ranks(self) -> None:
         if not (
             self.server_args.enable_dp_attention
@@ -3449,6 +3462,7 @@ class Scheduler(
             self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
+            self._attach_tq_mla_fault_status(batch_result)
             # Delay-sample is non-spec only; relays the sampled bonus tokens.
             self._relay_forward_payload(batch_result.future_indices, batch_result)
             batch_result.copy_to_cpu(

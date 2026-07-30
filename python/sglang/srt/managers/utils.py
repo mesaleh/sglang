@@ -55,6 +55,10 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[torch.cuda.Event] = None
+    # H43's process-lifetime sticky device word. The scheduler attaches the
+    # rank-local pool tensor; copy_to_cpu replaces it with its asynchronous
+    # host copy under the existing copy_done event.
+    tq_mla_fault_status: Optional[torch.Tensor] = None
     delay_sample_func: Optional[callable] = None
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
@@ -129,6 +133,8 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
+        if self.tq_mla_fault_status is not None:
+            self.tq_mla_fault_status = _async_d2h(self.tq_mla_fault_status)
 
         # Sub-objects only declare their device fields; the single copy+safety
         # primitive (_async_d2h: pinned D2H + record_stream) is injected here so
@@ -142,6 +148,17 @@ class GenerationBatchResult:
                 holder.map_device_tensors(_async_d2h)
 
         self.copy_done.record()
+
+    def raise_for_tq_mla_fault(self) -> None:
+        """Fail closed after copy_done if the native H43 writer saw bad input."""
+        if self.tq_mla_fault_status is None:
+            return
+        status = int(self.tq_mla_fault_status.item())
+        if status != 0:
+            raise RuntimeError(
+                "H43 TurboQuant frontend reported a sticky rank-local fault "
+                f"(status=0x{status:x}); coordinated rank restart is required"
+            )
 
     @classmethod
     def from_pp_proxy(

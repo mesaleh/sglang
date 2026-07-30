@@ -185,6 +185,7 @@ class SchedulerBatchResultProcessor:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            result.raise_for_tq_mla_fault()
             if result.routed_experts_output is not None:
                 result.routed_experts_output.finalize()
                 result.routed_experts_output = None
@@ -621,6 +622,7 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        result.raise_for_tq_mla_fault()
 
         self.output_streamer._stream_output_generation(
             batch.reqs, batch.return_logprob, is_idle_batch=True
@@ -633,6 +635,7 @@ class SchedulerBatchResultProcessor:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        result.raise_for_tq_mla_fault()
         if result.routed_experts_output is not None:
             result.routed_experts_output.finalize()
             result.routed_experts_output = None

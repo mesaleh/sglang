@@ -32,6 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.kv_turboquant import (
     should_allocate_mla_tq_fp8_codebook,
+    should_use_mla_tq_h43_frontend,
 )
 from sglang.srt.mem_cache.common import get_alloc_len_per_decode
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
@@ -187,9 +188,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if mr.use_mla_backend:
             if hasattr(mr, "turboquant_bits"):
-                # MLA + TurboQuant: nope half is packed k-bit + per-token scale,
-                # rope half stays uncompressed bf16. Matches storage layout in
-                # MLATokenToKVPoolTurboQuant.
+                # MLA + TurboQuant: nope half is packed k-bit + per-token scale.
+                # The default layout retains BF16 RoPE. The explicitly gated
+                # H43 E2M1 path stores FP8 RoPE plus a 16-byte FP8 codebook.
                 #   nope_packed:  (lora_rank // 2) bytes    (4-bit: 2 values/byte)
                 #   scale:        2 bytes                   (bf16, one per token)
                 #   rope_raw:     qk_rope_head_dim * 2 bytes (bf16 unmodified)
@@ -209,11 +210,20 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 nope_packed_bytes = lora // 2
                 # Per-token dequant scale for nope (bf16).
                 scale_bytes = 2
-                # Raw rope (bf16).
-                rope_bytes = rope * 2
-                codebook_bytes = 16 * should_allocate_mla_tq_fp8_codebook(
-                    mr.server_args.get_attention_backends()[1],
+                prefill_backend, decode_backend = (
+                    mr.server_args.get_attention_backends()
+                )
+                h43_frontend = should_use_mla_tq_h43_frontend(
+                    prefill_backend,
+                    decode_backend,
                     getattr(mr, "turboquant_e2m1", False),
+                    envs.SGLANG_TQ_MLA_H43_FRONTEND.get(),
+                )
+                rope_bytes = rope if h43_frontend else rope * 2
+                codebook_bytes = 16 * should_allocate_mla_tq_fp8_codebook(
+                    decode_backend,
+                    getattr(mr, "turboquant_e2m1", False),
+                    h43_frontend,
                 )
                 per_layer_per_token = (
                     nope_packed_bytes + scale_bytes + rope_bytes + codebook_bytes

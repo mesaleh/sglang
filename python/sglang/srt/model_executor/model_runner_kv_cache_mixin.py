@@ -23,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.kv_turboquant import (
     should_allocate_mla_tq_fp8_codebook,
+    should_use_mla_tq_h43_frontend,
 )
 from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
@@ -1012,6 +1013,20 @@ class ModelRunnerKVCacheMixin:
                     if hot_capacity_tokens > 0
                     else {}
                 )
+                prefill_backend, decode_backend = (
+                    self.server_args.get_attention_backends()
+                )
+                h43_frontend = should_use_mla_tq_h43_frontend(
+                    prefill_backend,
+                    decode_backend,
+                    getattr(self, "turboquant_e2m1", False),
+                    envs.SGLANG_TQ_MLA_H43_FRONTEND.get(),
+                )
+                if h43_frontend and hot_capacity_tokens > 0:
+                    raise ValueError(
+                        "SGLANG_TQ_MLA_H43_FRONTEND is incompatible with "
+                        "SGLANG_TQ_MLA_HOT_TOKENS"
+                    )
                 self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -1028,9 +1043,12 @@ class ModelRunnerKVCacheMixin:
                     turboquant_e2m1=getattr(self, "turboquant_e2m1", False),
                     turboquant_layer_ids=selected_layer_ids,
                     enable_fp8_codebook=should_allocate_mla_tq_fp8_codebook(
-                        self.server_args.get_attention_backends()[1],
+                        decode_backend,
                         getattr(self, "turboquant_e2m1", False),
+                        h43_frontend,
                     ),
+                    enable_fp8_rope=h43_frontend,
+                    enable_h43_frontend=h43_frontend,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                     **hot_kwargs,

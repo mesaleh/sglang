@@ -1768,13 +1768,19 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
         self.qk_rope_head_dim = device_pool.qk_rope_head_dim
         self.layer_num = device_pool.layer_num
         self.enable_fp8_codebook = device_pool.kv_nope_codebook_buffer is not None
+        self.rope_dtype = (
+            torch.float8_e4m3fn
+            if getattr(device_pool, "enable_fp8_rope", False)
+            else torch.bfloat16
+        )
+        self.rope_element_size = torch.empty((), dtype=self.rope_dtype).element_size()
         # 4-bit packed: 2 values per byte.
         self.packed_dim = self.kv_lora_rank // 2
         # Per-token-per-layer bytes for sizing the pool.
         self._cell_bytes = (
             self.packed_dim
             + 2
-            + self.qk_rope_head_dim * 2
+            + self.qk_rope_head_dim * self.rope_element_size
             + (16 if self.enable_fp8_codebook else 0)
         )
 
@@ -1839,10 +1845,10 @@ class MLATokenToKVPoolHostTurboQuant(HostKVCache):
             if self.enable_fp8_codebook
             else None
         )
-        # Rope: (layer_num, size, 1, qk_rope_head_dim) bfloat16
+        # Rope mirrors the device pool's BF16 or explicitly gated FP8 dtype.
         self.kv_rope_host = alloc_func(
             (self.layer_num, self.size, 1, self.qk_rope_head_dim),
-            dtype=torch.bfloat16,
+            dtype=self.rope_dtype,
             device=self.device,
             pin_memory=self.pin_memory,
             allocator=self.allocator,

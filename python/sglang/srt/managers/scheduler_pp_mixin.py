@@ -1477,6 +1477,7 @@ class SchedulerPPMixin:
             ),
             skipped_output_comm=True,
         )
+        self._attach_tq_mla_fault_status(batch_result)
         d2h_event = self.device_module.Event()
         d2h_event.record(self.device_module.current_stream())
         return None, batch_result, d2h_event
@@ -1540,6 +1541,7 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+        self._attach_tq_mla_fault_status(output_result)
         return output_result
 
     def _pp_process_batch_result(
@@ -1554,6 +1556,7 @@ class SchedulerPPMixin:
             output_result = self.model_worker.process_pp_batch_result(
                 batch, output_result
             )
+            self._attach_tq_mla_fault_status(output_result)
             batch.spec_info = output_result.next_draft_input
             if output_result.new_seq_lens is not None:
                 batch.seq_lens = output_result.new_seq_lens

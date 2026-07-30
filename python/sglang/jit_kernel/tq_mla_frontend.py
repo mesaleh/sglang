@@ -19,8 +19,9 @@ import torch
 from torch.utils.cpp_extension import load
 
 _MODULE: ModuleType | None = None
+_MODULE_PREBUILT = False
 _MODULE_LOCK = threading.Lock()
-_MODULE_NAME = "sglang_tq_mla_frontend_sm100_h43_i2_v1"
+_MODULE_NAME = "sglang_tq_mla_frontend_sm100_h43_i3_v2"
 
 
 def _sha256(path: Path) -> str:
@@ -62,12 +63,13 @@ def _load_prebuilt_module() -> ModuleType | None:
 
 
 def _get_module() -> ModuleType:
-    global _MODULE
+    global _MODULE, _MODULE_PREBUILT
     if _MODULE is not None:
         return _MODULE
     with _MODULE_LOCK:
         if _MODULE is None:
             _MODULE = _load_prebuilt_module()
+            _MODULE_PREBUILT = _MODULE is not None
         if _MODULE is None:
             source = (
                 Path(__file__).resolve().parent
@@ -87,6 +89,28 @@ def _get_module() -> ModuleType:
                 verbose=False,
             )
     return _MODULE
+
+
+def preload_tq_mla_frontend_prebuilt() -> None:
+    """Load the digest-pinned extension without permitting a runtime build."""
+
+    global _MODULE, _MODULE_PREBUILT
+    if _MODULE is not None:
+        if not _MODULE_PREBUILT:
+            raise RuntimeError(
+                "H43 serving refuses an extension loaded by runtime compilation"
+            )
+        return
+    with _MODULE_LOCK:
+        if _MODULE is None:
+            module = _load_prebuilt_module()
+            if module is None:
+                raise RuntimeError(
+                    "H43 serving requires SGLANG_TQ_MLA_FRONTEND_SO and "
+                    "SGLANG_TQ_MLA_FRONTEND_SO_SHA256"
+                )
+            _MODULE = module
+            _MODULE_PREBUILT = True
 
 
 def tq_mla_frontend_out(
@@ -207,4 +231,8 @@ def tq_mla_frontend(
     return query_out
 
 
-__all__ = ["tq_mla_frontend", "tq_mla_frontend_out"]
+__all__ = [
+    "preload_tq_mla_frontend_prebuilt",
+    "tq_mla_frontend",
+    "tq_mla_frontend_out",
+]

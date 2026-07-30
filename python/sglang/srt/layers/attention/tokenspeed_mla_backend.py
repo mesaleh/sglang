@@ -38,6 +38,10 @@ import triton.language as tl
 
 from sglang.jit_kernel.fp8_quantize import fp8_quantize
 from sglang.jit_kernel.mla_kv_pack_quantize_fp8 import mla_kv_pack_quantize_fp8
+from sglang.jit_kernel.tq_mla_frontend import (
+    preload_tq_mla_frontend_prebuilt,
+    tq_mla_frontend_out,
+)
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.tokenspeed_workspace import (
     tokenspeed_workspace_bytes,
@@ -280,15 +284,45 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             and getattr(self._tq_pool, "is_mla_turboquant_hotcold_pool", False)
         )
         self._tq_config = self._tq_pool.tq_config if self._tq4_cache else None
+        self._h43_frontend = bool(
+            self._tq4_cache and getattr(self._tq_pool, "enable_h43_frontend", False)
+        )
 
         if (
             self._tq4_cache
             and bool(getattr(self._tq_config, "e2m1", False))
             and self._tq_pool.kv_nope_codebook_buffer is not None
+            and not self._h43_frontend
         ):
             raise RuntimeError(
                 "TokenSpeed E2M1 must not allocate the redundant FP8 lookup row"
             )
+        if self._h43_frontend:
+            if not bool(getattr(self._tq_config, "e2m1", False)):
+                raise RuntimeError("H43 frontend requires E2M1 TurboQuant")
+            if self._tq_pool.kv_nope_codebook_buffer is None:
+                raise RuntimeError("H43 frontend requires the FP8 codebook pool")
+            selected_rope = next(
+                (value for value in self._tq_pool.kv_rope_buffer if value is not None),
+                None,
+            )
+            if selected_rope is None or selected_rope.dtype != torch.float8_e4m3fn:
+                raise RuntimeError("H43 frontend requires an FP8 RoPE pool")
+            if self._tq_pool.page_size != 32:
+                raise RuntimeError("H43 frontend requires page_size=32")
+            if torch.cuda.get_device_capability(selected_rope.device) != (10, 0):
+                raise RuntimeError("H43 frontend requires an SM100 GPU")
+            tq4_parameters = signature(
+                tokenspeed_mla.tokenspeed_mla_decode_tq4
+            ).parameters
+            if (
+                "kv_nope_codebook" not in tq4_parameters
+                or "fp8_rope" not in tq4_parameters
+            ):
+                raise RuntimeError(
+                    "installed TokenSpeed lacks the H43 codebook/FP8-RoPE reader"
+                )
+            preload_tq_mla_frontend_prebuilt()
         if not self._tq4_cache and self.data_type != torch.float8_e4m3fn:
             raise ValueError(
                 "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
@@ -488,8 +522,68 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         positions: torch.Tensor,
         layer: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Build FP8 (Q, K, V) for the FMHA kernel and write FP8 KV cache."""
+        if (
+            getattr(self, "_h43_frontend", False)
+            and self._is_turboquant_layer(layer.attn_mha)
+            and (
+                forward_batch.forward_mode.is_decode()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+        ):
+            if not getattr(self._tq_config, "mla_absorb_rotation_fused", False):
+                raise RuntimeError("H43 frontend requires fused MLA absorb rotations")
+            q_nope = q[..., : layer.qk_nope_head_dim]
+            q_rope, cache_rope = layer.rotary_emb(positions, q_pe, k_pe)
+            cache_latent = kv_a.unsqueeze(1)
+            query_out = torch.empty(
+                (
+                    q_nope.shape[0],
+                    q_nope.shape[1],
+                    layer.qk_nope_head_dim + layer.qk_rope_head_dim,
+                ),
+                dtype=torch.float8_e4m3fn,
+                device=q_nope.device,
+            )
+            layer_id_rel = layer.attn_mha.layer_id - self._tq_pool.start_layer
+            packed = self._tq_pool.kv_nope_packed_buffer[layer_id_rel]
+            scale = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
+            rope = self._tq_pool.kv_rope_buffer[layer_id_rel]
+            codebook = self._tq_pool.kv_nope_codebook_buffer[layer_id_rel]
+            status = self._tq_pool.tq_mla_frontend_fault_status
+            if any(value is None for value in (packed, scale, rope, codebook, status)):
+                raise RuntimeError("H43 selected-layer pool is incomplete")
+            storage_code_lut = self._tq_config.k_storage_code_lut
+            if storage_code_lut is None:
+                raise RuntimeError("H43 E2M1 storage-code LUT is missing")
+            tq_mla_frontend_out(
+                q_nope,
+                q_rope,
+                cache_latent,
+                cache_rope,
+                forward_batch.out_cache_loc,
+                self._tq_config.signs1,
+                self._tq_config.signs2,
+                self._tq_config.k_boundaries,
+                self._tq_config.k_quant_centroids,
+                storage_code_lut,
+                query_out,
+                packed,
+                scale,
+                rope,
+                status,
+                decode_centroids=self._tq_config.k_centroids,
+                codebook_cache=codebook,
+                scale_multiplier=self._tq_config.k_dequant_scale_multiplier,
+                rotation_fused=True,
+                num_warps=8,
+                strict=False,
+            )
+            # K/V are consumed only by prefill. Decode and target verification
+            # already wrote the compressed cache and run with save_kv_cache=False.
+            return query_out, None, None
+
         kv = layer.kv_b_proj(kv_a)[0]
         kv = kv.view(
             -1, layer.num_local_heads, layer.qk_nope_head_dim + layer.v_head_dim
@@ -1057,7 +1151,18 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             rotation_fused = getattr(
                 self._tq_config, "mla_absorb_rotation_fused", False
             )
-            if rotation_fused:
+            h43_frontend = getattr(self, "_h43_frontend", False)
+            if h43_frontend:
+                if not rotation_fused:
+                    raise RuntimeError(
+                        "H43 frontend requires fused MLA absorb rotations"
+                    )
+                if query.dtype != torch.float8_e4m3fn:
+                    raise RuntimeError(
+                        "H43 reader requires the native FP8 query output"
+                    )
+                query_fp8 = query
+            elif rotation_fused:
                 query_rotated = query
             else:
                 query_nope_rotated = self._tq_config.rotate_query(
@@ -1066,11 +1171,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 query_rotated = torch.cat(
                     (query_nope_rotated, query[..., self.kv_lora_rank :]), dim=-1
                 )
-            query_fp8 = _quantize_tq4_query(
-                query_rotated,
-                self.kv_lora_rank,
-                is_arch_support_pdl(),
-            )
+            if not h43_frontend:
+                query_fp8 = _quantize_tq4_query(
+                    query_rotated,
+                    self.kv_lora_rank,
+                    is_arch_support_pdl(),
+                )
             layer_id_rel = layer.layer_id - self._tq_pool.start_layer
             scale_buffer = self._tq_pool.kv_nope_scale_buffer[layer_id_rel]
             rope_buffer = self._tq_pool.kv_rope_buffer[layer_id_rel]
@@ -1079,7 +1185,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             rope = rope_buffer.view(-1, self.page_size, self.qk_rope_head_dim)
             e2m1_cache = bool(getattr(self._tq_config, "e2m1", False))
             codebook_buffer = self._tq_pool.kv_nope_codebook_buffer
-            if e2m1_cache:
+            if e2m1_cache and not h43_frontend:
                 # Canonical E2M1 codes can be expanded from the packed cache
                 # and per-token BF16 scale. Keeping a 16-byte FP8 lookup row
                 # would add a redundant shadow representation.
@@ -1100,7 +1206,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 kernel_max_seq_len,
                 tokenspeed_mla.get_num_sm(query.device),
             )
-            output = tokenspeed_mla.tokenspeed_mla_decode_tq4(
+            decode_kwargs = dict(
                 query=query_fp8,
                 kv_nope_packed=kv_cache,
                 kv_nope_scale=scale,
@@ -1124,6 +1230,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 cmask_off=custom_mask_offsets,
                 split_kv_override=split_kv,
             )
+            if h43_frontend:
+                decode_kwargs["fp8_rope"] = True
+            output = tokenspeed_mla.tokenspeed_mla_decode_tq4(**decode_kwargs)
             if not rotation_fused:
                 output = self._tq_config.inverse_rotate_output(output)
             return output

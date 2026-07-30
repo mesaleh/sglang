@@ -127,9 +127,11 @@ template <bool kRotationFused>
 __device__ __forceinline__ void write_query_head(
     const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
     const float* signs1, const float* signs2, uint8_t* query_out,
-    const int token, const int head, const int lane) {
+    const int token, const int head, const int lane,
+    const int64_t query_token_stride, const int64_t query_head_stride) {
   const int64_t latent_base =
-      (static_cast<int64_t>(token) * kQueryHeads + head) * kLatentDim;
+      static_cast<int64_t>(token) * query_token_stride +
+      static_cast<int64_t>(head) * query_head_stride;
   const int64_t rope_base =
       (static_cast<int64_t>(token) * kQueryHeads + head) * kRopeDim;
   const int64_t out_base =
@@ -287,14 +289,16 @@ __global__ void tq_mla_frontend_kernel(
     uint8_t* query_out, uint8_t* packed_cache, __nv_bfloat16* scale_cache,
     uint8_t* rope_cache, uint8_t* codebook_cache, int32_t* fault_status,
     const int64_t pool_size,
-    const float scale_multiplier) {
+    const float scale_multiplier, const int64_t query_token_stride,
+    const int64_t query_head_stride) {
   const int token = blockIdx.x;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
 
   for (int head = warp; head < kQueryHeads; head += kWarps) {
     write_query_head<kRotationFused>(query_latent, query_rope, signs1, signs2,
-                                     query_out, token, head, lane);
+                                     query_out, token, head, lane,
+                                     query_token_stride, query_head_stride);
   }
 
   if (warp == 0) {
@@ -323,8 +327,19 @@ bool tensors_overlap(const torch::Tensor& lhs, const torch::Tensor& rhs) {
   }
   const auto lhs_begin = reinterpret_cast<uintptr_t>(lhs.data_ptr());
   const auto rhs_begin = reinterpret_cast<uintptr_t>(rhs.data_ptr());
-  const auto lhs_end = lhs_begin + lhs.nbytes();
-  const auto rhs_end = rhs_begin + rhs.nbytes();
+  const auto tensor_span_bytes = [](const torch::Tensor& tensor) {
+    int64_t max_offset = 0;
+    for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+      TORCH_CHECK(tensor.stride(dim) >= 0,
+                  "H43 frontend does not support negative strides");
+      if (tensor.size(dim) > 0) {
+        max_offset += (tensor.size(dim) - 1) * tensor.stride(dim);
+      }
+    }
+    return static_cast<uintptr_t>((max_offset + 1) * tensor.element_size());
+  };
+  const auto lhs_end = lhs_begin + tensor_span_bytes(lhs);
+  const auto rhs_end = rhs_begin + tensor_span_bytes(rhs);
   return lhs_begin < rhs_end && rhs_begin < lhs_end;
 }
 
@@ -365,7 +380,7 @@ void launch_frontend(
           reinterpret_cast<uint8_t*>(rope_cache.data_ptr()),
           kWriteCodebook ? codebook_cache->data_ptr<uint8_t>() : nullptr,
           fault_status.data_ptr<int32_t>(), packed_cache.size(0),
-          scale_multiplier);
+          scale_multiplier, query_latent.stride(0), query_latent.stride(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -384,7 +399,7 @@ void tq_mla_frontend_out(
     const std::optional<torch::Tensor>& codebook_cache,
     const double scale_multiplier, const bool rotation_fused,
     const int64_t num_warps, const bool strict) {
-  check_cuda_contiguous(query_latent, "query_latent");
+  TORCH_CHECK(query_latent.is_cuda(), "query_latent must be a CUDA tensor");
   check_cuda_contiguous(query_rope, "query_rope");
   check_cuda_contiguous(cache_latent, "cache_latent");
   check_cuda_contiguous(cache_rope, "cache_rope");
@@ -468,6 +483,11 @@ void tq_mla_frontend_out(
   TORCH_CHECK(query_latent.dim() == 3 && query_latent.size(1) == kQueryHeads &&
                   query_latent.size(2) == kLatentDim,
               "query_latent must have shape (T, 8, 512)");
+  TORCH_CHECK(query_latent.stride(2) == 1 &&
+                  query_latent.stride(1) >= kLatentDim &&
+                  query_latent.stride(0) >=
+                      kQueryHeads * query_latent.stride(1),
+              "query_latent must have a non-overlapping contiguous last dimension");
   const int64_t tokens = query_latent.size(0);
   TORCH_CHECK(tokens <= std::numeric_limits<int>::max(),
               "token count exceeds the CUDA grid limit");

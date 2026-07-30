@@ -265,6 +265,10 @@ class Envs:
     SGLANG_TQ_MLA_FUSED_KV_WRITE = EnvBool(False)
     SGLANG_TQ_MLA_FUSED_ROPE_WRITE = EnvBool(False)
     SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS = EnvInt(256)
+    # Experimental H43 SM100 query/cache frontend. This changes the selected
+    # E2M1 row from BF16 RoPE/no-codebook to FP8 RoPE plus a 16-byte FP8
+    # codebook and is deliberately default-off.
+    SGLANG_TQ_MLA_H43_FRONTEND = EnvBool(False)
     SGLANG_TQ_MLA_HOT_TOKENS = EnvInt(0)
     SGLANG_TQ_MLA_FAST_METADATA = EnvBool(False)
     SGLANG_TQ_MLA_FUSED_METADATA_INDICES = EnvBool(False)

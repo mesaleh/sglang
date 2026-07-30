@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -141,6 +141,90 @@ def test_tq4_absorb_rotation_does_not_override_mha_prefill():
     # prefill uses independent 192-wide Q/K and 128-wide V projections, so the
     # TokenSpeed backend must preserve the parent prefill implementation.
     assert TokenspeedMLABackend.forward_extend is TRTLLMMLABackend.forward_extend
+
+
+def test_h43_decode_frontend_skips_unused_kv_projection():
+    backend = object.__new__(TokenspeedMLABackend)
+    backend._h43_frontend = True
+    backend._tq4_cache = True
+    backend._tq4_hotcold_cache = False
+    config = SimpleNamespace(
+        mla_absorb_rotation_fused=True,
+        signs1=torch.ones(512),
+        signs2=torch.ones(512),
+        k_boundaries=torch.zeros(15),
+        k_quant_centroids=torch.zeros(16),
+        k_storage_code_lut=torch.arange(16, dtype=torch.uint8),
+        k_centroids=torch.zeros(16),
+        k_dequant_scale_multiplier=1.0,
+    )
+    pool = SimpleNamespace(
+        start_layer=0,
+        is_turboquant_layer=lambda layer_id: layer_id == 3,
+        kv_nope_packed_buffer=[
+            None,
+            None,
+            None,
+            torch.empty(8, 1, 256, dtype=torch.uint8),
+        ],
+        kv_nope_scale_buffer=[
+            None,
+            None,
+            None,
+            torch.empty(8, 1, dtype=torch.bfloat16),
+        ],
+        kv_rope_buffer=[
+            None,
+            None,
+            None,
+            torch.empty(8, 1, 64, dtype=torch.float8_e4m3fn),
+        ],
+        kv_nope_codebook_buffer=[
+            None,
+            None,
+            None,
+            torch.empty(8, 1, 16, dtype=torch.uint8),
+        ],
+        tq_mla_frontend_fault_status=torch.zeros(1, dtype=torch.int32),
+    )
+    backend._tq_pool = pool
+    backend._tq_config = config
+
+    kv_b_proj = Mock(side_effect=AssertionError("kv_b_proj must be skipped"))
+    layer = SimpleNamespace(
+        qk_nope_head_dim=512,
+        qk_rope_head_dim=64,
+        kv_b_proj=kv_b_proj,
+        rotary_emb=Mock(side_effect=lambda positions, q_pe, k_pe: (q_pe, k_pe)),
+        attn_mha=SimpleNamespace(layer_id=3),
+    )
+    q = torch.zeros(5, 8, 576, dtype=torch.bfloat16)
+    q_pe = torch.zeros(5, 8, 64, dtype=torch.bfloat16)
+    kv_a = torch.zeros(5, 512, dtype=torch.bfloat16)
+    k_pe = torch.zeros(5, 1, 64, dtype=torch.bfloat16)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        out_cache_loc=torch.arange(5, dtype=torch.int64),
+    )
+
+    with patch(
+        "sglang.srt.layers.attention.tokenspeed_mla_backend.tq_mla_frontend_out"
+    ) as frontend:
+        query, key, value = backend.prepare_prefill_qkv(
+            q=q,
+            q_pe=q_pe,
+            kv_a=kv_a,
+            k_pe=k_pe,
+            positions=torch.arange(5, dtype=torch.int64),
+            layer=layer,
+            forward_batch=forward_batch,
+        )
+
+    kv_b_proj.assert_not_called()
+    frontend.assert_called_once()
+    assert query.shape == (5, 8, 576)
+    assert query.dtype == torch.float8_e4m3fn
+    assert key is None and value is None
 
 
 def test_tq4_rotation_fusion_uses_resolved_decode_backend():

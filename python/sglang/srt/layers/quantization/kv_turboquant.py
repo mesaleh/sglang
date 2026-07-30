@@ -53,9 +53,29 @@ E2M1_SORTED_CODE_LUT = np.array(
 """Map a sorted quantization-bin index to the corresponding E2M1 code."""
 
 
-def should_allocate_mla_tq_fp8_codebook(decode_backend: str, e2m1: bool) -> bool:
+def should_use_mla_tq_h43_frontend(
+    prefill_backend: str,
+    decode_backend: str,
+    e2m1: bool,
+    enabled: bool,
+) -> bool:
+    """Whether the default-off H43 E2M1 serving contract is selected."""
+    if not enabled:
+        return False
+    if not e2m1:
+        raise ValueError("H43 frontend requires E2M1 TurboQuant")
+    if prefill_backend != "tokenspeed_mla" or decode_backend != "tokenspeed_mla":
+        raise ValueError(
+            "H43 frontend requires TokenSpeed MLA for both prefill and decode"
+        )
+    return True
+
+
+def should_allocate_mla_tq_fp8_codebook(
+    decode_backend: str, e2m1: bool, h43_frontend: bool = False
+) -> bool:
     """Whether MLA TurboQuant needs the optional per-token FP8 lookup row."""
-    return decode_backend == "tokenspeed_mla" and not e2m1
+    return decode_backend == "tokenspeed_mla" and (not e2m1 or h43_frontend)
 
 
 def parse_mla_turboquant_layer_ids(

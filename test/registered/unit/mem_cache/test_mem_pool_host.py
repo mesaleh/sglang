@@ -139,6 +139,41 @@ class TestMLATurboQuantHostKVCache(CustomTestCase):
             )
             self.assertEqual(transfer.call_count, 4)
 
+    def test_h43_host_pool_uses_fp8_rope_and_338_bytes(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPoolTurboQuant
+
+        with envs.SGLANG_TQ_MLA_FUSED_KV_WRITE.override(False):
+            device_pool = MLATokenToKVPoolTurboQuant(
+                size=self.page_size * 2,
+                page_size=self.page_size,
+                dtype=torch.bfloat16,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=2,
+                device="cpu",
+                enable_memory_saver=False,
+                turboquant_e2m1=True,
+                enable_fp8_codebook=True,
+                enable_fp8_rope=True,
+                enable_h43_frontend=True,
+            )
+        host_pool = MLATokenToKVPoolHostTurboQuant(
+            device_pool=device_pool,
+            host_to_device_ratio=2.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="layer_first",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+
+        self.assertEqual(device_pool.get_per_token_all_layer_bytes(), 2 * 338)
+        self.assertEqual(host_pool._cell_bytes, 338)
+        self.assertEqual(host_pool.kv_rope_host.dtype, torch.float8_e4m3fn)
+        self.assertEqual(device_pool.tq_mla_frontend_fault_status.dtype, torch.int32)
+
 
 if __name__ == "__main__":
     unittest.main()

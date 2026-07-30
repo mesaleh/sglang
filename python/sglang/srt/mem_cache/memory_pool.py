@@ -3387,7 +3387,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
     lookup row per token so its SM100 reader can replace indexed scalar lookups
     with register permutations. That optional layout is 402 bytes/token/layer.
     Native E2M1 consumes the canonical packed codes directly and remains at
-    386 bytes/token/layer.
+    386 bytes/token/layer. The explicitly gated H43 frontend instead stores
+    FP8 RoPE plus that codebook, for 338 bytes/token/layer.
 
     Storage layout (per layer):
       - kv_nope_packed_buffer: (size+page, 1, lora_rank // 2) uint8
@@ -3395,18 +3396,14 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
           hardware codes in the explicitly gated native-E2M1 format)
       - kv_nope_scale_buffer: (size+page, 1) bfloat16
           one dequant-scale (norm / max(qnorm, eps)) per token
-      - kv_rope_buffer: (size+page, 1, qk_rope_head_dim) bfloat16
-          raw rope values
+      - kv_rope_buffer: (size+page, 1, qk_rope_head_dim) bfloat16 by default,
+          float8_e4m3fn for the explicitly gated H43 frontend
       - kv_nope_codebook_buffer: optional (size+page, 1, 16) uint8
-          raw E4M3FN codebook bytes, enabled only for TokenSpeed Lloyd decode
+          raw E4M3FN codebook bytes, enabled for TokenSpeed Lloyd decode or H43
 
-    Correctness approach:
-      This class overrides get_key_buffer / get_value_buffer / get_mla_kv_buffer
-      to dequantize on-demand into bf16 tensors with the same shapes attention
-      backends currently expect. No attention-backend changes required to boot.
-      Performance cost: dequant runs every attention call rather than once.
-      Acceptable for a first-cut validation; G3 (backend integration) will
-      add fused paths later.
+    Generic accessors reconstruct BF16 rows on demand. TokenSpeed-selected
+    decode paths consume the persistent packed representation directly; H43
+    also writes its FP8 query and selected cache row in one native operation.
     """
 
     is_mla_turboquant_pool = True
@@ -3429,6 +3426,8 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_fp8_codebook: bool = False,
+        enable_fp8_rope: bool = False,
+        enable_h43_frontend: bool = False,
         turboquant_layer_ids: Optional[tuple[int, ...]] = None,
     ):
         # For MLA, V is derived from the same latent as K (no separate V buffer).
@@ -3452,7 +3451,17 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
             )
         self.turboquant_bits = k_bits
         self.enable_fp8_codebook = enable_fp8_codebook
+        self.enable_fp8_rope = enable_fp8_rope
+        self.enable_h43_frontend = enable_h43_frontend
         self.turboquant_e2m1 = turboquant_e2m1
+        if self.enable_h43_frontend and not (
+            self.turboquant_e2m1 and self.enable_fp8_codebook and self.enable_fp8_rope
+        ):
+            raise ValueError(
+                "H43 frontend requires E2M1, an FP8 codebook, and FP8 RoPE"
+            )
+        if self.enable_fp8_rope and not self.enable_h43_frontend:
+            raise ValueError("FP8 RoPE is reserved for the gated H43 frontend")
 
         resolved_start_layer = 0 if start_layer is None else start_layer
         resolved_end_layer = (
@@ -3558,10 +3567,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         return layer_id_rel in self._tq_layer_ids_rel
 
     def get_per_token_all_layer_bytes(self) -> int:
+        rope_bytes = self.qk_rope_head_dim * (1 if self.enable_fp8_rope else 2)
         compressed_row_bytes = (
             self.kv_lora_rank // 2
             + 2
-            + self.qk_rope_head_dim * 2
+            + rope_bytes
             + (16 if self.enable_fp8_codebook else 0)
         )
         fp8_row_bytes = self.kv_lora_rank + self.qk_rope_head_dim
@@ -3607,7 +3617,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
                         )
                         rope_buffer = torch.zeros(
                             (m, 1, rope),
-                            dtype=torch.bfloat16,
+                            dtype=(
+                                torch.float8_e4m3fn
+                                if self.enable_fp8_rope
+                                else torch.bfloat16
+                            ),
                             device=self.device,
                         )
                         self.kv_nope_packed_buffer[layer_id_rel] = packed
@@ -3640,6 +3654,11 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         self._tq_mla_kv_write_y = torch.empty(
             (workspace_tokens, 1, lora), dtype=torch.float32, device=self.device
         )
+        self.tq_mla_frontend_fault_status = (
+            torch.zeros(1, dtype=torch.int32, device=self.device)
+            if self.enable_h43_frontend
+            else None
+        )
 
         # The parent builds its pointer table from this list. Each entry is the
         # sole primary allocation for that layer: packed nope for TQ, or the
@@ -3670,6 +3689,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         del self._tq_mla_kv_write_unit
         del self._tq_mla_kv_write_norms
         del self._tq_mla_kv_write_y
+        del self.tq_mla_frontend_fault_status
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if tgt_loc.numel() == 0:
@@ -3793,7 +3813,7 @@ class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
         nope = self._dequant_nope_full(layer_id_rel)  # (m, 1, lora)
         rope = self.kv_rope_buffer[layer_id_rel]  # (m, 1, rope)
         assert rope is not None
-        return torch.cat([nope, rope], dim=-1)  # (m, 1, lora+rope)
+        return torch.cat([nope, rope.to(torch.bfloat16)], dim=-1)  # (m, 1, lora+rope)
 
     # ------------------------------------------------------------------
     # Overrides of MLATokenToKVPool accessors

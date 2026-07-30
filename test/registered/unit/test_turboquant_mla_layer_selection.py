@@ -10,6 +10,8 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 from sglang.srt.layers.quantization.kv_turboquant import (
     parse_mla_turboquant_layer_ids,
+    should_allocate_mla_tq_fp8_codebook,
+    should_use_mla_tq_h43_frontend,
 )
 from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
 
@@ -24,6 +26,25 @@ def test_parse_mla_turboquant_layer_ids_canonicalizes_ranges():
         15,
         20,
     )
+
+
+def test_h43_frontend_gate_and_codebook_truth_table():
+    assert not should_use_mla_tq_h43_frontend(
+        "tokenspeed_mla", "tokenspeed_mla", True, False
+    )
+    with pytest.raises(ValueError, match="both prefill and decode"):
+        should_use_mla_tq_h43_frontend("flashinfer", "tokenspeed_mla", True, True)
+    with pytest.raises(ValueError, match="requires E2M1"):
+        should_use_mla_tq_h43_frontend("tokenspeed_mla", "tokenspeed_mla", False, True)
+    assert should_use_mla_tq_h43_frontend(
+        "tokenspeed_mla", "tokenspeed_mla", True, True
+    )
+
+    assert not should_allocate_mla_tq_fp8_codebook("tokenspeed_mla", True)
+    assert should_allocate_mla_tq_fp8_codebook(
+        "tokenspeed_mla", True, h43_frontend=True
+    )
+    assert should_allocate_mla_tq_fp8_codebook("tokenspeed_mla", False)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +116,30 @@ def test_mla_turboquant_pool_sizing_preserves_all_layer_default():
         cell_size = configurator._compute_cell_size(runner, num_layers=10)
 
     assert cell_size == 10 * 386
+
+
+def test_h43_pool_sizing_uses_338_byte_selected_row():
+    configurator = object.__new__(DefaultPoolConfigurator)
+    configurator._fixed_size = 0
+    runner = _fake_model_runner((8, 12, 15, 25))
+
+    with (
+        patch(
+            "sglang.srt.model_executor.pool_configurator.get_attention_tp_size",
+            return_value=8,
+        ),
+        patch(
+            "sglang.srt.model_executor.pool_configurator.envs.SGLANG_TQ_MLA_HOT_TOKENS.get",
+            return_value=0,
+        ),
+        patch(
+            "sglang.srt.model_executor.pool_configurator.envs.SGLANG_TQ_MLA_H43_FRONTEND.get",
+            return_value=True,
+        ),
+    ):
+        cell_size = configurator._compute_cell_size(runner, num_layers=10)
+
+    assert cell_size == 2 * 338 + 8 * 576
 
 
 def test_tokenspeed_layer_static_frontend_dispatch():

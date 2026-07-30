@@ -594,7 +594,10 @@ def test_wrapper_rejections(
     noncontiguous = torch.empty(
         1, HEADS, LATENT * 2, dtype=torch.bfloat16, device=device
     )[..., ::2]
-    expect_error(lambda: invoke((noncontiguous, *inputs[1:])), "must be contiguous")
+    expect_error(
+        lambda: invoke((noncontiguous, *inputs[1:])),
+        "non-overlapping contiguous last dimension",
+    )
     expect_error(lambda: invoke((inputs[0].float(), *inputs[1:])), "must be bfloat16")
     expect_error(lambda: invoke(changed_locations=locations.int()), "must be int64")
     expect_error(
@@ -754,6 +757,36 @@ def test_special_fp8(
     assert torch.equal(buffers.codebook[locations], expected_codebook[locations])
     assert int(buffers.status.item()) == 0
     assert_guards(buffers)
+
+
+def test_query_projection_view(
+    config: TurboQuantConfig,
+    device: torch.device,
+    generator: torch.Generator,
+) -> None:
+    tokens = 5
+    full_query = torch.empty(
+        tokens, HEADS, LATENT + ROPE, dtype=torch.bfloat16, device=device
+    ).normal_(mean=0.0, std=0.125, generator=generator)
+    query_latent = full_query[..., :LATENT]
+    assert not query_latent.is_contiguous()
+    assert query_latent.stride() == (
+        HEADS * (LATENT + ROPE),
+        LATENT + ROPE,
+        1,
+    )
+    _, query_rope, cache_latent, cache_rope = make_inputs(
+        tokens, device, generator, "random"
+    )
+    locations = torch.tensor([7, 2, 11, 4, 9], dtype=torch.int64, device=device)
+    assert_case(
+        (query_latent, query_rope, cache_latent, cache_rope),
+        locations,
+        config,
+        rotation_fused=True,
+        warps=8,
+        pool_size=16,
+    )
 
 
 def run_strict_invalid(
@@ -916,6 +949,7 @@ def main() -> None:
     test_current_stream(config, device, generator)
     test_wrapper_rejections(config, device, generator)
     test_no_codebook_specialization(config, device, generator)
+    test_query_projection_view(config, device, generator)
     test_codebook_scale_boundaries(config, device, generator)
     test_special_fp8(config, device)
     result = {
@@ -937,6 +971,7 @@ def main() -> None:
         "current_stream": "PASS",
         "wrapper_rejections": "PASS",
         "no_codebook_specialization": "PASS",
+        "query_projection_view": "PASS",
         "codebook_scale_boundaries": "PASS",
         "special_fp8": "PASS",
     }
