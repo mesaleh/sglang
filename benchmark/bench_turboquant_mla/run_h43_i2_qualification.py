@@ -505,6 +505,12 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                     "processes": 1,
                     "phase": "pre-outage",
                 },
+                "gpu_stage_surface": {
+                    "timeout": 180,
+                    "processes": 1,
+                    "phase": "pre-outage",
+                    "gpu_access": False,
+                },
                 "writer_correctness": {"timeout": 300, "observed_seconds": 54},
                 "lifecycle": {"timeout": 300, "basis": "six focused unit methods"},
                 "roundtrip_each": {"timeout": 300, "processes": 5},
@@ -545,6 +551,7 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
                     "native-prebuilt-load",
                     "h40-contract",
                     "pdl-source-order",
+                    "gpu-stage-surface",
                 )
             },
         }
@@ -744,6 +751,41 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
         )
         if pdl_source is None:
             raise RuntimeError("PDL source-order gate produced no result")
+        surface_script = r"""set -euo pipefail
+command -v compute-sanitizer >/dev/null
+command -v ncu >/dev/null
+command -v cuobjdump >/dev/null
+test -f /i2/benchmark/bench_turboquant_mla/test_h41_w2_frontend.py
+help=$(python3 /i2/benchmark/bench_turboquant_mla/test_h41_w2_frontend.py --help)
+grep -Fq -- '--mode' <<<"$help"
+test -f /i2/benchmark/bench_turboquant_mla/test_h41_i1_roundtrip.py
+help=$(python3 /i2/benchmark/bench_turboquant_mla/test_h41_i1_roundtrip.py --help)
+for option in --context --q-len --split-kv; do grep -Fq -- "$option" <<<"$help"; done
+test -f /i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py
+help=$(python3 /i2/benchmark/bench_turboquant_mla/probe_h43_i2_pdl_ordering.py --help)
+for option in --context --q-len --split-kv --steps --reader; do grep -Fq -- "$option" <<<"$help"; done
+test -f /i2/benchmark/bench_turboquant_mla/bench_h43_i2_writer_delta.py
+help=$(python3 /i2/benchmark/bench_turboquant_mla/bench_h43_i2_writer_delta.py --help)
+for option in --tokens --pairs --replays --profile-arm; do grep -Fq -- "$option" <<<"$help"; done
+test -f /i2/benchmark/bench_turboquant_mla/bench_h41_i1_integrated.py
+help=$(python3 /i2/benchmark/bench_turboquant_mla/bench_h41_i1_integrated.py --help)
+for option in --context --split-kv --allocation-order --sequence --warmups --samples --replays-per-sample; do grep -Fq -- "$option" <<<"$help"; done
+test -f /work/probe_h43_tq_racecheck.py
+help=$(python3 /work/probe_h43_tq_racecheck.py --help)
+for option in --contract --context --sequence; do grep -Fq -- "$option" <<<"$help"; done
+test -f /work/check_h43_racecheck.py
+help=$(python3 /work/check_h43_racecheck.py --help)
+for option in --contract --context --reference-log --candidate-log --reference-target --candidate-target --reference-exit-code --candidate-exit-code; do grep -Fq -- "$option" <<<"$help"; done
+PYTHONPATH=/i2/python:/i2/test:/i2:/work python3 -c "from srt.test_turboquant import TestTurboQuantGPU as T; from registered.unit.mem_cache.test_mem_pool_host import TestMLATurboQuantHostKVCache as H; names=('test_mla_fused_kv_write_matches_legacy_quantize_store','test_mla_e2m1_fused_and_fallback_writers_match','test_mla_e2m1_chunked_fused_writer_matches_full_workspace','test_mla_layerwise_pool_has_one_representation_per_layer','test_mla_layerwise_codebook_allocates_only_selected_slots'); assert all(hasattr(T,n) for n in names); assert hasattr(H,'test_codebook_allocation_and_transfer_contract')"
+printf '%s\n' '{"binaries":3,"lifecycle_methods":6,"scripts":7,"status":"PASS"}'
+"""
+        self._preoutage_run(
+            self.candidate,
+            "gpu-stage-surface",
+            ["bash", "-lc", surface_script],
+            timeout=180,
+            expected_json_status="PASS",
+        )
 
     def start_candidate(self) -> None:
         if (
@@ -983,14 +1025,22 @@ print(json.dumps(rows,separators=(",",":"),sort_keys=True))
             raise RuntimeError("writer correctness did not cover all 352 cases")
 
         tests = [
-            "test.srt.test_turboquant.TestTurboQuantGPU.test_mla_fused_kv_write_matches_legacy_quantize_store",
-            "test.srt.test_turboquant.TestTurboQuantGPU.test_mla_e2m1_fused_and_fallback_writers_match",
-            "test.srt.test_turboquant.TestTurboQuantGPU.test_mla_e2m1_chunked_fused_writer_matches_full_workspace",
-            "test.srt.test_turboquant.TestTurboQuantGPU.test_mla_layerwise_pool_has_one_representation_per_layer",
-            "test.srt.test_turboquant.TestTurboQuantGPU.test_mla_layerwise_codebook_allocates_only_selected_slots",
-            "test.registered.unit.mem_cache.test_mem_pool_host.TestMLATurboQuantHostKVCache.test_codebook_allocation_and_transfer_contract",
+            "srt.test_turboquant.TestTurboQuantGPU.test_mla_fused_kv_write_matches_legacy_quantize_store",
+            "srt.test_turboquant.TestTurboQuantGPU.test_mla_e2m1_fused_and_fallback_writers_match",
+            "srt.test_turboquant.TestTurboQuantGPU.test_mla_e2m1_chunked_fused_writer_matches_full_workspace",
+            "srt.test_turboquant.TestTurboQuantGPU.test_mla_layerwise_pool_has_one_representation_per_layer",
+            "srt.test_turboquant.TestTurboQuantGPU.test_mla_layerwise_codebook_allocates_only_selected_slots",
+            "registered.unit.mem_cache.test_mem_pool_host.TestMLATurboQuantHostKVCache.test_codebook_allocation_and_transfer_contract",
         ]
-        lifecycle_command = ["python3", "-m", "unittest", "-v", *tests]
+        lifecycle_command = [
+            "env",
+            "PYTHONPATH=/i2/python:/i2/test:/i2:/work",
+            "python3",
+            "-m",
+            "unittest",
+            "-v",
+            *tests,
+        ]
         self._candidate("lifecycle", lifecycle_command, timeout=300)
         lifecycle = h43.remote(
             self.host0,
