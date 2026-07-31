@@ -11,35 +11,35 @@ from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 import triton
+import triton.language as tl
 
 from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.kernels.ops.attention.pad import (
+    pad_draft_extend_query as pad_draft_extend_query_triton,
+)
+from sglang.kernels.ops.attention.pad import (
+    unpad_draft_extend_output as unpad_draft_extend_output_triton,
+)
+from sglang.kernels.ops.attention.utils import (
+    concat_mla_absorb_q_general,
+    mla_quantize_and_rope_for_fp8,
+)
+from sglang.kernels.ops.kvcache.kv_indices import (
+    create_flashmla_kv_indices_triton,
+    get_num_kv_index_blocks_flashmla,
+    get_num_page_per_block_flashmla,
+)
+from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
 )
-from sglang.srt.layers.attention.triton_ops.kv_indices import (
-    create_flashmla_kv_indices_triton,
-    get_num_kv_index_blocks_flashmla,
-    get_num_page_per_block_flashmla,
-)
-from sglang.srt.layers.attention.triton_ops.pad import (
-    pad_draft_extend_query as pad_draft_extend_query_triton,
-)
-from sglang.srt.layers.attention.triton_ops.pad import (
-    unpad_draft_extend_output as unpad_draft_extend_output_triton,
-)
-from sglang.srt.layers.attention.utils import (
-    concat_mla_absorb_q_general,
-    mla_quantize_and_rope_for_fp8,
-)
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_buffer, get_parallel, get_server_args
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
 
 if is_flashinfer_available():
@@ -48,6 +48,7 @@ if is_flashinfer_available():
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpecInput
 
 logger = logging.getLogger(__name__)
 
@@ -241,9 +242,7 @@ def build_draft_frontier_page_table_kernel(
     last_page_len = prefix_len - full_prefix_pages * page_size
     branch_pages = tl.cdiv(last_page_len + draft_len, page_size)
 
-    num_new_pages_per_topk = tl.cdiv(
-        last_page_len + speculative_num_steps, page_size
-    )
+    num_new_pages_per_topk = tl.cdiv(last_page_len + speculative_num_steps, page_size)
     prefix_base = full_prefix_pages * page_size
     branch_base = prefix_base + topk_id * num_new_pages_per_topk * page_size
 
@@ -310,7 +309,6 @@ def _quantize_fp8_qkv(q, k, v, layer):
     return q, k, v, k_scale, v_scale
 
 
-global_zero_init_workspace_buffer = None
 # cute-dsl needs its own workspace: it overwrites the buffer with split-KV
 # partials, which corrupts the trtllm-gen multiCtasKv counters that rely on the
 # zero-init buffer (they share it under attention-backend=cutedsl_mla, where
@@ -343,6 +341,19 @@ class TRTLLMMLADecodeMetadata:
     custom_mask_offsets: Optional[torch.Tensor] = None
     batch_size: Optional[int] = None
     is_draft_frontier: bool = False
+
+
+def _target_verify_max_seq_len(metadata: TRTLLMMLADecodeMetadata) -> int:
+    """Return the final KV bound recorded by target-verify metadata.
+
+    Both eager and CUDA-graph metadata store ``seq_lens_k`` after draft tokens
+    have been appended. The matching max bound must therefore be consumed
+    directly rather than adding the draft width again.
+    """
+
+    if metadata.max_seq_len_k is None:
+        raise RuntimeError("target-verify MLA metadata is missing max_seq_len_k")
+    return int(metadata.max_seq_len_k)
 
 
 class TRTLLMMLABackend(FlashInferMLAAttnBackend):
@@ -404,14 +415,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 )
             self.workspace_buffer = global_cute_dsl_workspace_buffer
         else:
-            global global_zero_init_workspace_buffer
-            if global_zero_init_workspace_buffer is None:
-                global_zero_init_workspace_buffer = torch.zeros(
+            self.workspace_buffer = get_buffer(
+                "trtllm_mla_zero_workspace",
+                lambda: torch.zeros(
                     self.workspace_size,
                     dtype=torch.int8,
                     device=model_runner.device,
-                )
-            self.workspace_buffer = global_zero_init_workspace_buffer
+                ),
+            )
 
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
@@ -422,13 +433,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.forward_decode_metadata: Union[TRTLLMMLADecodeMetadata, None] = None
 
         self.disable_chunked_prefix_cache = (
-            get_global_server_args().disable_chunked_prefix_cache
+            get_server_args().disable_chunked_prefix_cache
         )
 
         self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
         self.cuda_graph_custom_mask = None
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
         self.speculative_topk = model_runner.server_args.speculative_eagle_topk
+        # Tree-mask scratch is fetched from the target backend only.
+        self.is_draft_runner = model_runner.is_draft_worker
 
     def _calc_padded_blocks(self, max_seq_len: int) -> int:
         """
@@ -531,13 +544,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             self.decode_cuda_graph_custom_mask = None
             self.decode_cuda_graph_custom_mask_offsets = None
-        num_tokens_per_bs = max_num_tokens // max_bs
+        num_tokens_per_req = max_num_tokens // max_bs
 
         if is_float4_e2m1fn_x2(self.data_type):
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.store_dtype = torch.uint8
             self.padded_q_buffer = torch.zeros(
-                (max_bs, num_tokens_per_bs // 2, self.num_q_heads, self.kv_cache_dim),
+                (max_bs, num_tokens_per_req // 2, self.num_q_heads, self.kv_cache_dim),
                 dtype=self.store_dtype,
                 device=self.device,
             )
@@ -551,7 +564,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         else:
             # Buffer for padded query: (max_bs, max_draft_tokens, num_q_heads, v_head_dim)
             self.padded_q_buffer = torch.zeros(
-                (max_bs, num_tokens_per_bs, self.num_q_heads, self.kv_cache_dim),
+                (max_bs, num_tokens_per_req, self.num_q_heads, self.kv_cache_dim),
                 dtype=self.data_type,
                 device=self.device,
             )
@@ -563,7 +576,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 device=self.device,
             )
 
-        if self.num_draft_tokens and not self.skip_prefill:
+        if self.num_draft_tokens and not self.skip_prefill and not self.is_draft_runner:
             # Worst-case FULL_MASK tree-mask scratch (bool); build_tree writes it
             # in-place so the gpu_only path needs no seq_lens_sum.
             self.cuda_graph_custom_mask = torch.zeros(
@@ -580,7 +593,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     @staticmethod
     def _is_draft_frontier_spec(
         forward_mode: ForwardMode,
-        spec_info: Optional["SpecInput"],
+        spec_info: Optional[SpecInput],
         request_bs: int,
     ) -> bool:
         if not forward_mode.is_decode_or_idle() or spec_info is None:
@@ -703,7 +716,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens: torch.Tensor,
         device: torch.device,
         req_pool_indices: Optional[torch.Tensor] = None,
-        spec_info: Optional["SpecInput"] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         """Allocate persistent metadata buffers for CUDA graph capture."""
         metadata = TRTLLMMLADecodeMetadata()
@@ -711,18 +724,18 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         if forward_mode.is_target_verify():
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             metadata.cu_seqlens_q = torch.arange(
                 0,
-                bs * num_tokens_per_bs + 1,
-                num_tokens_per_bs,
+                bs * num_tokens_per_req + 1,
+                num_tokens_per_req,
                 dtype=torch.int32,
                 device=device,
             )
             metadata.seq_lens_q = torch.full(
-                (bs,), num_tokens_per_bs, dtype=torch.int32, device=device
+                (bs,), num_tokens_per_req, dtype=torch.int32, device=device
             )
             metadata.seq_lens_k = torch.zeros((bs,), dtype=torch.int32, device=device)
 
@@ -783,7 +796,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
-        spec_info: Optional["SpecInput"] = None,
+        spec_info: Optional[SpecInput] = None,
     ):
         """Shared decode / target-verify / draft-extend capture+replay body.
 
@@ -793,12 +806,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         metadata = self.decode_cuda_graph_metadata[bs]
 
         if forward_mode.is_target_verify():
-            seq_lens = seq_lens[:bs] + self.num_draft_tokens
-            metadata.seq_lens_k.copy_(seq_lens)
+            # Intentional int64 -> int32 same-kind out= downcast.
+            torch.add(seq_lens[:bs], self.num_draft_tokens, out=metadata.seq_lens_k)
+            seq_lens = metadata.seq_lens_k
         elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_bs = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_bs
-            metadata.sum_seq_lens_q = num_tokens_per_bs * bs
+            num_tokens_per_req = self.num_draft_tokens
+            metadata.max_seq_len_q = num_tokens_per_req
+            metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
 
@@ -846,7 +860,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
 
-    def init_mha_chunk_metadata(self, forward_batch: ForwardBatch) -> None:
+    def init_mha_chunk_metadata(
+        self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
+    ) -> None:
         has_prefix = any(forward_batch.extend_prefix_lens_cpu)
         fallback_to_flashinfer_impl = (
             self.disable_chunked_prefix_cache and has_prefix
@@ -948,11 +964,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 self.forward_prefill_metadata = None
-            # Get maximum sequence length.
+            # Never read max_seq from the GPU tensor (.max().item() blocks the
+            # host on the stream backlog); max_seq only sizes the block table /
+            # scheduling hint, so the static context bound is a safe fallback.
             if getattr(forward_batch, "seq_lens_cpu", None) is not None:
                 max_seq = forward_batch.seq_lens_cpu.max().item()
             else:
-                max_seq = forward_batch.seq_lens.max().item()
+                max_seq = self.max_context_len
 
             seq_lens = forward_batch.seq_lens
 
@@ -1301,8 +1319,17 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
+        # The fallback belongs to genuine extend forwards only. Target-verify /
+        # draft-extend must never honor it: `forward_prefill_metadata` is a
+        # stale leftover from the last prefill there (eager init clears it,
+        # but decode-graph capture does not), and capturing verify through the
+        # flashinfer path binds the graph to prefill-planned wrapper buffers,
+        # which fault (illegal address) at replay.
         if (
-            self.forward_prefill_metadata is not None
+            forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and self.forward_prefill_metadata is not None
             and self.forward_prefill_metadata.fallback_to_flashinfer_impl
         ):
             return super().forward_extend(
@@ -1385,9 +1412,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             q = q.to(self.data_type)
 
             if forward_batch.forward_mode.is_target_verify():
-                max_seq_len = (
-                    metadata.max_seq_len_k + forward_batch.spec_info.draft_token_num
-                )
+                max_seq_len = _target_verify_max_seq_len(metadata)
                 # For target_verify, all sequences have the same number of draft tokens
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 needs_unpad = False
@@ -1611,6 +1636,7 @@ class TRTLLMMLAMultiStepDraftBackend(FlashInferMLAMultiStepDraftBackend):
         if self.topk > 1 and getattr(
             self.attn_backends[0], "supports_custom_decode_mask", False
         ):
+
             def call_fn(i, _forward_batch):
                 self.attn_backends[i].init_forward_metadata_out_graph(
                     _forward_batch, in_capture=in_capture

@@ -26,10 +26,10 @@ import torch
 import triton
 import triton.testing
 
-from sglang.srt.layers.attention.triton_ops.decode_attention import (
+from sglang.kernels.ops.attention.decode_attention import (
     _decode_softmax_reducev_fwd,
 )
-from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
+from sglang.kernels.ops.attention.turboquant_mla_decode_attention import (
     _MIN_BLOCK_KV,
     _fwd_tq_mla_decode_stage1,
     tq_mla_decode_attention_fwd,

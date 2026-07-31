@@ -15,11 +15,29 @@ Supports two dequant modes:
 """
 
 import math
+from typing import Optional
 
 import numpy as np
 import torch
 
 
+def parse_turboquant_kv_cache_dtype(
+    value: str,
+) -> Optional[tuple[int, int, bool]]:
+    if not value.startswith("turboquant_"):
+        return None
+
+    payload = value.removeprefix("turboquant_")
+    uniform = payload.endswith("_uniform")
+    if uniform:
+        payload = payload.removesuffix("_uniform")
+
+    if payload.startswith("k") and "v" in payload:
+        k_bits, v_bits = payload[1:].split("v", 1)
+        return int(k_bits), int(v_bits), uniform
+
+    bits = int(payload.removesuffix("bit"))
+    return bits, bits, uniform
 
 
 # ---------------------------------------------------------------------------
@@ -384,7 +402,6 @@ class TurboQuantConfig:
             Transformed weight with inverse rotation baked in.
         """
         from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
-        device = o_proj_weight.device
         dtype = o_proj_weight.dtype
         dim = self.head_dim
         hidden = o_proj_weight.shape[1]

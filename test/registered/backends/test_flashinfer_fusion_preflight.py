@@ -49,6 +49,7 @@ def _run_rank(rank, world_size, port, scenario, result_q):
         )
 
         probe_kwargs = dict(
+            backend="trtllm",
             world_size=8,
             max_token_num=2048,
             hidden_dim=12288,

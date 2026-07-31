@@ -24,7 +24,7 @@ Concurrent-dispatch coverage (``TestMxfp4ConcurrentBatching``):
 
 Usage:
     # CI runner (what test/run_suite.py uses):
-    python3 test/run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-large
+    python3 test/run_suite.py --hw cuda --suite stage-b-test-1-gpu-large
 
     # Single-file pytest:
     python -m pytest test/registered/kernels/test_mxfp4_moe_kernel.py -v
@@ -36,7 +36,6 @@ import unittest
 
 try:
     import torch
-    import triton
     import triton.language as tl
 
     HAS_CUDA = torch.cuda.is_available()
@@ -48,7 +47,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # CI: H100-class runner (needs MXFP4 weight path + H100 triton).
 # est_time ~20s locally; 60s gives CI partitioning headroom.
-register_cuda_ci(est_time=60, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=60, stage="stage-b", runner_config="1-gpu-large")
 
 
 def _pack_mxfp4_reference(weight_fp32: torch.Tensor):
@@ -394,10 +393,20 @@ class TestMxfp4NaNPropAndFilter(CustomTestCase):
             "num_stages": 2,
         }
         invoke_fused_moe_kernel_mxfp4(
-            A, packed, scales, C, topk_weights, topk_ids,
-            sorted_token_ids, expert_ids, num_tokens_post_padded,
-            mul_routed_weight=False, top_k=topk, config=config,
-            compute_type=tl.bfloat16, filter_expert=False,
+            A,
+            packed,
+            scales,
+            C,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config,
+            compute_type=tl.bfloat16,
+            filter_expert=False,
             enable_nan_prop=True,
         )
 
@@ -454,10 +463,20 @@ class TestMxfp4NaNPropAndFilter(CustomTestCase):
             "num_stages": 2,
         }
         invoke_fused_moe_kernel_mxfp4(
-            A, packed, scales, C, topk_weights, topk_ids,
-            sorted_token_ids, expert_ids_filtered, num_tokens_post_padded,
-            mul_routed_weight=False, top_k=topk, config=config,
-            compute_type=tl.bfloat16, filter_expert=True,
+            A,
+            packed,
+            scales,
+            C,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids_filtered,
+            num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config,
+            compute_type=tl.bfloat16,
+            filter_expert=True,
             enable_nan_prop=False,
         )
 
@@ -504,9 +523,7 @@ class TestMxfp4ConcurrentBatching(CustomTestCase):
         produce the correct result.
     """
 
-    def _run_batched(
-        self, A, packed, scales, topk_ids, topk_weights, topk, E, BLOCK_M
-    ):
+    def _run_batched(self, A, packed, scales, topk_ids, topk_weights, topk, E, BLOCK_M):
         """Run one kernel call for the whole batch; return C."""
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             invoke_fused_moe_kernel_mxfp4,
@@ -530,10 +547,20 @@ class TestMxfp4ConcurrentBatching(CustomTestCase):
             "num_stages": 2,
         }
         invoke_fused_moe_kernel_mxfp4(
-            A, packed, scales, C, topk_weights, topk_ids,
-            sorted_token_ids, expert_ids, num_tokens_post_padded,
-            mul_routed_weight=False, top_k=topk, config=config,
-            compute_type=tl.bfloat16, filter_expert=False,
+            A,
+            packed,
+            scales,
+            C,
+            topk_weights,
+            topk_ids,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            mul_routed_weight=False,
+            top_k=topk,
+            config=config,
+            compute_type=tl.bfloat16,
+            filter_expert=False,
             enable_nan_prop=True,
         )
         return C
@@ -562,9 +589,7 @@ class TestMxfp4ConcurrentBatching(CustomTestCase):
             A_m = A[m : m + 1].contiguous()
             tids_m = topk_ids[m : m + 1].contiguous()
             tw_m = topk_weights[m : m + 1].contiguous()
-            c_m = self._run_batched(
-                A_m, packed, scales, tids_m, tw_m, topk, E, BLOCK_M
-            )
+            c_m = self._run_batched(A_m, packed, scales, tids_m, tw_m, topk, E, BLOCK_M)
             # c_m is [1*topk, N]; place it at rows [m*topk : (m+1)*topk].
             C_sequential[m * topk : (m + 1) * topk] = c_m
 
@@ -574,7 +599,8 @@ class TestMxfp4ConcurrentBatching(CustomTestCase):
         diff = (C_batched.float() - C_sequential.float()).abs()
         max_err = diff.max().item()
         self.assertLess(
-            max_err, 1e-2,
+            max_err,
+            1e-2,
             f"batched vs per-request divergence at M={M} topk={topk}: "
             f"max_err={max_err}",
         )
@@ -605,11 +631,18 @@ class TestMxfp4ConcurrentBatching(CustomTestCase):
         # Build two independent workloads A/W.
         def make_workload(seed: int):
             g = torch.Generator(device=device).manual_seed(seed)
-            A = torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=g) * 0.3
-            W = torch.randn(E, N, K, dtype=torch.float32, device=device, generator=g) * 0.3
+            A = (
+                torch.randn(M, K, dtype=torch.bfloat16, device=device, generator=g)
+                * 0.3
+            )
+            W = (
+                torch.randn(E, N, K, dtype=torch.float32, device=device, generator=g)
+                * 0.3
+            )
             packed, scales = _pack_mxfp4_reference(W)
-            topk_ids = torch.randint(0, E, (M, topk), dtype=torch.int32,
-                                     device=device, generator=g)
+            topk_ids = torch.randint(
+                0, E, (M, topk), dtype=torch.int32, device=device, generator=g
+            )
             tw = torch.rand(M, topk, dtype=torch.float32, device=device, generator=g)
             tw = tw / tw.sum(dim=-1, keepdim=True)
             return A, packed, scales, topk_ids, tw
@@ -664,6 +697,7 @@ class TestAutotuneWiring(CustomTestCase):
 
     def test_dtype_string_registered(self):
         import torch
+
         from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
             get_config_dtype_str,
         )
@@ -687,12 +721,22 @@ class TestAutotuneWiring(CustomTestCase):
         # branches must satisfy this.
         for M in [1, 4, 32, 128, 512, 4096]:
             cfg = get_default_config(
-                M=M, E=128, N=2880, K=2880, topk=4,
-                dtype="mxfp4_w4a16", is_marlin=False,
+                M=M,
+                E=128,
+                N=2880,
+                K=2880,
+                topk=4,
+                dtype="mxfp4_w4a16",
+                is_marlin=False,
             )
             self.assertEqual(cfg["BLOCK_SIZE_K"] % 32, 0, f"M={M}")
-            for key in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "GROUP_SIZE_M",
-                        "num_warps", "num_stages"):
+            for key in (
+                "BLOCK_SIZE_M",
+                "BLOCK_SIZE_N",
+                "GROUP_SIZE_M",
+                "num_warps",
+                "num_stages",
+            ):
                 self.assertIn(key, cfg, f"M={M} missing {key}")
 
     def test_try_get_optimal_falls_back_cleanly(self):

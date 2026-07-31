@@ -24,7 +24,7 @@ Placement per write-sglang-test skill: test/registered/attention/.
 Suite: stage-b-test-1-gpu-large (H100 required — kernel is Hopper-targeted).
 
 Related:
-  Source: python/sglang/srt/layers/attention/triton_ops/turboquant_mla_decode_attention.py
+  Source: python/sglang/kernels/ops/attention/turboquant_mla_decode_attention.py
   Backend: python/sglang/srt/layers/attention/flashmla_backend.py (TurboQuantMLABackend)
   Pool: python/sglang/srt/mem_cache/memory_pool.py (MLATokenToKVPoolTurboQuant)
   Kernel Engineering Rule KE-13: backend-kernel interface is a separate
@@ -42,7 +42,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 # H100-class memory + Hopper Triton compatibility.
-register_cuda_ci(est_time=40, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=40, stage="stage-b", runner_config="1-gpu-large")
 
 
 def _build_config(lora_rank: int, device: torch.device):
@@ -120,7 +120,9 @@ def _reference_mla_decode(
     """
     bs, q_heads, lora_rank = q_nope.shape
     rope_dim = q_rope.shape[-1]
-    out = torch.zeros((bs, q_heads, lora_rank), dtype=torch.float32, device=q_nope.device)
+    out = torch.zeros(
+        (bs, q_heads, lora_rank), dtype=torch.float32, device=q_nope.device
+    )
 
     for b in range(bs):
         start = int(kv_indptr[b].item())
@@ -170,7 +172,7 @@ class TestTurboQuantMLADecodeKernel(CustomTestCase):
 
     def _run_one(self, bs: int, ctx_len: int, seed: int = 0) -> tuple[float, float]:
         """Run one (bs, ctx_len) configuration. Return (cos_sim, max_abs_err)."""
-        from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
+        from sglang.kernels.ops.attention.turboquant_mla_decode_attention import (
             tq_mla_decode_attention_fwd,
         )
 
@@ -182,7 +184,9 @@ class TestTurboQuantMLADecodeKernel(CustomTestCase):
         # Inputs in ORIGINAL domain.
         q_nope = torch.randn(bs, qh, lora, dtype=torch.bfloat16, device=device)
         q_rope = torch.randn(bs, qh, rope, dtype=torch.bfloat16, device=device)
-        k_nope_orig = torch.randn(total_kv, 1, lora, dtype=torch.bfloat16, device=device)
+        k_nope_orig = torch.randn(
+            total_kv, 1, lora, dtype=torch.bfloat16, device=device
+        )
         k_rope = torch.randn(total_kv, 1, rope, dtype=torch.bfloat16, device=device)
 
         # Quantize K_nope the way the pool does at set_mla_kv_buffer.
@@ -206,15 +210,11 @@ class TestTurboQuantMLADecodeKernel(CustomTestCase):
         att_logits = torch.empty(
             (bs, qh, max_splits, lora), dtype=torch.float32, device=device
         )
-        att_lse = torch.empty(
-            (bs, qh, max_splits), dtype=torch.float32, device=device
-        )
+        att_lse = torch.empty((bs, qh, max_splits), dtype=torch.float32, device=device)
         o = torch.empty((bs, qh, lora), dtype=torch.bfloat16, device=device)
         # Per-batch split count (kernel expects (bs,) int32 per-batch — NOT
         # flashmla's (bs+1,) prefix-sum convention; this was Stage C bug #3).
-        num_kv_splits = torch.full(
-            (bs,), max_splits, dtype=torch.int32, device=device
-        )
+        num_kv_splits = torch.full((bs,), max_splits, dtype=torch.int32, device=device)
 
         tq_mla_decode_attention_fwd(
             q_nope_rotated=q_nope_rot,
@@ -301,7 +301,7 @@ class TestTurboQuantMLADecodeKernel(CustomTestCase):
         accepts (bs+1,), the shape change would read garbage. This test
         confirms the per-batch shape is what the kernel needs.
         """
-        from sglang.srt.layers.attention.triton_ops.turboquant_mla_decode_attention import (
+        from sglang.kernels.ops.attention.turboquant_mla_decode_attention import (
             tq_mla_decode_attention_fwd,
         )
 
@@ -315,14 +315,10 @@ class TestTurboQuantMLADecodeKernel(CustomTestCase):
         k_nope_orig = torch.randn(
             bs * ctx_len, 1, lora, dtype=torch.bfloat16, device=device
         )
-        k_rope = torch.randn(
-            bs * ctx_len, 1, rope, dtype=torch.bfloat16, device=device
-        )
+        k_rope = torch.randn(bs * ctx_len, 1, rope, dtype=torch.bfloat16, device=device)
         packed, dequant_scale = _quantize_like_pool(k_nope_orig, self.cfg)
 
-        kv_indptr = (
-            torch.arange(0, bs + 1, dtype=torch.int32, device=device) * ctx_len
-        )
+        kv_indptr = torch.arange(0, bs + 1, dtype=torch.int32, device=device) * ctx_len
         kv_indices = torch.arange(0, bs * ctx_len, dtype=torch.int32, device=device)
         max_splits = 8
         att_logits = torch.empty(
@@ -333,9 +329,7 @@ class TestTurboQuantMLADecodeKernel(CustomTestCase):
         q_nope_rot = self.cfg.rotate_query(q_nope).to(q_nope.dtype)
 
         # Happy path: per-batch (bs,) — shape (2,).
-        num_kv_splits = torch.full(
-            (bs,), max_splits, dtype=torch.int32, device=device
-        )
+        num_kv_splits = torch.full((bs,), max_splits, dtype=torch.int32, device=device)
         self.assertEqual(num_kv_splits.shape, torch.Size([bs]))
 
         tq_mla_decode_attention_fwd(

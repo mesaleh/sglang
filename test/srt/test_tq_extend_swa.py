@@ -133,7 +133,7 @@ class TestWindowedCorrectness(unittest.TestCase):
         v_bits,
         sinks=None,
     ):
-        from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
+        from sglang.kernels.ops.attention.turboquant_extend_attention import (
             tq_extend_attention_fwd,
         )
 
@@ -465,7 +465,7 @@ class TestBackwardCompat(unittest.TestCase):
 
     def test_sws_neg1_determinism(self):
         """Two identical runs with SWS=-1 produce bitwise-identical output."""
-        from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
+        from sglang.kernels.ops.attention.turboquant_extend_attention import (
             tq_extend_attention_fwd,
         )
 
@@ -519,7 +519,7 @@ class TestBackwardCompat(unittest.TestCase):
         SWS=-1 and SWS=very-large (larger than prefix+extend) must produce
         equivalent output — both attend to the entire prefix.
         """
-        from sglang.srt.layers.attention.triton_ops.turboquant_extend_attention import (
+        from sglang.kernels.ops.attention.turboquant_extend_attention import (
             tq_extend_attention_fwd,
         )
 

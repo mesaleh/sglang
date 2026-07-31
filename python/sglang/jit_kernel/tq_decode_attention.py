@@ -46,7 +46,7 @@ def test_correctness(batch=32, seq_len=512, q_heads=32, kv_heads=8, head_dim=128
     import sys
     sys.path.insert(0, '/workspace/sglang/python')
 
-    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+    from sglang.kernels.ops.attention.turboquant_decode_attention import (
         tq_decode_attention_fwd,
     )
     from sglang.srt.layers.quantization.kv_turboquant import build_codebook
@@ -124,7 +124,7 @@ def benchmark(batch=32, seq_len=1024, q_heads=32, kv_heads=8, head_dim=128,
     import sys
     sys.path.insert(0, '/workspace/sglang/python')
 
-    from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+    from sglang.kernels.ops.attention.turboquant_decode_attention import (
         tq_decode_attention_fwd,
     )
     from sglang.srt.layers.quantization.kv_turboquant import build_codebook

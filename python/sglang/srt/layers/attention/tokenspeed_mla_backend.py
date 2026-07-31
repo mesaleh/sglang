@@ -60,26 +60,45 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_g_tokenspeed_workspace: dict[torch.device, torch.Tensor] = {}
-
 
 def _supports_custom_decode_mask(decode_fn) -> bool:
     parameters = signature(decode_fn).parameters
     return "custom_mask" in parameters and "cmask_off" in parameters
 
 
+def _custom_decode_mask_kwargs(
+    *,
+    supports_custom_decode_mask: bool,
+    custom_mask,
+    custom_mask_offsets,
+) -> dict:
+    if custom_mask is not None and not supports_custom_decode_mask:
+        raise RuntimeError(
+            "tokenspeed_mla target verification requires a side-library build "
+            "whose decode API accepts custom_mask and cmask_off."
+        )
+    if not supports_custom_decode_mask:
+        return {}
+    return {
+        "custom_mask": custom_mask,
+        "cmask_off": custom_mask_offsets,
+    }
+
+
 def _get_tokenspeed_workspace(
     device: torch.device, num_heads: int, kv_lora_rank: int, q_len: int
 ) -> torch.Tensor:
+    from sglang.srt.runtime_context import get_resources
+
     needed = tokenspeed_workspace_bytes(
         tokenspeed_mla.get_num_sm(device), num_heads, kv_lora_rank, q_len
     )
-    existing = _g_tokenspeed_workspace.get(device)
+    buffers = get_resources().buffers
+    key = f"tokenspeed_mla_workspace:{device}"
+    existing = buffers.get(key)
     if existing is None or existing.numel() < needed:
-        _g_tokenspeed_workspace[device] = torch.empty(
-            needed, dtype=torch.int8, device=device
-        )
-    return _g_tokenspeed_workspace[device]
+        buffers[key] = torch.empty(needed, dtype=torch.int8, device=device)
+    return buffers[key]
 
 
 # TODO(Qiaolin-Yu): Merge this attention backend into trtllm_mla_backend.py
@@ -327,11 +346,13 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             output_scale=output_scale,
             enable_pdl=is_arch_support_pdl(),
         )
-        if self.supports_custom_decode_mask:
-            decode_kwargs.update(
+        decode_kwargs.update(
+            _custom_decode_mask_kwargs(
+                supports_custom_decode_mask=self.supports_custom_decode_mask,
                 custom_mask=custom_mask,
-                cmask_off=custom_mask_offsets,
+                custom_mask_offsets=custom_mask_offsets,
             )
+        )
         return tokenspeed_mla.tokenspeed_mla_decode(**decode_kwargs)
 
     def _run_prefill_kernel(

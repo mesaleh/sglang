@@ -6,7 +6,6 @@ exists only for research images and must be explicitly enabled.
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
 import torch
@@ -306,7 +305,6 @@ void stage_tq_mla_pages_to_physical_i64_cuda(
 def _load_staging_extension():
     from torch.utils.cpp_extension import load_inline
 
-    os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
     return load_inline(
         name="sglang_tq_mla_staged_flashmla",
         cpp_sources=_CPP_DECL,

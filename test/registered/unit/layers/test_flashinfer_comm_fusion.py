@@ -4,8 +4,8 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.layers import communicator
+from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.layers import layernorm
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -122,7 +122,9 @@ class TestFlashInferCommFusion(unittest.TestCase):
                 forward_batch=MagicMock(),
             )
 
-        torch.testing.assert_close(all_reduce.call_args.args[0], hidden_states + pre_add)
+        torch.testing.assert_close(
+            all_reduce.call_args.args[0], hidden_states + pre_add
+        )
         layer_communicator.input_layernorm.assert_called_once()
         reduced, norm_residual = layer_communicator.input_layernorm.call_args.args
         torch.testing.assert_close(reduced, (hidden_states + pre_add) * 4)
@@ -162,9 +164,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
             flashinfer_allreduce_fusion_backend="mnnvl", nnodes=2
         )
         advertised_comm = types.SimpleNamespace(
-            AllReduceFusionPattern=types.SimpleNamespace(
-                kARResidualRMSNorm=object()
-            ),
+            AllReduceFusionPattern=types.SimpleNamespace(kARResidualRMSNorm=object()),
             supports_pre_allreduce_add=lambda backend, _pattern: backend == "mnnvl",
         )
 
@@ -258,6 +258,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
                 max_token_num=8,
                 hidden_dim=16,
                 backend="mnnvl",
+                dtype=torch.float32,
                 device_group=None,
                 cpu_group=None,
                 comm_device_group=device_group,
@@ -268,16 +269,40 @@ class TestFlashInferCommFusion(unittest.TestCase):
         self.assertIs(created_backends[0].device_group, device_group)
         self.assertIs(created_backends[0].cpu_group, cpu_group)
         preflight.assert_called_once_with(
+            backend="mnnvl",
             world_size=4,
             max_token_num=8,
             hidden_dim=16,
-            dtype=None,
+            dtype=torch.float32,
+            use_oneshot=None,
             cpu_group=cpu_group,
         )
         self.assertIs(fake_comm.calls[0]["comm_backend"], created_backends[0])
         self.assertIsNone(fake_comm.calls[0]["group"])
         self.assertEqual(fake_comm.calls[0]["gpus_per_node"], 4)
+        self.assertIs(fake_comm.calls[0]["dtype"], torch.float32)
+        self.assertNotIn("use_fp32_lamport", fake_comm.calls[0])
         self.assertEqual(manager.group, (None, None))
+
+    def test_mnnvl_preflight_uses_backend_workspace_shape(self):
+        actual = fusion._flashinfer_mnnvl_workspace_size_bytes(
+            world_size=8,
+            max_token_num=2048,
+            hidden_dim=7168,
+            dtype=torch.bfloat16,
+        )
+        expected_twoshot = 3 * 2 * 2048 * 7168 * 2
+        self.assertEqual(actual, expected_twoshot)
+
+        forced_oneshot = fusion._flashinfer_mnnvl_workspace_size_bytes(
+            world_size=8,
+            max_token_num=2048,
+            hidden_dim=7168,
+            dtype=torch.bfloat16,
+            force_oneshot=True,
+        )
+        self.assertEqual(forced_oneshot, 3 * 8 * 2048 * 7168 * 2)
+        self.assertGreater(forced_oneshot, actual)
 
     def test_full_tp_keeps_groups_for_workspace_rendezvous(self):
         device_group = object()
@@ -316,6 +341,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
         self.assertIsNone(kwargs["cpu_group"])
         self.assertIs(kwargs["comm_device_group"], device_group)
         self.assertIs(kwargs["comm_cpu_group"], cpu_group)
+        self.assertNotIn("use_fp32_lamport", kwargs)
 
     def test_auto_backend_resolves_by_arch(self):
         single_node = types.SimpleNamespace(
@@ -404,9 +430,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
             fusion.envs.SGLANG_FLASHINFER_TRTLLM_MULTINODE.override(True),
         ):
             self.assertEqual(
-                fusion.resolve_flashinfer_allreduce_fusion_backend(
-                    multi_node_trtllm
-                ),
+                fusion.resolve_flashinfer_allreduce_fusion_backend(multi_node_trtllm),
                 "trtllm",
             )
             auto = types.SimpleNamespace(
@@ -444,8 +468,12 @@ class TestFlashInferCommFusion(unittest.TestCase):
         fake_comm = _FakeFlashInferComm()
         original_comm = fusion._flashinfer_comm
         original_create = fusion._create_allreduce_fusion_workspace
-        original_manager = fusion._attn_tp_workspace_manager
         original_unavailable = fusion._flashinfer_allreduce_unavailable
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        manager_key = "flashinfer_fusion_attn_tp_workspace"
+        original_manager = buffers.get(manager_key)
         try:
             fusion._flashinfer_comm = fake_comm
             fusion._create_allreduce_fusion_workspace = (
@@ -459,7 +487,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
                     manager = fusion.FlashInferWorkspaceManager()
                     manager.workspace = _FakeWorkspace(backend, world_size)
                     manager.initialized = True
-                    fusion._attn_tp_workspace_manager = manager
+                    buffers[manager_key] = manager
                     if not torch.cuda.is_available():
                         self.skipTest("FlashInfer allreduce custom op is CUDA-only")
                     device = torch.device("cuda")
@@ -499,7 +527,10 @@ class TestFlashInferCommFusion(unittest.TestCase):
         finally:
             fusion._flashinfer_comm = original_comm
             fusion._create_allreduce_fusion_workspace = original_create
-            fusion._attn_tp_workspace_manager = original_manager
+            if original_manager is None:
+                buffers.pop(manager_key, None)
+            else:
+                buffers[manager_key] = original_manager
             fusion._flashinfer_allreduce_unavailable = original_unavailable
 
     def test_mnnvl_workspace_declines_pre_allreduce_add(self):

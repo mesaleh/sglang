@@ -16,10 +16,12 @@ Usage:
 
 import argparse
 import math
+import os
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
-import numpy as np
+import torch
 
 
 class TestTurboQuantCLI(unittest.TestCase):
@@ -40,6 +42,229 @@ class TestTurboQuantCLI(unittest.TestCase):
                 ["--model-path", "test-model", "--kv-cache-dtype", dtype]
             )
             self.assertEqual(args.kv_cache_dtype, dtype)
+
+    def test_dtype_parser(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            parse_turboquant_kv_cache_dtype,
+        )
+
+        self.assertEqual(
+            parse_turboquant_kv_cache_dtype("turboquant_4bit"), (4, 4, False)
+        )
+        self.assertEqual(
+            parse_turboquant_kv_cache_dtype("turboquant_4bit_uniform"),
+            (4, 4, True),
+        )
+        self.assertEqual(
+            parse_turboquant_kv_cache_dtype("turboquant_k4v2"), (4, 2, False)
+        )
+        self.assertIsNone(parse_turboquant_kv_cache_dtype("bf16"))
+
+    def test_model_runner_configures_mha_backend_through_override(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        class ServerArgs(SimpleNamespace):
+            def override(self, source, **fields):
+                self.override_source = source
+                for name, value in fields.items():
+                    setattr(self, name, value)
+
+        runner = object.__new__(ModelRunner)
+        runner.server_args = ServerArgs(
+            kv_cache_dtype="turboquant_k4v2",
+            speculative_draft_attention_backend=None,
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            disable_cuda_graph=False,
+        )
+        runner.model = SimpleNamespace(quant_config=None)
+        runner.dtype = torch.bfloat16
+        runner.is_draft_worker = False
+        runner.spec_algorithm = SpeculativeAlgorithm.NONE
+        runner.use_mla_backend = False
+
+        runner.configure_kv_cache_dtype()
+
+        self.assertEqual(runner.kv_cache_dtype, torch.bfloat16)
+        self.assertEqual(runner.turboquant_k_bits, 4)
+        self.assertEqual(runner.turboquant_v_bits, 2)
+        self.assertEqual(runner.server_args.prefill_attention_backend, "triton")
+        self.assertEqual(runner.server_args.decode_attention_backend, "triton")
+        self.assertFalse(runner.server_args.disable_cuda_graph)
+
+    def test_model_runner_keeps_mla_backend(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        class ServerArgs(SimpleNamespace):
+            def override(self, source, **fields):
+                for name, value in fields.items():
+                    setattr(self, name, value)
+
+        runner = object.__new__(ModelRunner)
+        runner.server_args = ServerArgs(
+            kv_cache_dtype="turboquant_4bit",
+            speculative_draft_attention_backend=None,
+            attention_backend=None,
+            prefill_attention_backend="fa3",
+            decode_attention_backend="flashmla",
+            disable_cuda_graph=False,
+        )
+        runner.model = SimpleNamespace(quant_config=None)
+        runner.dtype = torch.bfloat16
+        runner.is_draft_worker = False
+        runner.spec_algorithm = SpeculativeAlgorithm.NONE
+        runner.use_mla_backend = True
+
+        runner.configure_kv_cache_dtype()
+
+        self.assertEqual(runner.kv_cache_dtype, torch.bfloat16)
+        self.assertEqual(runner.server_args.prefill_attention_backend, "fa3")
+        self.assertEqual(runner.server_args.decode_attention_backend, "flashmla")
+
+    def test_output_rotation_fusion_is_all_or_nothing(self):
+        from sglang.srt.model_executor.model_runner_components.turboquant_rotation import (
+            fuse_turboquant_output_rotation_weights,
+        )
+
+        class Config:
+            output_rotation_fused = False
+
+            @staticmethod
+            def fuse_inverse_rotation_into_o_proj(weight, _n_heads):
+                return weight + 1
+
+        weight = torch.nn.Parameter(
+            torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        )
+        cfg = Config()
+        original = weight.detach().clone()
+
+        fused = fuse_turboquant_output_rotation_weights(
+            cfg,
+            [(weight, 2)],
+            skipped_layers=1,
+        )
+
+        self.assertFalse(fused)
+        torch.testing.assert_close(weight, original)
+        self.assertFalse(cfg.output_rotation_fused)
+
+    def test_output_rotation_fuses_when_all_layers_are_eligible(self):
+        from sglang.srt.model_executor.model_runner_components.turboquant_rotation import (
+            fuse_turboquant_output_rotation_weights,
+        )
+
+        weight = torch.nn.Parameter(torch.zeros(4, 4))
+        cfg = SimpleNamespace(
+            output_rotation_fused=False,
+            fuse_inverse_rotation_into_o_proj=lambda weight, _n_heads: weight + 1,
+        )
+        fused = fuse_turboquant_output_rotation_weights(
+            cfg,
+            [(weight, 2)],
+            skipped_layers=0,
+        )
+
+        self.assertTrue(fused)
+        torch.testing.assert_close(weight, torch.ones_like(weight))
+        self.assertTrue(cfg.output_rotation_fused)
+
+    def test_staged_flashmla_jit_does_not_mutate_arch_environment(self):
+        from sglang.srt.layers.attention import turboquant_mla_staged_flashmla
+
+        turboquant_mla_staged_flashmla._load_staging_extension.cache_clear()
+        previous = os.environ.pop("TORCH_CUDA_ARCH_LIST", None)
+        try:
+            with patch(
+                "torch.utils.cpp_extension.load_inline",
+                return_value=object(),
+            ):
+                turboquant_mla_staged_flashmla._load_staging_extension()
+            self.assertNotIn("TORCH_CUDA_ARCH_LIST", os.environ)
+        finally:
+            turboquant_mla_staged_flashmla._load_staging_extension.cache_clear()
+            if previous is not None:
+                os.environ["TORCH_CUDA_ARCH_LIST"] = previous
+
+    def test_transfer_modes_fail_closed_for_unsupported_layouts(self):
+        from sglang.srt.model_executor.model_runner_components.turboquant_compat import (
+            validate_turboquant_transfer_compatibility,
+        )
+
+        with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+            validate_turboquant_transfer_compatibility(
+                kv_cache_dtype="turboquant_4bit",
+                disaggregation_mode="decode",
+                enable_hierarchical_cache=False,
+                use_mla_backend=True,
+            )
+        with self.assertRaisesRegex(ValueError, "MHA TurboQuant"):
+            validate_turboquant_transfer_compatibility(
+                kv_cache_dtype="turboquant_k4v2",
+                disaggregation_mode="null",
+                enable_hierarchical_cache=True,
+                use_mla_backend=False,
+            )
+        with self.assertRaisesRegex(ValueError, "deterministic Triton"):
+            validate_turboquant_transfer_compatibility(
+                kv_cache_dtype="turboquant_k4v2",
+                disaggregation_mode="null",
+                enable_hierarchical_cache=False,
+                use_mla_backend=False,
+                enable_deterministic_inference=True,
+            )
+
+        validate_turboquant_transfer_compatibility(
+            kv_cache_dtype="turboquant_4bit",
+            disaggregation_mode="null",
+            enable_hierarchical_cache=True,
+            use_mla_backend=True,
+            enable_deterministic_inference=True,
+            prefill_attention_backend="flashmla",
+            decode_attention_backend="flashmla",
+            mla_fused_decode_enabled=True,
+        )
+        validate_turboquant_transfer_compatibility(
+            kv_cache_dtype="bf16",
+            disaggregation_mode="decode",
+            enable_hierarchical_cache=True,
+            use_mla_backend=False,
+        )
+
+    def test_mla_turboquant_requires_explicit_fused_backend(self):
+        from sglang.srt.model_executor.model_runner_components.turboquant_compat import (
+            validate_turboquant_transfer_compatibility,
+        )
+
+        common = dict(
+            kv_cache_dtype="turboquant_4bit",
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            use_mla_backend=True,
+        )
+        with self.assertRaisesRegex(ValueError, "SGLANG_TQ_MLA_FUSED_DECODE=1"):
+            validate_turboquant_transfer_compatibility(
+                **common,
+                prefill_attention_backend="flashmla",
+                decode_attention_backend="flashmla",
+            )
+        with self.assertRaisesRegex(ValueError, "requires flashmla"):
+            validate_turboquant_transfer_compatibility(
+                **common,
+                prefill_attention_backend="trtllm_mla",
+                decode_attention_backend="flashmla",
+                mla_fused_decode_enabled=True,
+            )
+
+        validate_turboquant_transfer_compatibility(
+            **common,
+            prefill_attention_backend="flashmla",
+            decode_attention_backend="flashmla",
+            mla_fused_decode_enabled=True,
+        )
 
 
 class TestCodebook(unittest.TestCase):
@@ -351,10 +576,10 @@ class TestTurboQuantGPU(unittest.TestCase):
         from sglang.srt.layers.quantization.kv_turboquant import (
             batched_dequantize_rotspace, batched_quantize,
         )
-        from sglang.srt.layers.attention.triton_ops.turboquant_decode_attention import (
+        from sglang.kernels.ops.attention.turboquant_decode_attention import (
             tq_decode_attention_fwd,
         )
-        from sglang.srt.layers.attention.triton_ops.decode_attention import (
+        from sglang.kernels.ops.attention.decode_attention import (
             decode_attention_fwd,
         )
 
@@ -486,7 +711,8 @@ class TestTurboQuantGPU(unittest.TestCase):
     def test_move_kv_cache_dequant_correctness(self):
         """Verify data is correct after move_kv_cache."""
         from sglang.srt.layers.quantization.kv_turboquant import (
-            TurboQuantConfig, batched_quantize, batched_dequantize_rotspace,
+            batched_dequantize_rotspace,
+            batched_quantize,
         )
         cfg = self.configs[4]
         torch.manual_seed(42)
@@ -521,7 +747,7 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_mla_fused_kv_write_matches_legacy_quantize_store(self):
         """Verify the Phase 35A MLA NoPE fused store matches the legacy path."""
-        from sglang.srt.layers.attention.triton_ops.turboquant_quantize import (
+        from sglang.kernels.ops.attention.turboquant_quantize import (
             fused_turboquant_quantize_and_store,
         )
         from sglang.srt.layers.quantization.kv_turboquant import (

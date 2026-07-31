@@ -14,8 +14,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
@@ -69,10 +68,7 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
         return "trtllm"
 
     if backend == "trtllm" and is_multi_node:
-        if not (
-            is_sm100_supported()
-            and envs.SGLANG_FLASHINFER_TRTLLM_MULTINODE.get()
-        ):
+        if not (is_sm100_supported() and envs.SGLANG_FLASHINFER_TRTLLM_MULTINODE.get()):
             raise ValueError(
                 "FlashInfer allreduce fusion trtllm backend supports single-node "
                 "only by default. On GB200, the experimental multi-node path "
@@ -115,7 +111,7 @@ def supports_flashinfer_pre_allreduce_add(server_args=None) -> bool:
     if not _flashinfer_allreduce_supports_pre_allreduce_add:
         return False
     if server_args is None:
-        server_args = get_global_server_args()
+        server_args = get_server_args()
     try:
         backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     except ValueError:
@@ -127,9 +123,7 @@ def _backend_supports_pre_allreduce_add(backend: Optional[str]) -> bool:
     if backend is None or not _flashinfer_allreduce_supports_pre_allreduce_add:
         return False
 
-    capability_fn = getattr(
-        _flashinfer_comm, "supports_pre_allreduce_add", None
-    )
+    capability_fn = getattr(_flashinfer_comm, "supports_pre_allreduce_add", None)
     if callable(capability_fn):
         try:
             pattern = _flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm
@@ -155,9 +149,7 @@ def _workspace_supports_pre_allreduce_add(workspace) -> bool:
     if explicit_capability is not None:
         return bool(explicit_capability)
 
-    return _backend_supports_pre_allreduce_add(
-        getattr(workspace, "backend", None)
-    )
+    return _backend_supports_pre_allreduce_add(getattr(workspace, "backend", None))
 
 
 if is_flashinfer_available():
@@ -375,6 +367,58 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     return allocation_sizes
 
 
+def _flashinfer_mnnvl_workspace_size_bytes(
+    world_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    force_oneshot: bool = False,
+) -> int:
+    """Mirror FlashInfer MNNVL's three-buffer symmetric-memory request."""
+    elem_size = torch.empty((), dtype=dtype).element_size()
+    if force_oneshot:
+        per_buffer = world_size * max_token_num * hidden_dim * elem_size
+    else:
+        oneshot_threshold = 64 * 1024 * 8 * 2
+        oneshot_max_tokens = min(
+            oneshot_threshold // (world_size * elem_size * hidden_dim),
+            max_token_num,
+        )
+        oneshot_size = oneshot_max_tokens * hidden_dim * world_size * elem_size
+        rounded_tokens = ((max_token_num + world_size - 1) // world_size) * world_size
+        twoshot_size = 2 * rounded_tokens * hidden_dim * elem_size
+        per_buffer = max(oneshot_size, twoshot_size)
+    return per_buffer * 3
+
+
+def _flashinfer_mnnvl_workspace_allocation_sizes(
+    cuda_driver,
+    prop,
+    world_size: int,
+    max_token_num: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    force_oneshot: bool = False,
+) -> list[int]:
+    requested_size = _flashinfer_mnnvl_workspace_size_bytes(
+        world_size,
+        max_token_num,
+        hidden_dim,
+        dtype,
+        force_oneshot,
+    )
+    err, alloc_granularity = cuda_driver.cuMemGetAllocationGranularity(
+        prop,
+        cuda_driver.CUmemAllocationGranularity_flags.CU_MEM_ALLOC_GRANULARITY_RECOMMENDED,
+    )
+    if err != cuda_driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(
+            "cuMemGetAllocationGranularity failed for FlashInfer MNNVL "
+            f"workspace preflight: {err}"
+        )
+    return [ceil_align(requested_size, alloc_granularity)]
+
+
 def _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop) -> bool:
     handles = []
     try:
@@ -390,19 +434,21 @@ def _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop) -> bool:
 
 
 def _preflight_check_workspace_memory(
+    backend: str,
     world_size: int,
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
+    use_oneshot: Optional[bool] = None,
     cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> bool:
     """Collectively decide whether to enter FlashInfer workspace creation.
 
-    FlashInfer TRTLLM workspaces allocate several SymmDeviceMemory buffers and
+    FlashInfer workspaces allocate backend-specific symmetric-memory buffers and
     then exchange handles across ranks. If one rank fails local cuMemCreate and
     exits while peers enter handle exchange, peers can hang until the watchdog
-    aborts. Probe the same handle type and allocation sequence first, then vote
-    on a CPU group so all ranks proceed or skip together.
+    aborts. Probe the selected backend's local allocation sequence first, then
+    vote on a CPU group so all ranks proceed or skip together.
     """
     import torch.distributed as dist
 
@@ -417,14 +463,29 @@ def _preflight_check_workspace_memory(
     try:
         cuda_driver = get_cuda_driver_bindings()
         prop = _make_flashinfer_workspace_allocation_prop(cuda_driver)
-        allocation_sizes = _flashinfer_trtllm_workspace_allocation_sizes(
-            cuda_driver,
-            prop,
-            world_size,
-            max_token_num,
-            hidden_dim,
-            dtype,
-        )
+        if backend == "trtllm":
+            allocation_sizes = _flashinfer_trtllm_workspace_allocation_sizes(
+                cuda_driver,
+                prop,
+                world_size,
+                max_token_num,
+                hidden_dim,
+                dtype,
+            )
+        elif backend == "mnnvl":
+            allocation_sizes = _flashinfer_mnnvl_workspace_allocation_sizes(
+                cuda_driver,
+                prop,
+                world_size,
+                max_token_num,
+                hidden_dim,
+                dtype,
+                force_oneshot=bool(use_oneshot),
+            )
+        else:
+            raise ValueError(
+                f"Unsupported FlashInfer workspace preflight backend: {backend}"
+            )
         local_ok = _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop)
     except Exception as e:
         logger.warning(
@@ -483,7 +544,6 @@ class FlashInferWorkspaceManager:
         hidden_dim: int,
         backend: str = "auto",
         group: Optional[ProcessGroup] = None,
-        use_fp32_lamport: bool = False,
         dtype: Optional[torch.dtype] = None,
         use_oneshot: Optional[bool] = None,
         device_group: Optional["torch.distributed.ProcessGroup"] = None,
@@ -523,11 +583,15 @@ class FlashInferWorkspaceManager:
 
         self.cleanup()
 
+        alloc_token_num = max(max_token_num, self._max_token_num_seen or 0)
+        alloc_hidden_dim = max(hidden_dim, self._max_hidden_dim_seen or 0)
         if not _preflight_check_workspace_memory(
+            backend=backend,
             world_size=world_size,
-            max_token_num=max_token_num,
-            hidden_dim=hidden_dim,
-            dtype=dtype,
+            max_token_num=alloc_token_num,
+            hidden_dim=alloc_hidden_dim,
+            dtype=dtype or torch.bfloat16,
+            use_oneshot=use_oneshot,
             cpu_group=comm_cpu_group or cpu_group,
         ):
             _flashinfer_allreduce_unavailable = True
@@ -553,8 +617,6 @@ class FlashInferWorkspaceManager:
             comm_backend = _mnnvl_comm_backend(node_pg)
 
         try:
-            alloc_token_num = max(max_token_num, self._max_token_num_seen or 0)
-            alloc_hidden_dim = max(hidden_dim, self._max_hidden_dim_seen or 0)
             create_kw = dict(
                 backend=backend,
                 world_size=world_size,
@@ -577,8 +639,6 @@ class FlashInferWorkspaceManager:
                 create_kw["group"] = device_group
             if use_oneshot is not None:
                 create_kw["force_oneshot_support"] = bool(use_oneshot)
-            if use_fp32_lamport:
-                create_kw["use_fp32_lamport"] = True
             self.workspace = _create_allreduce_fusion_workspace(**create_kw)
             self.world_size = world_size
             self.rank = rank
@@ -661,14 +721,22 @@ class FlashInferWorkspaceManager:
                 self._logged_init = False
 
 
-_attn_tp_workspace_manager = FlashInferWorkspaceManager()
-_moe_tp_workspace_manager = FlashInferWorkspaceManager()
-
-
 def _get_workspace_manager(use_attn_tp_group: bool) -> FlashInferWorkspaceManager:
-    return (
-        _attn_tp_workspace_manager if use_attn_tp_group else _moe_tp_workspace_manager
+    """The per-group fusion workspace manager; the instances live on
+    ``ctx.resources`` (one per comm group, created lazily)."""
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    name = (
+        "flashinfer_fusion_attn_tp_workspace"
+        if use_attn_tp_group
+        else "flashinfer_fusion_moe_tp_workspace"
     )
+    manager = buffers.get(name)
+    if manager is None:
+        manager = FlashInferWorkspaceManager()
+        buffers[name] = manager
+    return manager
 
 
 def _sync_allreduce_unavailable_across_tp():
@@ -705,7 +773,6 @@ def _sync_allreduce_unavailable_across_tp():
 def ensure_workspace_initialized(
     max_token_num: int = 2048,
     hidden_dim: int = 4096,
-    use_fp32_lamport: bool = False,
     dtype: Optional[torch.dtype] = None,
     token_num: Optional[int] = None,
     use_oneshot: Optional[bool] = None,
@@ -753,7 +820,7 @@ def ensure_workspace_initialized(
     token_num = token_num or max_token_num
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
-    server_args = get_global_server_args()
+    server_args = get_server_args()
     backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
     if backend is None:
         return False
@@ -777,7 +844,6 @@ def ensure_workspace_initialized(
             hidden_dim=hidden_dim,
             backend=backend,
             group=cpu_group,
-            use_fp32_lamport=use_fp32_lamport,
             dtype=dtype,
             use_oneshot=use_oneshot,
             device_group=device_group,
@@ -887,7 +953,6 @@ def flashinfer_allreduce_residual_rmsnorm(
     if not ensure_workspace_initialized(
         max_token_num=max_token_num,
         hidden_dim=input_tensor.shape[-1],
-        use_fp32_lamport=(input_tensor.dtype == torch.float32),
         dtype=input_tensor.dtype,
         token_num=input_tensor.shape[0],
         use_oneshot=use_oneshot,
@@ -901,8 +966,9 @@ def flashinfer_allreduce_residual_rmsnorm(
         logger.debug("FlashInfer workspace is None")
         return None, None
 
-    if pre_allreduce_addition is not None and not _workspace_supports_pre_allreduce_add(
-        workspace_manager.workspace
+    if (
+        pre_allreduce_addition is not None
+        and not _workspace_supports_pre_allreduce_add(workspace_manager.workspace)
     ):
         global _unsupported_pre_allreduce_add_backend_logged
         if not _unsupported_pre_allreduce_add_backend_logged:
@@ -975,11 +1041,13 @@ def pre_initialize_workspaces(
 
 
 def cleanup_flashinfer_workspace():
-    global _attn_tp_workspace_manager, _moe_tp_workspace_manager
-    if _attn_tp_workspace_manager is not None:
-        _attn_tp_workspace_manager.cleanup()
-    if (
-        _moe_tp_workspace_manager is not None
-        and _moe_tp_workspace_manager is not _attn_tp_workspace_manager
+    from sglang.srt.runtime_context import get_resources
+
+    buffers = get_resources().buffers
+    for name in (
+        "flashinfer_fusion_attn_tp_workspace",
+        "flashinfer_fusion_moe_tp_workspace",
     ):
-        _moe_tp_workspace_manager.cleanup()
+        manager = buffers.get(name)
+        if manager is not None:
+            manager.cleanup()

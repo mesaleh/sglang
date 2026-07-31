@@ -47,6 +47,11 @@ class TestDecodeCudaGraphRunner(unittest.TestCase):
         self.assertTrue(runner.can_run_graph(forward_batch))
         self.assertEqual(runner.backend.shape_key, ShapeKey(size=3))
 
+        runner.backend.shape_key = None
+        forward_batch.disable_decode_cuda_graph = True
+        self.assertFalse(runner.can_run_graph(forward_batch))
+        self.assertIsNone(runner.backend.shape_key)
+
 
 if __name__ == "__main__":
     unittest.main()
