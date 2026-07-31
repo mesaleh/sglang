@@ -1,0 +1,32 @@
+{"at": "2026-07-31T02:20:53.498815Z", "epoch": 1785464453.4988244, "event": "coordinator-start", "generation": "ee712a8ab13e456c8abc58f5adc716e3", "previous_state": "DISARMED", "reason": "coordinator-startup", "state": "DISARMED"}
+{"at": "2026-07-31T02:21:18.911405Z", "epoch": 1785464478.9114347, "event": "preflight-pass"}
+{"at": "2026-07-31T02:21:18.947560Z", "epoch": 1785464478.9475708, "event": "state-transition", "generation": "491d3cebb77f4beea83c00d652259b95", "health_failures": {"ct13": 0, "ct14": 0}, "previous_state": "DISARMED", "reason": "live-safe-drill", "role": "h43_stage1", "state": "TRANSITION"}
+{"at": "2026-07-31T02:21:20.755374Z", "epoch": 1785464480.7553835, "event": "state-disarmed", "generation": "afc9c3fb96a744758e2e7e92a1048dd1", "previous_state": "TRANSITION", "reason": "live-safe-drill-pass", "state": "DISARMED"}
+{"at": "2026-07-31T02:27:44.554912Z", "epoch": 1785464864.5549212, "event": "state-transition", "generation": "9463eab116d841959ff430e46816cbff", "health_failures": {"ct13": 0, "ct14": 0}, "previous_state": "DISARMED", "reason": "endpoint-window-start", "role": "h43_stage1", "state": "TRANSITION"}
+{"at": "2026-07-31T02:46:43.595469Z", "epoch": 1785466003.595497, "error": "runtime attestation ranks mismatch: observed=[] expected=0..7", "event": "arm-rejected", "role": "h43_stage1"}
+{"at": "2026-07-31T02:51:29.905241Z", "epoch": 1785466289.9052508, "event": "coordinator-start", "generation": "4e0e4645babb42758f8f2a5e690a0678", "previous_state": "TRANSITION", "reason": "coordinator-startup", "state": "DISARMED"}
+{"at": "2026-07-31T02:51:40.244941Z", "epoch": 1785466300.2449498, "event": "state-transition", "generation": "9b804370a55c4e029a6337c3885f3928", "health_failures": {"ct13": 0, "ct14": 0}, "previous_state": "DISARMED", "reason": "stderr-log-fix-rearm", "role": "h43_stage1", "state": "TRANSITION"}
+{"at": "2026-07-31T02:51:47.085767Z", "epoch": 1785466307.0858064, "event": "completion-smoke-pass", "response_id": "48df76e382284f24aaee748de574aa0f", "role": "h43_stage1", "usage": {"completion_tokens": 54, "prompt_tokens": 18, "prompt_tokens_details": null, "reasoning_tokens": 52, "total_tokens": 72}}
+{"at": "2026-07-31T02:51:47.508747Z", "epoch": 1785466307.5087578, "event": "state-monitoring", "generation": "9b804370a55c4e029a6337c3885f3928", "identities": {"ct13": {"configured_image": "gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:kimi-k26-tq-h43-i3-20260730-3f7d419a-1eff3d1c-w8fix-v3@sha256:c2d3d098cce506721c9e57dddde7b3f4406b2da8119ff85198cd631498c51154", "id": "1399e30bf34fbe554712100b0eae97c88aec1f82297e8544116b31f348ad04dd", "image": "sha256:c2d3d098cce506721c9e57dddde7b3f4406b2da8119ff85198cd631498c51154", "name": "/tq-h43-i3-h43_stage1-r0", "running": "true", "started_at": "2026-07-31T02:28:53.421904511Z", "status": "running"}, "ct14": {"configured_image": "gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:kimi-k26-tq-h43-i3-20260730-3f7d419a-1eff3d1c-w8fix-v3@sha256:c2d3d098cce506721c9e57dddde7b3f4406b2da8119ff85198cd631498c51154", "id": "7ec389fbb72d5772a5c4a994f7906420b46ff3af80c294212e074ef10eb78811", "image": "sha256:a7cad07ac1600fbca0ba3304ca6477b542f2f91c6b6db7b55ef4cf38c3d303dc", "name": "/tq-h43-i3-h43_stage1-r1", "running": "true", "started_at": "2026-07-31T02:28:51.053548184Z", "status": "running"}}, "role": "h43_stage1"}
+{"at": "2026-07-31T03:02:34.211881Z", "epoch": 1785466954.2118902, "event": "state-transition", "generation": "63bcbc3bf6194bc49a50da7648d32819", "health_failures": {"ct13": 0, "ct14": 0}, "previous_state": "MONITORING", "reason": "stage1-pass", "role": "fp8_pre", "state": "TRANSITION"}
+Fri 2026-07-31 03:40:23 UTC 35min left    n/a                         n/a          h43-i3-phase-fp8-pre.timer     h43-i3-deadline@phase-fp8-pre.service
+Fri 2026-07-31 06:27:51 UTC 3h 23min left n/a                         n/a          h43-i3-endpoint-absolute.timer h43-i3-deadline@endpoint-absolute.service
+× h43-i3-coordinator.service - H43 I3 two-rank endpoint coordinator (starts disarmed)
+     Loaded: loaded (/etc/systemd/system/h43-i3-coordinator.service; static)
+     Active: failed (Result: exit-code) since Fri 2026-07-31 03:02:35 UTC; 1min 56s ago
+    Process: 1854970 ExecStartPre=/usr/bin/test -x /var/lib/h43/h43-i3-endpoint-c2d3d098/h43-i3-coordinator.py (code=exited, status=0/SUCCESS)
+    Process: 1854972 ExecStartPre=/usr/bin/sha256sum --check /var/lib/h43/h43-i3-endpoint-c2d3d098/h43-i3-coordinator.sha256 (code=exited, status=0/SUCCESS)
+    Process: 1854973 ExecStart=/var/lib/h43/h43-i3-endpoint-c2d3d098/h43-i3-coordinator.py run (code=exited, status=2)
+   Main PID: 1854973 (code=exited, status=2)
+        CPU: 6.979s
+
+Jul 31 03:02:28 beacon-cr-ct13 sudo[1861244]:  mesaleh : PWD=/ ; USER=root ; COMMAND=/usr/bin/docker inspect --type container tq-h43-i3-h43_stage1-r0
+Jul 31 03:02:28 beacon-cr-ct13 sudo[1861244]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1002)
+Jul 31 03:02:28 beacon-cr-ct13 sudo[1861244]: pam_unix(sudo:session): session closed for user root
+Jul 31 03:02:28 beacon-cr-ct13 sudo[1861257]:  mesaleh : PWD=/ ; USER=root ; COMMAND=/usr/bin/docker logs --timestamps --tail 5000 --since 5m tq-h43-i3-h43_stage1-r0
+Jul 31 03:02:28 beacon-cr-ct13 sudo[1861257]: pam_unix(sudo:session): session opened for user root(uid=0) by (uid=1002)
+Jul 31 03:02:28 beacon-cr-ct13 sudo[1861257]: pam_unix(sudo:session): session closed for user root
+Jul 31 03:02:35 beacon-cr-ct13 h43-i3-coordinator.py[1854973]: coordinator: cannot read persisted coordinator state: [Errno 13] Permission denied: '/var/lib/h43/h43-i3-endpoint-c2d3d098/coordinator/state.json'
+Jul 31 03:02:35 beacon-cr-ct13 systemd[1]: h43-i3-coordinator.service: Main process exited, code=exited, status=2/INVALIDARGUMENT
+Jul 31 03:02:35 beacon-cr-ct13 systemd[1]: h43-i3-coordinator.service: Failed with result 'exit-code'.
+Jul 31 03:02:35 beacon-cr-ct13 systemd[1]: h43-i3-coordinator.service: Consumed 6.979s CPU time.
