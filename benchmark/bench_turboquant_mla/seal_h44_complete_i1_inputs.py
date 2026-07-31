@@ -137,13 +137,14 @@ def seal_tree(root: Path) -> None:
     for path in paths:
         metadata = path.lstat()
         if stat.S_ISLNK(metadata.st_mode):
-            resolved = path.resolve(strict=True)
             try:
-                resolved.relative_to(root)
-            except ValueError as exc:
-                raise SealError(
-                    f"staged symlink escapes complete-I1 root: {path}"
-                ) from exc
+                runner._safe_symlink_target(
+                    root,
+                    path.relative_to(root).as_posix(),
+                    os.readlink(path),
+                )
+            except runner.I1Error as exc:
+                raise SealError(f"unsafe staged complete-I1 symlink: {path}") from exc
             os.chown(path, 0, 0, follow_symlinks=False)
         elif stat.S_ISREG(metadata.st_mode):
             if metadata.st_nlink != 1:

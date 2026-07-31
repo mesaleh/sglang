@@ -14,7 +14,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-
 MODULE_PATH = Path(__file__).with_name("run_h44_complete_i1.py")
 SPEC = importlib.util.spec_from_file_location("run_h44_complete_i1", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -104,6 +103,54 @@ class CompleteI1Tests(unittest.TestCase):
             ignore=shutil.ignore_patterns(".git"),
         )
         self.assertEqual(runner.git_tree_oid(exported), expected)
+
+    def test_inventory_preserves_top_level_mount_for_symlinks(self) -> None:
+        root = self.root / "sealed"
+        (root / "source" / "shared").mkdir(parents=True)
+        (root / "source" / "nested").mkdir()
+        (root / "aot").mkdir()
+        target = root / "source" / "shared" / "target"
+        target.write_text("inside\n", encoding="utf-8")
+        target.chmod(0o444)
+        aot_target = root / "aot" / "target"
+        aot_target.write_text("cross-mount\n", encoding="utf-8")
+        aot_target.chmod(0o444)
+        (root / "source" / "nested" / "link").symlink_to("../shared/target")
+        with mock.patch.object(runner, "SEALED_OWNER_UID", os.getuid()):
+            inventory = runner.inventory_tree(root, manifest_name="input-manifest.json")
+        self.assertIn(
+            {
+                "kind": "symlink",
+                "path": "source/nested/link",
+                "target": "../shared/target",
+            },
+            inventory,
+        )
+
+        (root / "source" / "nested" / "cross").symlink_to("../../aot/target")
+        with (
+            mock.patch.object(runner, "SEALED_OWNER_UID", os.getuid()),
+            self.assertRaisesRegex(runner.I1Error, "top-level container mount"),
+        ):
+            runner.inventory_tree(root, manifest_name="input-manifest.json")
+
+        (root / "source" / "nested" / "cross").unlink()
+        (root / "source" / "nested" / "reentry").symlink_to(
+            "../../../sealed/source/shared/target"
+        )
+        with (
+            mock.patch.object(runner, "SEALED_OWNER_UID", os.getuid()),
+            self.assertRaisesRegex(runner.I1Error, "top-level container mount"),
+        ):
+            runner.inventory_tree(root, manifest_name="input-manifest.json")
+
+        (root / "source" / "nested" / "reentry").unlink()
+        (root / "source" / "masked-climb").symlink_to("../source/shared/target")
+        with (
+            mock.patch.object(runner, "SEALED_OWNER_UID", os.getuid()),
+            self.assertRaisesRegex(runner.I1Error, "top-level container mount"),
+        ):
+            runner.inventory_tree(root, manifest_name="input-manifest.json")
 
     def test_one_total_replacement_is_enforced(self) -> None:
         campaign = runner.CompleteI1(args_for(self.root, verify_only=True))

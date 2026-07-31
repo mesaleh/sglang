@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import posixpath
 import re
 import shlex
 import signal
@@ -19,7 +20,6 @@ import sys
 import time
 import types
 from typing import Any
-
 
 H44_ROOT = Path("/var/lib/h44/kimi-k26-tq-recovery-20260731")
 CAMPAIGN_EVIDENCE_ROOT = H44_ROOT / "campaign" / "evidence"
@@ -222,6 +222,36 @@ def _safe_relative(root: Path, relative: str) -> Path:
     return resolved
 
 
+def _safe_symlink_target(root: Path, link_relative: str, target: str) -> Path:
+    root = root.resolve(strict=True)
+    target_path = Path(target)
+    if not target or target_path.is_absolute():
+        raise I1Error(f"unsafe sealed-input symlink target: {target!r}")
+    link_parts = Path(link_relative).parts
+    if len(link_parts) < 2:
+        raise I1Error(
+            "sealed-input symlink is not below a top-level container mount: "
+            f"{link_relative!r} -> {target!r}"
+        )
+    mount_relative_link = posixpath.join(*link_parts[1:])
+    lexical = posixpath.normpath(
+        posixpath.join(posixpath.dirname(mount_relative_link), target)
+    )
+    if lexical == ".." or lexical.startswith("../"):
+        raise I1Error(
+            "sealed-input symlink crosses its top-level container mount: "
+            f"{link_relative!r} -> {target!r}"
+        )
+    resolved = (root / Path(link_relative).parent / target_path).resolve(strict=True)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise I1Error(
+            f"sealed-input symlink escapes root: {link_relative!r} -> {target!r}"
+        ) from exc
+    return resolved
+
+
 def inventory_tree(root: Path, *, manifest_name: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for current, directories, filenames in os.walk(root, followlinks=False):
@@ -242,7 +272,7 @@ def inventory_tree(root: Path, *, manifest_name: str) -> list[dict[str, Any]]:
                 directories.remove(name)
                 relative = path.relative_to(root).as_posix()
                 target = os.readlink(path)
-                _safe_relative(root, str(Path(relative).parent / target))
+                _safe_symlink_target(root, relative, target)
                 rows.append({"kind": "symlink", "path": relative, "target": target})
         for name in sorted(filenames):
             path = current_path / name
@@ -252,7 +282,7 @@ def inventory_tree(root: Path, *, manifest_name: str) -> list[dict[str, Any]]:
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 target = os.readlink(path)
-                _safe_relative(root, str(Path(relative).parent / target))
+                _safe_symlink_target(root, relative, target)
                 rows.append({"kind": "symlink", "path": relative, "target": target})
                 continue
             if not stat.S_ISREG(info.st_mode):

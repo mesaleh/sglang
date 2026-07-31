@@ -14,7 +14,6 @@ import tempfile
 import unittest
 from unittest import mock
 
-
 MODULE_PATH = Path(__file__).with_name("seal_h44_complete_i1_inputs.py")
 SPEC = importlib.util.spec_from_file_location(
     "seal_h44_complete_i1_inputs", MODULE_PATH
@@ -140,6 +139,17 @@ class SealCompleteI1InputsTests(unittest.TestCase):
             self.assertRaisesRegex(sealer.SealError, "not bound"),
         ):
             sealer.seal(args)
+
+    def test_seal_tree_rejects_cross_mount_symlink(self) -> None:
+        link = self.root / "source" / "cross"
+        target = self.root / "aot" / "target"
+        target.write_text("cross-mount\n", encoding="utf-8")
+        link.symlink_to("../aot/target")
+        with (
+            mock.patch.object(sealer.os, "chown"),
+            self.assertRaisesRegex(sealer.SealError, "unsafe staged"),
+        ):
+            sealer.seal_tree(self.root)
 
 
 if __name__ == "__main__":
