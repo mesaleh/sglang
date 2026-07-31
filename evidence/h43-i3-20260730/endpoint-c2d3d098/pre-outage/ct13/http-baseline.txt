@@ -1,0 +1,2 @@
+health_http=200
+{"object":"list","data":[{"id":"moonshotai/Kimi-K2.6","object":"model","created":1785461769,"owned_by":"sglang","root":"moonshotai/Kimi-K2.6","parent":null,"max_model_len":256000}]}
