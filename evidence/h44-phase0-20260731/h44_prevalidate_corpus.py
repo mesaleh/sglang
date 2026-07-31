@@ -23,6 +23,27 @@ QUALIFICATION_CANDIDATES = 10
 WARMUP_CANDIDATES = 10
 SELECTED_PROMPTS = 30
 ENDPOINT_PROMPTS = 10
+FROZEN_PROMPT_SALT_PREFIX = "h46-i3-frozen-20260731-"
+CANDIDATE_SALT_INDICES = range(0, INITIAL_CANDIDATES)
+WARMUP_SALT_INDICES = range(100, 100 + WARMUP_CANDIDATES)
+QUALIFICATION_SALT_INDICES = range(200, 200 + QUALIFICATION_CANDIDATES)
+ALLOWED_SALT_INDICES = frozenset(
+    (*CANDIDATE_SALT_INDICES, *WARMUP_SALT_INDICES, *QUALIFICATION_SALT_INDICES)
+)
+
+if len(ALLOWED_SALT_INDICES) != (
+    INITIAL_CANDIDATES + WARMUP_CANDIDATES + QUALIFICATION_CANDIDATES
+):
+    raise RuntimeError("H46 frozen prompt salt ranges overlap")
+
+
+def build_prompt_salt(salt_index: int) -> str:
+    if type(salt_index) is not int or salt_index not in ALLOWED_SALT_INDICES:
+        raise ValueError(f"salt index is outside the H46 frozen ranges: {salt_index}")
+    return (
+        f"{FROZEN_PROMPT_SALT_PREFIX}"
+        f"s0001-synthetic-synthetic-p16000-o512-c1-r{salt_index:03d}"
+    )
 
 
 def build_messages(canonical: Any, salt: str) -> list[dict[str, str]]:
@@ -96,8 +117,12 @@ def make_candidate_record(
     warmup_probe: bool,
 ) -> dict[str, Any]:
     kind = "warmup" if warmup_probe else "candidate"
-    salt_index = candidate_index + 100 if warmup_probe else candidate_index
-    salt = f"{corpus_id}-s0001-synthetic-synthetic-p16000-o512-c1-" f"r{salt_index:03d}"
+    salt_index = (
+        WARMUP_SALT_INDICES[candidate_index]
+        if warmup_probe
+        else CANDIDATE_SALT_INDICES[candidate_index]
+    )
+    salt = build_prompt_salt(salt_index)
     messages = build_messages(canonical, salt)
     max_tokens = 1 if warmup_probe else TELEMETRY.OUTPUT_TOKENS
     payload = build_openai_payload(
@@ -128,10 +153,8 @@ def make_native_qualification_record(
     candidate_index: int,
     timeout_s: int,
 ) -> dict[str, Any]:
-    salt = (
-        f"{corpus_id}-qualification-s0001-synthetic-synthetic-"
-        f"p16000-o512-c1-r{candidate_index:03d}"
-    )
+    salt_index = QUALIFICATION_SALT_INDICES[candidate_index]
+    salt = build_prompt_salt(salt_index)
     messages = build_messages(canonical, salt)
     rendered_prompt = TELEMETRY.render_frozen_kimi_chat(messages)
     payload = {
@@ -164,6 +187,7 @@ def make_native_qualification_record(
         "recorded_at_utc": TELEMETRY.now_utc(),
         "kind": "qualification",
         "candidate_index": candidate_index,
+        "salt_index": salt_index,
         "salt": salt,
         "messages": messages,
         "prompt_sha256": TELEMETRY.sha256_json(messages),
@@ -215,6 +239,7 @@ def select_initial_manifest(
         warmups.append(
             {
                 "candidate_index": record["candidate_index"],
+                "salt_index": record["salt_index"],
                 "salt": record["salt"],
                 "messages": record["messages"],
                 "prompt_sha256": record["prompt_sha256"],
@@ -227,6 +252,7 @@ def select_initial_manifest(
             {
                 "selected_index": selected_index,
                 "candidate_index": record["candidate_index"],
+                "salt_index": record["salt_index"],
                 "salt": record["salt"],
                 "messages": record["messages"],
                 "prompt_sha256": record["prompt_sha256"],
@@ -250,6 +276,20 @@ def select_initial_manifest(
             "thinking": "unset",
             "ignore_eos": False,
             "cache_mode": "unique-prefix",
+            "frozen_prompt_salt_prefix": FROZEN_PROMPT_SALT_PREFIX,
+            "candidate_salt_indices": [
+                CANDIDATE_SALT_INDICES.start,
+                CANDIDATE_SALT_INDICES.stop - 1,
+            ],
+            "warmup_salt_indices": [
+                WARMUP_SALT_INDICES.start,
+                WARMUP_SALT_INDICES.stop - 1,
+            ],
+            "qualification_salt_indices": [
+                QUALIFICATION_SALT_INDICES.start,
+                QUALIFICATION_SALT_INDICES.stop - 1,
+            ],
+            "campaign_identity_in_prompt": False,
         },
         "selection_rule": (
             "first 30 of 40 candidate indices returning exactly 10218 prompt "
@@ -260,6 +300,7 @@ def select_initial_manifest(
         "identity": identity,
         "qualification_prompt": {
             "candidate_index": qualification_record["candidate_index"],
+            "salt_index": qualification_record["salt_index"],
             "salt": qualification_record["salt"],
             "messages": qualification_record["messages"],
             "prompt_sha256": qualification_record["prompt_sha256"],
