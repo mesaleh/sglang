@@ -320,7 +320,25 @@ class CompleteI1Tests(unittest.TestCase):
                 input_root, manifest_name="input-manifest.json"
             )
         image_id = "sha256:" + "7" * 64
+        local_image_id = "sha256:" + "6" * 64
         image_ref = "registry/image@sha256:" + "8" * 64
+        image_inspect = {
+            "Architecture": "arm64",
+            "Config": {
+                "Labels": {
+                    "com.omniva.inference.h43-native-sha256": "2" * 64,
+                }
+            },
+            "Created": "2026-07-31T00:00:00Z",
+            "Id": local_image_id,
+            "Os": "linux",
+            "RepoDigests": [image_ref],
+            "RootFS": {"Layers": ["sha256:" + "3" * 64], "Type": "layers"},
+        }
+        _, _, image_runtime_sha256 = runner.image_identity_from_inspect(
+            json.dumps([image_inspect]),
+            image_ref=image_ref,
+        )
         value = {
             "allowed_nodes": ["ct13", "ct14"],
             "aot_expected_entries": 14,
@@ -331,12 +349,13 @@ class CompleteI1Tests(unittest.TestCase):
             "gate": "complete_i1_inputs",
             "image_id": image_id,
             "image_ref": image_ref,
+            "image_runtime_sha256": image_runtime_sha256,
             "loader_path": "work/h43_aot_loader.py",
             "native_extension_path": "/opt/omniva/h43/sglang_tq_mla_frontend_sm100_h43_i3_v2.so",
             "native_extension_sha256": "2" * 64,
             "phase": "phase0_complete_i1",
             "roundtrip_root": "roundtrip",
-            "schema_version": 1,
+            "schema_version": 2,
             "source_commit": source_commit,
             "source_commit_object_path": runner.SOURCE_COMMIT_OBJECT_PATH,
             "source_root": "source",
@@ -346,9 +365,7 @@ class CompleteI1Tests(unittest.TestCase):
         path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
         path.chmod(0o444)
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        image = subprocess.CompletedProcess(
-            [], 0, f"{image_id} {value['native_extension_sha256']}\n", ""
-        )
+        image = subprocess.CompletedProcess([], 0, json.dumps([image_inspect]), "")
         with (
             mock.patch.object(runner, "SEALED_OWNER_UID", os.getuid()),
             mock.patch.object(runner, "SEALED_GATE_ROOT", gate_root),
@@ -361,6 +378,27 @@ class CompleteI1Tests(unittest.TestCase):
                 source_commit=source_commit,
             )
         self.assertEqual(observed, value)
+
+    def test_image_identity_requires_exact_repository_digest(self) -> None:
+        image_ref = "registry/image@sha256:" + "4" * 64
+        image = {
+            "Architecture": "arm64",
+            "Config": {
+                "Labels": {
+                    "com.omniva.inference.h43-native-sha256": "5" * 64,
+                }
+            },
+            "Created": "2026-07-31T00:00:00Z",
+            "Id": "sha256:" + "6" * 64,
+            "Os": "linux",
+            "RepoDigests": ["registry/image@sha256:" + "7" * 64],
+            "RootFS": {"Layers": [], "Type": "layers"},
+        }
+        with self.assertRaisesRegex(runner.I1Error, "exact repository digest"):
+            runner.image_identity_from_inspect(
+                json.dumps([image]),
+                image_ref=image_ref,
+            )
 
     def test_write_new_refuses_overwrite(self) -> None:
         path = self.root / "artifact"

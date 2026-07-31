@@ -85,12 +85,31 @@ class SealCompleteI1InputsTests(unittest.TestCase):
         (self.root / "provenance" / "source-commit-object").write_bytes(commit_payload)
         image_id = "sha256:" + "c" * 64
         native_sha256 = "d" * 64
-        image = subprocess.CompletedProcess([], 0, f"{image_id} {native_sha256}\n", "")
+        image_ref = "registry/image@sha256:" + "f" * 64
+        image_inspect = {
+            "Architecture": "arm64",
+            "Config": {
+                "Labels": {
+                    "com.omniva.inference.h43-native-sha256": native_sha256,
+                }
+            },
+            "Created": "2026-07-31T00:00:00Z",
+            "Id": image_id,
+            "Os": "linux",
+            "RepoDigests": [image_ref],
+            "RootFS": {"Layers": ["sha256:" + "e" * 64], "Type": "layers"},
+        }
+        image_payload = json.dumps([image_inspect])
+        _, _, image_runtime_sha256 = sealer.runner.image_identity_from_inspect(
+            image_payload,
+            image_ref=image_ref,
+        )
+        image = subprocess.CompletedProcess([], 0, image_payload, "")
         args = argparse.Namespace(
             phase="phase0_complete_i1",
             source_commit=source_commit,
             source_tree=source_tree,
-            image_ref="registry/image@sha256:" + "f" * 64,
+            image_ref=image_ref,
             root=self.root,
         )
         with (
@@ -101,7 +120,7 @@ class SealCompleteI1InputsTests(unittest.TestCase):
             mock.patch.object(
                 sealer,
                 "docker_image_identity",
-                return_value=(image_id, native_sha256),
+                return_value=(image_id, native_sha256, image_runtime_sha256),
             ),
             mock.patch.object(sealer.runner, "docker", return_value=image),
         ):
@@ -111,6 +130,7 @@ class SealCompleteI1InputsTests(unittest.TestCase):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["source_tree"], source_tree)
         self.assertEqual(manifest["image_id"], image_id)
+        self.assertEqual(manifest["image_runtime_sha256"], image_runtime_sha256)
         self.assertEqual(result["status"], "PASS")
         final_root = self.gate_root.resolve() / "phase0_complete_i1"
         self.assertEqual(

@@ -37,7 +37,7 @@ class SealError(RuntimeError):
     pass
 
 
-def docker_image_identity(image_ref: str) -> tuple[str, str]:
+def docker_image_identity(image_ref: str) -> tuple[str, str, str]:
     try:
         completed = subprocess.run(
             [
@@ -45,8 +45,6 @@ def docker_image_identity(image_ref: str) -> tuple[str, str]:
                 "image",
                 "inspect",
                 image_ref,
-                "--format",
-                '{{.Id}} {{index .Config.Labels "com.omniva.inference.h43-native-sha256"}}',
             ],
             check=False,
             capture_output=True,
@@ -55,19 +53,18 @@ def docker_image_identity(image_ref: str) -> tuple[str, str]:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SealError(f"cannot inspect complete-I1 image: {exc}") from exc
-    fields = completed.stdout.strip().split()
-    if completed.returncode or len(fields) != 2:
+    if completed.returncode:
         raise SealError(
             f"complete-I1 image inspection failed rc={completed.returncode}: "
             f"{completed.stderr.strip()}"
         )
-    image_id, native_sha256 = fields
-    if (
-        re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None
-        or runner.SHA256.fullmatch(native_sha256) is None
-    ):
-        raise SealError("complete-I1 image identity or native label is invalid")
-    return image_id, native_sha256
+    try:
+        return runner.image_identity_from_inspect(
+            completed.stdout,
+            image_ref=image_ref,
+        )
+    except runner.I1Error as exc:
+        raise SealError(f"complete-I1 image identity is invalid: {exc}") from exc
 
 
 def validate_layout(
@@ -195,7 +192,9 @@ def seal(args: argparse.Namespace) -> dict[str, Any]:
     aot_manifest = validate_layout(
         root, source_commit=args.source_commit, source_tree=args.source_tree
     )
-    image_id, native_sha256 = docker_image_identity(args.image_ref)
+    image_id, native_sha256, image_runtime_sha256 = docker_image_identity(
+        args.image_ref
+    )
     executable_dir = root / "executable"
     executable_dir.mkdir(mode=0o700)
     source_runner = (
@@ -230,12 +229,13 @@ def seal(args: argparse.Namespace) -> dict[str, Any]:
             "gate": "complete_i1_inputs",
             "image_id": image_id,
             "image_ref": args.image_ref,
+            "image_runtime_sha256": image_runtime_sha256,
             "loader_path": "work/h43_aot_loader.py",
             "native_extension_path": NATIVE_PATH,
             "native_extension_sha256": native_sha256,
             "phase": args.phase,
             "roundtrip_root": "roundtrip",
-            "schema_version": 1,
+            "schema_version": 2,
             "source_commit": args.source_commit,
             "source_commit_object_path": runner.SOURCE_COMMIT_OBJECT_PATH,
             "source_root": "source",

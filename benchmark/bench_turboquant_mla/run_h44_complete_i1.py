@@ -73,6 +73,57 @@ def canonical_digest(value: Any) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def image_identity_from_inspect(
+    payload: str, *, image_ref: str
+) -> tuple[str, str, str]:
+    try:
+        values = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise I1Error("complete-I1 image inspection is not JSON") from exc
+    if (
+        not isinstance(values, list)
+        or len(values) != 1
+        or not isinstance(values[0], dict)
+    ):
+        raise I1Error("complete-I1 image inspection has an invalid shape")
+    value = values[0]
+    image_id = str(value.get("Id", ""))
+    repo_digests = value.get("RepoDigests")
+    config = value.get("Config")
+    rootfs = value.get("RootFS")
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is None:
+        raise I1Error("complete-I1 local image ID is invalid")
+    if not isinstance(repo_digests, list) or image_ref not in repo_digests:
+        raise I1Error("complete-I1 image omits the exact repository digest")
+    if (
+        value.get("Architecture") != "arm64"
+        or value.get("Os") != "linux"
+        or not isinstance(value.get("Created"), str)
+        or not isinstance(config, dict)
+        or not isinstance(rootfs, dict)
+    ):
+        raise I1Error("complete-I1 image runtime identity is invalid")
+    labels = config.get("Labels")
+    native_sha256 = (
+        labels.get("com.omniva.inference.h43-native-sha256")
+        if isinstance(labels, dict)
+        else None
+    )
+    if SHA256.fullmatch(str(native_sha256 or "")) is None:
+        raise I1Error("complete-I1 image native label is invalid")
+    runtime_sha256 = canonical_digest(
+        {
+            "Architecture": value["Architecture"],
+            "Config": config,
+            "Created": value["Created"],
+            "Os": value["Os"],
+            "RootFS": rootfs,
+            "Variant": value.get("Variant"),
+        }
+    )
+    return image_id, str(native_sha256), runtime_sha256
+
+
 def _git_object_oid(kind: str, payload: bytes) -> bytes:
     header = f"{kind} {len(payload)}\0".encode()
     return hashlib.sha1(header + payload, usedforsecurity=False).digest()
@@ -348,6 +399,7 @@ def load_input_manifest(
         "allowed_nodes",
         "image_ref",
         "image_id",
+        "image_runtime_sha256",
         "source_root",
         "source_commit_object_path",
         "aot_root",
@@ -363,7 +415,7 @@ def load_input_manifest(
     if not isinstance(value, dict) or set(value) != expected_fields:
         raise I1Error("complete-I1 input-manifest fields differ from schema")
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "gate": "complete_i1_inputs",
         "phase": phase,
         "source_commit": source_commit,
@@ -386,6 +438,7 @@ def load_input_manifest(
     if re.fullmatch(r"[^\s@]+@sha256:[0-9a-f]{64}", image_ref) is None:
         raise I1Error("complete-I1 image reference is not digest-pinned")
     for field in (
+        "image_runtime_sha256",
         "native_extension_sha256",
         "aot_source_manifest_digest",
         "aot_installed_mla_sha256",
@@ -419,20 +472,16 @@ def load_input_manifest(
     observed = inventory_tree(root, manifest_name=path.name)
     if files != observed:
         raise I1Error("complete-I1 input file inventory differs from sealed manifest")
-    image = (
-        docker(
-            "image",
-            "inspect",
-            image_ref,
-            "--format",
-            '{{.Id}} {{index .Config.Labels "com.omniva.inference.h43-native-sha256"}}',
-            timeout=30,
-        )
-        .stdout.strip()
-        .split()
+    inspected = docker("image", "inspect", image_ref, timeout=30)
+    _local_image_id, native_sha256, runtime_sha256 = image_identity_from_inspect(
+        inspected.stdout,
+        image_ref=image_ref,
     )
-    if image != [value["image_id"], value["native_extension_sha256"]]:
-        raise I1Error("complete-I1 image ID/native label differs from manifest")
+    if (
+        native_sha256 != value["native_extension_sha256"]
+        or runtime_sha256 != value["image_runtime_sha256"]
+    ):
+        raise I1Error("complete-I1 image runtime identity differs from manifest")
     return value
 
 
