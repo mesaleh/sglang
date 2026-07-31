@@ -1,0 +1,49 @@
+=== COLLABORATIVE REVIEW ===
+Timestamp:    2026-07-30 21:56:15
+Model:        claude-opus-5 (effort: max)
+Project dir:  /private/tmp/h43-final-review.1uPvJI
+Session key:  h43-i3-final-evidence-20260731
+Continuing:   8be60e83-6c34-4998-980a-c4c87bc8e36e
+Prompt file:  /tmp/h43-final-review.1uPvJI/review-prompt-round3.md
+
+=== PROMPT ===
+# H43 I3 final evidence review — round 3
+
+Re-review commit `d401ebb` and the current snapshot after the single remaining round-two finding.
+Return `LGTM` exactly if no medium-or-higher correctness, statistical, decision, or safety issue
+remains. Otherwise report only remaining findings with minimal fixes.
+
+Timer chronology is now explicit and directly evidenced:
+
+- Coordinator state-machine disarm: 04:24:37 UTC.
+- The independent systemd safeguards were still armed at the 04:25:47/49 restore captures.
+- CT13 and CT14 journals both show FP8-post and absolute timers deactivated/stopped at 04:25:58,
+  before the 04:39:23/24 phase deadline.
+- Timestamped 04:54:56-59 evidence in
+  `timed/coordinator/post-deadline-timer-proof.txt` shows all six timer units inactive/dead with
+  empty last-trigger fields. Both deadline services have `ExecMainStartTimestamp=n/a`, are
+  inactive/dead, and have no journal entries, proving they never fired.
+- All prose now distinguishes coordinator disarm from later systemd timer stop and no longer says
+  the restore captures preceded disarm.
+
+The analyzer-review wording now explicitly refers to the separate pre-measurement three-round
+analyzer review that ended LGTM, not this final content-review series. Rank-local image/configured
+image/overlay details are labeled as pre-campaign attestation; the timed restore evidence's narrower
+contents are stated accurately.
+
+One additional self-review correction is included: each role summary did contain an independent,
+fresh-role post-run `/server_info` cumulative accept-length metric (2.652/2.592/2.574/2.647 for
+FP8-pre/E2M1/H43/FP8-post). The notes label it corroborating only because it includes coordinator
+smoke and warmups, has no usable before value, and is not per-request. It remains excluded from the
+verdict; successor work still requires final-response `meta_info` or clean counter deltas.
+
+All prior round-one statistical, causality, TTFT, counterfactual, bootstrap, test-coverage,
+structural-completeness, historical-297, and next-direction corrections remain in place. Thirteen
+tests pass locally; pycompile and both source/vault diff checks pass.
+
+=== REVIEWER OUTPUT (raw JSON) ===
+{"is_error":false,"duration_api_ms":205567,"num_turns":13,"stop_reason":"end_turn","session_id":"8be60e83-6c34-4998-980a-c4c87bc8e36e","total_cost_usd":2.7610409999999996,"usage":{"input_tokens":16,"cache_creation_input_tokens":179518,"cache_read_input_tokens":1184762,"output_tokens":14936,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":179518,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":1019,"cache_read_input_tokens":182854,"cache_creation_input_tokens":311,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":311},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5":{"inputTokens":16,"outputTokens":14936,"cacheReadInputTokens":1184762,"cacheCreationInputTokens":179518,"webSearchRequests":0,"costUSD":2.7610409999999996,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-opus-5","provider":"firstParty"}},"permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_01KfEcTK5DVsA6Sq8mrnR73D","tool_input":{"command":"rg -n 'precede disarm|before disarm|captured after disarm|the final round returned' timed/ vault/ ; echo \"--- exit $? (1 = no matches) ---\"; echo \"=== test count ===\"; rg -c '    def test_' timed/test_analyze_h43_i3_endpoint.py","description":"Check stale phrasing removed and count tests"}}],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"result":"LGTM","ttft_ms":4205,"ttft_stream_ms":3195,"time_to_request_ms":99,"type":"result","duration_ms":206113,"uuid":"b8a7c303-5b8c-4535-b592-9b187fdd4335"}
+
+=== REVIEWER OUTPUT (clean text) ===
+LGTM
+=== END ===

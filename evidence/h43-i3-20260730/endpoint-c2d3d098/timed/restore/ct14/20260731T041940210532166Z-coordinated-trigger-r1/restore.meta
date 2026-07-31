@@ -1,0 +1,9 @@
+timestamp=20260731T041940210532166Z
+host=beacon-cr-ct14
+rank=1
+reason=coordinated-trigger
+lock_was_contended=0
+accepted_id=a64d7605b6396e208173bdce0747c2b8b178c3c23403481e13a266e19e4bc15d
+accepted_name=tq-native-p28-e2m1-dflash-layers-0e68a197-r1
+accepted_image=sha256:d41714925d455b56ce561a9b45088b02abb45b2df072b29d709374876bf8ef09
+accepted_configured_image=gitlab.aws.omniva.com:5050/acls/security-analytics/sglang:kimi-k26-tq-gate-candidate-20260727-7a1-db01-admissionfix@sha256:cc6fa1f338da513f9da20ee9310ba8dafbc964e2d9a6b7d528bdef9500c1920c

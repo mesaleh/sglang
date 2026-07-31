@@ -1,0 +1,143 @@
+capture_utc=2026-07-31T04:54:56Z
+COORDINATOR_STATE_CT13
+{
+  "generation": "b2f946ccbc9c45e5a3ced8f41ece5831",
+  "reason": "accepted-restore-pass",
+  "restored_after_epoch": 1785471579,
+  "schema": 1,
+  "state": "DISARMED",
+  "updated_at": "2026-07-31T04:24:37.195137Z",
+  "updated_epoch": 1785471877.19516
+}
+NODE=ct13
+node_capture_utc=2026-07-31T04:54:58Z
+beacon-cr-ct13
+TIMER_STOP_JOURNAL
+Jul 31 04:25:58 beacon-cr-ct13 systemd[1]: h43-i3-phase-fp8-post.timer: Deactivated successfully.
+Jul 31 04:25:58 beacon-cr-ct13 systemd[1]: Stopped H43 I3 FP8-post 38-minute deadline.
+Jul 31 04:25:58 beacon-cr-ct13 systemd[1]: h43-i3-endpoint-absolute.timer: Deactivated successfully.
+Jul 31 04:25:58 beacon-cr-ct13 systemd[1]: Stopped H43 I3 four-hour absolute endpoint deadline.
+TIMER_PROPERTIES
+UNIT=h43-i3-phase-h43-stage1.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-fp8-pre.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-e2m1.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-h43.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-fp8-post.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-endpoint-absolute.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+DEADLINE_SERVICE_PROPERTIES
+UNIT=h43-i3-deadline@phase-fp8-post.service
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=n/a
+ExecMainExitTimestamp=n/a
+ExecMainStatus=0
+ActiveState=inactive
+SubState=dead
+JOURNAL
+-- No entries --
+UNIT=h43-i3-deadline@endpoint-absolute.service
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=n/a
+ExecMainExitTimestamp=n/a
+ExecMainStatus=0
+ActiveState=inactive
+SubState=dead
+JOURNAL
+-- No entries --
+NODE=ct14
+node_capture_utc=2026-07-31T04:54:59Z
+beacon-cr-ct14
+TIMER_STOP_JOURNAL
+Jul 31 04:25:58 beacon-cr-ct14 systemd[1]: h43-i3-phase-fp8-post.timer: Deactivated successfully.
+Jul 31 04:25:58 beacon-cr-ct14 systemd[1]: Stopped H43 I3 FP8-post 38-minute deadline.
+Jul 31 04:25:58 beacon-cr-ct14 systemd[1]: h43-i3-endpoint-absolute.timer: Deactivated successfully.
+Jul 31 04:25:58 beacon-cr-ct14 systemd[1]: Stopped H43 I3 four-hour absolute endpoint deadline.
+TIMER_PROPERTIES
+UNIT=h43-i3-phase-h43-stage1.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-fp8-pre.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-e2m1.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-h43.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-phase-fp8-post.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+UNIT=h43-i3-endpoint-absolute.timer
+NextElapseUSecRealtime=
+LastTriggerUSec=
+Result=success
+ActiveState=inactive
+SubState=dead
+DEADLINE_SERVICE_PROPERTIES
+UNIT=h43-i3-deadline@phase-fp8-post.service
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=n/a
+ExecMainExitTimestamp=n/a
+ExecMainStatus=0
+ActiveState=inactive
+SubState=dead
+JOURNAL
+-- No entries --
+UNIT=h43-i3-deadline@endpoint-absolute.service
+Result=success
+NRestarts=0
+ExecMainStartTimestamp=n/a
+ExecMainExitTimestamp=n/a
+ExecMainStatus=0
+ActiveState=inactive
+SubState=dead
+JOURNAL
+-- No entries --

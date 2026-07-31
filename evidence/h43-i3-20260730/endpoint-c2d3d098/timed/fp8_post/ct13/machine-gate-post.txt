@@ -1,0 +1,16 @@
+Fri Jul 31 04:22:05 UTC 2026
+POST_STOP_LOG_CLASSIFICATION
+The traceback below follows coordinator SIGTERM, zero remaining requests, graceful exit, and SystemExit: 0; the pre-stop role gate was clean.
+ROLE_IDENTITY
+id=0938ce0daeea61279568ef620b48008edb8a6e1e8366bf1aec682abf404c2015 running=false oom=false started=2026-07-31T04:02:10.976769182Z finished=2026-07-31T04:19:48.502422646Z image=sha256:c2d3d098cce506721c9e57dddde7b3f4406b2da8119ff85198cd631498c51154
+GPU_STATE_AFTER_ROLE
+0, P0, 1965 MHz, 4000 MHz, 0
+1, P0, 1965 MHz, 4000 MHz, 0
+2, P0, 1965 MHz, 4000 MHz, 0
+3, P0, 1965 MHz, 4000 MHz, 0
+KERNEL_XID_SXID_SINCE_ROLE_START
+ROLE_LOG_ERRORS
+[2026-07-31 04:19:45] ERROR:    Traceback (most recent call last):
+Traceback (most recent call last):
+ACCEPTED_RESTORE_CONTAINER
+tq-native-p28-e2m1-dflash-layers-0e68a197-r0 03b4ce2c1c9c Up 2 minutes

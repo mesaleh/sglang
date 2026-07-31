@@ -1,0 +1,15 @@
+Fri Jul 31 04:22:06 UTC 2026
+POST_STOP_LOG_CLASSIFICATION
+The traceback below is dummy-worker startup cancellation after coordinator SIGTERM; the pre-stop role gate was clean.
+ROLE_IDENTITY
+id=631a6def641bf3c9d6f766b5a9f9fed9ccc4e0bc8b07929544c515134bc94e77 running=false oom=false started=2026-07-31T04:02:08.912152244Z finished=2026-07-31T04:19:48.240105023Z image=sha256:a7cad07ac1600fbca0ba3304ca6477b542f2f91c6b6db7b55ef4cf38c3d303dc
+GPU_STATE_AFTER_ROLE
+0, P0, 1965 MHz, 4000 MHz, 0
+1, P0, 1965 MHz, 4000 MHz, 0
+2, P0, 1965 MHz, 4000 MHz, 0
+3, P0, 1965 MHz, 4000 MHz, 0
+KERNEL_XID_SXID_SINCE_ROLE_START
+ROLE_LOG_ERRORS
+[2026-07-31 04:19:46] ERROR:    Traceback (most recent call last):
+ACCEPTED_RESTORE_CONTAINER
+tq-native-p28-e2m1-dflash-layers-0e68a197-r1 a64d7605b639 Up 2 minutes

@@ -1,0 +1,5 @@
+tq-h43-i3-h43_stage1-r1 tq-h43-i3-h43_stage1-r1-failsafe-20260731T041940210532166Z
+tq-h43-i3-fp8_pre-r1 tq-h43-i3-fp8_pre-r1-failsafe-20260731T041940210532166Z
+tq-h43-i3-e2m1-r1 tq-h43-i3-e2m1-r1-failsafe-20260731T041940210532166Z
+tq-h43-i3-h43-r1 tq-h43-i3-h43-r1-failsafe-20260731T041940210532166Z
+tq-h43-i3-fp8_post-r1 tq-h43-i3-fp8_post-r1-failsafe-20260731T041940210532166Z

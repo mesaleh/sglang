@@ -1,0 +1,49 @@
+=== COLLABORATIVE REVIEW ===
+Timestamp:    2026-07-30 20:48:09
+Model:        claude-opus-5 (effort: max)
+Project dir:  /private/tmp/h43-analyzer-review.0Q79yR
+Session key:  h43-analyzer-bounded-20260731
+Continuing:   f045b4ca-aab8-47f9-9a0e-3635892b474a
+Prompt file:  /tmp/h43-review-prompt-iteration-3.md
+
+=== PROMPT ===
+This is iteration #3 of the review.
+
+## Review Subject
+
+Review the current uncommitted diff and complete files in this bounded snapshot:
+- `evidence/h43-i3-20260730/endpoint-c2d3d098/timed/analyze_h43_i3_endpoint.py`
+- `evidence/h43-i3-20260730/endpoint-c2d3d098/timed/test_analyze_h43_i3_endpoint.py`
+- `contract/H43-I3-contract.md` (authoritative experiment contract; especially 338-369, 403-405, 493-559)
+
+Run `git diff HEAD`, then read the full current files and contract. Current validation
+passes 7/7 unit tests, Python compilation, and `git diff --check`.
+
+## Prior Findings Ledger
+
+### Iteration 1
+
+1. [MEDIUM] Frozen prompt uniqueness was not checked — ACCEPTED, FIXED: require exactly 12 distinct manifest hashes before role load; regression test added.
+2. [MEDIUM] Plain PASS/all-gates reason overstated analyzer scope — ACCEPTED, FIXED: success is `PASS_PERF`, automated scope and required external endpoint gates are explicit.
+3. [MEDIUM] Role ordering did not bound an overlong bracket — ACCEPTED, FIXED: bracket-span backstop added with terminal `NO_DECISION`; regression test added, with its bound corrected in iteration 2.
+4. [LOW] Bool/int equality accepted type-confused frozen fields — ACCEPTED, FIXED: require exact type and equality.
+5. [LOW] Finite non-positive timing values reached ratios — ACCEPTED, FIXED: timing and decode-rate fields must be finite and positive.
+6. [LOW] Static output claims were not distinguished from measurements — PARTIALLY ACCEPTED, FIXED: memory is labeled contractual/not measured here; prompt equality remains a valid success-path assertion because all-role mismatch raises.
+
+### Iteration 2
+
+7. [MEDIUM] Four-hour bound was too loose for the measured-role subset — ACCEPTED, FIXED: `MAX_TIMED_BRACKET_S` is now the contract-derived 135 minutes (122-minute measured-role budget plus the complete 13-minute shared reserve), so a provable campaign-cap crossing becomes `NO_DECISION`.
+
+## Review Instructions
+
+Run `git diff HEAD`, read the current files and cited contract, and focus ONLY on NEW issues
+MEDIUM or higher not in the ledger. Do not re-flag accepted/fixed items unless a fix itself
+introduced a new problem. If everything looks good, respond with exactly: LGTM
+Otherwise use numbered findings with [SEVERITY] and file:line.
+
+=== REVIEWER OUTPUT (raw JSON) ===
+{"is_error":false,"duration_api_ms":63006,"num_turns":5,"stop_reason":"end_turn","session_id":"f045b4ca-aab8-47f9-9a0e-3635892b474a","total_cost_usd":0.48996249999999997,"usage":{"input_tokens":8,"cache_creation_input_tokens":19437,"cache_read_input_tokens":372755,"output_tokens":4367,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":19437,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":437,"cache_read_input_tokens":100059,"cache_creation_input_tokens":4071,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":4071},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5":{"inputTokens":8,"outputTokens":4367,"cacheReadInputTokens":372755,"cacheCreationInputTokens":19437,"webSearchRequests":0,"costUSD":0.48996249999999997,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-opus-5","provider":"firstParty"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"result":"LGTM","ttft_ms":3757,"ttft_stream_ms":3679,"time_to_request_ms":469,"type":"result","duration_ms":63929,"uuid":"91331ff5-b7fa-440f-886f-17bcc2c0b98b"}
+
+=== REVIEWER OUTPUT (clean text) ===
+LGTM
+=== END ===

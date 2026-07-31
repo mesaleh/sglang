@@ -33,13 +33,27 @@ class AnalyzerTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def write_role(
-        self, role: str, *, base_epoch: int, tpot_ms: float, ttft_ms: float = 100.0
+        self,
+        role: str,
+        *,
+        base_epoch: int,
+        tpot_ms: float,
+        ttft_ms: float = 100.0,
+        response_chunks: int = 200,
+        measured_tpots: list[float] | None = None,
     ) -> None:
+        if measured_tpots is not None and len(measured_tpots) != 10:
+            raise ValueError("measured_tpots must contain ten values")
         role_dir = self.root / role
         role_dir.mkdir(exist_ok=True)
         rows = []
         for index in range(12):
             measured_index = index - 2
+            row_tpot_ms = (
+                measured_tpots[measured_index]
+                if measured_tpots is not None and measured_index >= 0
+                else tpot_ms
+            )
             recorded = dt.datetime.fromtimestamp(
                 base_epoch + index * 3, tz=dt.timezone.utc
             ).strftime("%Y%m%dT%H%M%SZ")
@@ -61,7 +75,7 @@ class AnalyzerTests(unittest.TestCase):
                     "output_tokens_target": 512,
                     "prompt_tokens_target": 16000,
                     "response_chars": 2048,
-                    "response_chunks": 200,
+                    "response_chunks": response_chunks,
                     "scenario_id": "s0001-synthetic-synthetic-p16000-o512-c1",
                     "schema_version": 1,
                     "sglang_rid": "",
@@ -69,10 +83,10 @@ class AnalyzerTests(unittest.TestCase):
                     "temperature": 0.0,
                     "thinking": "unset",
                     "top_p": 1.0,
-                    "tpot_ms": tpot_ms,
+                    "tpot_ms": row_tpot_ms,
                     "ttft_ms": ttft_ms,
                     "e2e_ms": 1000.0,
-                    "decode_tok_s": 1000.0 / tpot_ms,
+                    "decode_tok_s": 1000.0 / row_tpot_ms,
                     "recorded_at_utc": recorded,
                     "prompt_tokens": 10218,
                     "response_sha256": f"{role}-{index}",
@@ -117,6 +131,78 @@ class AnalyzerTests(unittest.TestCase):
         self.write_pass_fixture()
         self.write_role("fp8_post", base_epoch=4000, tpot_ms=3.06)
         result = analyzer.analyze(self.root, self.manifest)
+        self.assertEqual(result["verdict"], "NO_DECISION")
+        self.assertEqual(result["reason"], "fp8-flank-drift")
+
+    def test_invalid_flank_precedes_failing_candidate(self) -> None:
+        self.write_pass_fixture()
+        self.write_role(
+            "h43",
+            base_epoch=3000,
+            tpot_ms=3.3,
+            measured_tpots=[3.3] * 9 + [3.8],
+        )
+        self.write_role("fp8_post", base_epoch=4000, tpot_ms=3.06)
+        result = analyzer.analyze(self.root, self.manifest)
+        self.assertEqual(result["verdict"], "NO_DECISION")
+        self.assertEqual(result["reason"], "fp8-flank-drift")
+        self.assertEqual(result["h43_tpot_band"], "FAIL_PERF")
+        self.assertFalse(result["h43_tail_pass"])
+
+    def test_valid_flank_tail_only_failure_forces_fail_perf(self) -> None:
+        self.write_pass_fixture()
+        self.write_role(
+            "h43",
+            base_epoch=3000,
+            tpot_ms=3.0,
+            measured_tpots=[3.0] * 9 + [3.5],
+        )
+        result = analyzer.analyze(self.root, self.manifest)
+        self.assertEqual(result["h43_tpot_band"], "PASS")
+        self.assertEqual(result["h43_ttft_band"], "PASS")
+        self.assertFalse(result["h43_tail_pass"])
+        self.assertEqual(result["verdict"], "FAIL_PERF")
+        self.assertEqual(result["reason"], "performance-gate")
+
+    def test_ttft_failure_forces_fail_perf(self) -> None:
+        self.write_pass_fixture()
+        self.write_role("h43", base_epoch=3000, tpot_ms=3.1, ttft_ms=112.0)
+        result = analyzer.analyze(self.root, self.manifest)
+        self.assertEqual(result["h43_tpot_band"], "PASS")
+        self.assertEqual(result["h43_ttft_band"], "FAIL_PERF")
+        self.assertTrue(result["h43_tail_pass"])
+        self.assertEqual(result["verdict"], "FAIL_PERF")
+
+    def test_fp8_ttft_drift_cap_forces_no_decision(self) -> None:
+        self.write_pass_fixture()
+        self.write_role(
+            "fp8_post", base_epoch=4000, tpot_ms=3.0, ttft_ms=102.1
+        )
+        result = analyzer.analyze(self.root, self.manifest)
+        self.assertGreater(abs(result["fp8_flank_drift"]["ttft_ms"]), 0.02)
+        self.assertEqual(result["verdict"], "NO_DECISION")
+        self.assertEqual(result["reason"], "fp8-flank-drift")
+
+    def test_fp8_acceptance_drift_cap_forces_no_decision(self) -> None:
+        self.write_pass_fixture()
+        self.write_role(
+            "fp8_post", base_epoch=4000, tpot_ms=3.0, response_chunks=211
+        )
+        result = analyzer.analyze(self.root, self.manifest)
+        self.assertGreater(abs(result["fp8_flank_drift"]["acceptance"]), 0.05)
+        self.assertEqual(result["verdict"], "NO_DECISION")
+        self.assertEqual(result["reason"], "fp8-flank-drift")
+
+    def test_fp8_target_verify_drift_cap_forces_no_decision(self) -> None:
+        self.write_pass_fixture()
+        self.write_role(
+            "fp8_post", base_epoch=4000, tpot_ms=3.0, response_chunks=205
+        )
+        result = analyzer.analyze(self.root, self.manifest)
+        self.assertLess(abs(result["fp8_flank_drift"]["acceptance"]), 0.05)
+        self.assertGreater(
+            abs(result["fp8_flank_drift"]["target_verify_ms"]), 0.02
+        )
         self.assertEqual(result["verdict"], "NO_DECISION")
         self.assertEqual(result["reason"], "fp8-flank-drift")
 

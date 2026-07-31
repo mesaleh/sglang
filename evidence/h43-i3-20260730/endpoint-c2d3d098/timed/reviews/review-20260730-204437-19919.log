@@ -1,0 +1,49 @@
+=== COLLABORATIVE REVIEW ===
+Timestamp:    2026-07-30 20:44:37
+Model:        claude-opus-5 (effort: max)
+Project dir:  /private/tmp/h43-analyzer-review.0Q79yR
+Session key:  h43-analyzer-bounded-20260731
+Continuing:   f045b4ca-aab8-47f9-9a0e-3635892b474a
+Prompt file:  /tmp/h43-review-prompt-iteration-2.md
+
+=== PROMPT ===
+This is iteration #2 of the review.
+
+## Review Subject
+
+Review the current uncommitted diff and complete files in this bounded snapshot:
+- `evidence/h43-i3-20260730/endpoint-c2d3d098/timed/analyze_h43_i3_endpoint.py`
+- `evidence/h43-i3-20260730/endpoint-c2d3d098/timed/test_analyze_h43_i3_endpoint.py`
+- `contract/H43-I3-contract.md` (authoritative experiment contract; especially 493-537)
+
+Run `git diff HEAD` for all fixes, then read the full current files and contract. Current
+validation passes 7/7 unit tests, Python compilation, and `git diff --check`.
+
+## Prior Findings Ledger
+
+### Iteration 1
+
+1. [MEDIUM] Frozen prompt uniqueness was not checked — ACCEPTED, FIXED: the manifest must now contain exactly 12 distinct hashes before any role is loaded; a duplicate-corpus regression test was added.
+2. [MEDIUM] A plain PASS/all-gates reason overstated this analyzer's scope — ACCEPTED, FIXED: success is now `PASS_PERF`, reason is `all-automated-matched-performance-gates`, scope is explicit, and the external gates needed for endpoint PASS are listed.
+3. [MEDIUM] Role midpoint ordering did not bound an overlong bracket — ACCEPTED, FIXED: the measured timed bracket now has a necessary four-hour validity backstop; a miss is terminal `NO_DECISION` with reason `timed-bracket-span`, and a regression test covers it.
+4. [LOW] Python bool/int equality could accept type-confused frozen fields — ACCEPTED, FIXED: each frozen value now requires both exact type and equality.
+5. [LOW] Finite but non-positive timing values could reach ratios — ACCEPTED, FIXED: every required timing and decode-rate field must be finite and positive.
+6. [LOW] Static prompt/memory output claims were not distinguished from measurements — PARTIALLY ACCEPTED, FIXED: memory is now explicitly `contractual_memory_claims` with a not-measured-here source marker. The prompt-hash claim remains because equality is actually evaluated for every role and mismatch raises, so `True` is a valid success-path assertion.
+
+## Review Instructions
+
+Run `git diff HEAD`, read the current files and contract, and focus ONLY on NEW issues
+MEDIUM or higher not in the ledger. Do not re-flag accepted/fixed items unless a fix itself
+introduced a new problem. You may challenge the partial rejection with a concrete reason.
+
+If everything looks good, respond with exactly: LGTM
+Otherwise use numbered findings with [SEVERITY] and file:line.
+
+=== REVIEWER OUTPUT (raw JSON) ===
+{"is_error":false,"duration_api_ms":162362,"num_turns":4,"stop_reason":"end_turn","session_id":"f045b4ca-aab8-47f9-9a0e-3635892b474a","total_cost_usd":1.1984555000000001,"usage":{"input_tokens":6,"cache_creation_input_tokens":81001,"cache_read_input_tokens":139881,"output_tokens":12739,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":81001,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":6360,"cache_read_input_tokens":70051,"cache_creation_input_tokens":14642,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":14642},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5":{"inputTokens":6,"outputTokens":12739,"cacheReadInputTokens":139881,"cacheCreationInputTokens":81001,"webSearchRequests":0,"costUSD":1.1984555000000001,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-opus-5","provider":"firstParty"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"result":"All six ledger fixes are correctly implemented and I found no new problems in five of them. Verified: manifest length + uniqueness runs before any role load (`:205-208`), the type-strict frozen-field check correctly distinguishes `bool`/`int` (`:81-86`), positivity covers all four required fields (`:98-101`), the new gate takes top precedence and both new tests genuinely exercise their paths, `external_gates_required_for_endpoint_pass` maps completely onto contract `:515-517`, and the `PASS_PERF`/`FAIL_PERF` asymmetry is semantically right (a perf FAIL from this analyzer *is* the terminal contract verdict; a perf pass is not). One new issue in the fix for ledger item 3:\n\n1. [MEDIUM] `evidence/h43-i3-20260730/endpoint-c2d3d098/timed/analyze_h43_i3_endpoint.py:20` (applied at `:224-227`) — `MAX_TIMED_BRACKET_S` is set to the whole 240-minute window budget, but the value it bounds is a strict subset of that window, so the gate cannot fire for any realistic overrun. The span measured is `fp8_pre` first-measured-request start → `fp8_post` last-measured-request end, which by contract `:367-369` excludes `fp8_pre`'s 25-minute readiness/capture and `fp8_post`'s 5-minute archive/stop, and sits inside a window that also contains `h43_stage1` (50 min) and final restore (25 min). Contractually reachable maximum for exactly that span: fp8_pre 8+5, e2m1 38, h43 38, fp8_post 25+8 = 122 min base, plus at most the entire 13-minute shared reserve = 135 min (8,100 s). The gate admits 14,400 s. Concretely, a 150-minute bracket forces a window total of 25+150+5+50+25 = 255 min against a 240-minute non-rearmable deadline — a provable crossing, terminal `NO_DECISION` under contract `:403-405` and `:556-559` — yet `timed_bracket_valid` reports `true` and the run can emit `PASS_PERF`. Everything in (8,100 s, 14,400 s] is that blind spot, roughly 105 minutes wide. Deriving the constant from the timed-role budget instead (≈8,100 s) also implicitly bounds inter-role stalls, which the current span-only check at 4 hours does not. Two mitigating facts worth weighing before changing it: the ledger already describes this as a *necessary* backstop rather than a sufficient one, and the coordinator's armed per-role deadlines with automatic restore are the primary enforcement — an overrun of this size would normally destroy the campaign before `fp8_post` data existed. The concern is that the analyzer is the artifact of record, and as tuned it will affirmatively certify a span it has enough information to reject.","ttft_ms":3347,"ttft_stream_ms":2423,"time_to_request_ms":203,"type":"result","duration_ms":162911,"uuid":"29eb67b6-f92b-4106-8562-41f6a2fa03fe"}
+
+=== REVIEWER OUTPUT (clean text) ===
+All six ledger fixes are correctly implemented and I found no new problems in five of them. Verified: manifest length + uniqueness runs before any role load (`:205-208`), the type-strict frozen-field check correctly distinguishes `bool`/`int` (`:81-86`), positivity covers all four required fields (`:98-101`), the new gate takes top precedence and both new tests genuinely exercise their paths, `external_gates_required_for_endpoint_pass` maps completely onto contract `:515-517`, and the `PASS_PERF`/`FAIL_PERF` asymmetry is semantically right (a perf FAIL from this analyzer *is* the terminal contract verdict; a perf pass is not). One new issue in the fix for ledger item 3:
+
+1. [MEDIUM] `evidence/h43-i3-20260730/endpoint-c2d3d098/timed/analyze_h43_i3_endpoint.py:20` (applied at `:224-227`) — `MAX_TIMED_BRACKET_S` is set to the whole 240-minute window budget, but the value it bounds is a strict subset of that window, so the gate cannot fire for any realistic overrun. The span measured is `fp8_pre` first-measured-request start → `fp8_post` last-measured-request end, which by contract `:367-369` excludes `fp8_pre`'s 25-minute readiness/capture and `fp8_post`'s 5-minute archive/stop, and sits inside a window that also contains `h43_stage1` (50 min) and final restore (25 min). Contractually reachable maximum for exactly that span: fp8_pre 8+5, e2m1 38, h43 38, fp8_post 25+8 = 122 min base, plus at most the entire 13-minute shared reserve = 135 min (8,100 s). The gate admits 14,400 s. Concretely, a 150-minute bracket forces a window total of 25+150+5+50+25 = 255 min against a 240-minute non-rearmable deadline — a provable crossing, terminal `NO_DECISION` under contract `:403-405` and `:556-559` — yet `timed_bracket_valid` reports `true` and the run can emit `PASS_PERF`. Everything in (8,100 s, 14,400 s] is that blind spot, roughly 105 minutes wide. Deriving the constant from the timed-role budget instead (≈8,100 s) also implicitly bounds inter-role stalls, which the current span-only check at 4 hours does not. Two mitigating facts worth weighing before changing it: the ledger already describes this as a *necessary* backstop rather than a sufficient one, and the coordinator's armed per-role deadlines with automatic restore are the primary enforcement — an overrun of this size would normally destroy the campaign before `fp8_post` data existed. The concern is that the analyzer is the artifact of record, and as tuned it will affirmatively certify a span it has enough information to reject.
+=== END ===

@@ -1,0 +1,11 @@
+accepted_already_running=false
+accepted_started_at=2026-07-30T22:28:36.002729066Z
+accepted_age_seconds=unknown
+accepted_pre_health=not-running
+role_teardown_failed=0
+role_teardown_proven_running=0
+role_teardown_unknown=0
+lock_was_contended=0
+completion_marker_match=0
+completion_marker_age_seconds=unknown
+

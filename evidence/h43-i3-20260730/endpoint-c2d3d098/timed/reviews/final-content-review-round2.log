@@ -1,0 +1,97 @@
+=== COLLABORATIVE REVIEW ===
+Timestamp:    2026-07-30 21:48:43
+Model:        claude-opus-5 (effort: max)
+Project dir:  /private/tmp/h43-final-review.1uPvJI
+Session key:  h43-i3-final-evidence-20260731
+Continuing:   8be60e83-6c34-4998-980a-c4c87bc8e36e
+Prompt file:  /tmp/h43-final-review.1uPvJI/review-prompt-round2.md
+
+=== PROMPT ===
+# H43 I3 final evidence review — round 2
+
+Re-review the complete current snapshot after round-one findings. Inspect commit `19cb154` versus
+its parent and the current files. Return `LGTM` exactly if there are no remaining
+medium-or-higher correctness, statistical, decision, or safety findings; otherwise give only
+remaining prioritized findings with minimal fixes.
+
+Round-one disposition:
+
+1. Added the omitted post-disarm evidence at
+   `timed/coordinator/final-status-and-timers.txt` plus final state. Notes now explicitly distinguish
+   pre-disarm `restore-final-*` captures from post-disarm proof.
+2. Reframed acceptance/target-verify as algebraically dependent stream proxies, not causal evidence,
+   and require independent server-side accept-length telemetry next.
+3. Added the independent H43 TTFT regression: 324.918 ms is +32.30% versus same-layer E2M1 N14;
+   next attribution now profiles H43 prefill/TTFT as well as draft acceptance.
+4. Scoped the 3.695/3.699-ms counterfactual to mean TPOT only and states TTFT/tails still fail. Both
+   mean-of-means and matched-index estimators are labeled.
+5. Documented that deterministic FP8 acceptance drift is structurally zero and target-verify drift
+   is collinear with TPOT; only TPOT/TTFT independently constrained this bracket.
+6. Explicitly says the TPOT bootstrap interval crosses the gate and bases engineering rejection on
+   joint observed mean, TTFT, tails, and E2M1 N14 floor; no claim that TPOT CI alone excludes pass.
+7. Expanded analyzer tests from 7 to 13: actual invalid-flank + failing-candidate precedence,
+   tail-only failure, TTFT failure, and every drift cap. All 13 pass locally with py_compile and
+   diff-check clean.
+8. Explained distinct rank-local accepted Docker image IDs as separately pinned historical
+   node-local images/overlays; restore pins each node's exact identities and overlay digests.
+9. Clarified ~297 tok/s belongs to accepted E2M1 N2, which this bracket did not measure; no
+   cross-campaign comparison is supported.
+10. Replaced timed-response “coherent” claims with structural completeness and states payload
+    equality is harness-attested rather than reverified from raw records. Stage-1 coherence claims
+    remain because those were manually inspected outside this analyzer.
+
+The unchanged predeclared contract is: formal verdict precedence makes invalid FP8 flank
+`NO_DECISION` even when candidate bands fail. Product mean-TPOT gate is <=5%; automatic TPOT
+PASS<=+4.5/FAIL>+5.5, TTFT PASS<=+9/FAIL>+11, tail p95<=1.10 and max<=1.15. Memory values remain
+contractual prior byte accounting, not analyzer measurements.
+
+Please verify actual files/numbers and whether the revised next step is now evidence-proportional:
+fixed-memory selected-layer/numerical-representation attribution with independent server accept
+telemetry plus H43 prefill/TTFT profiling, EAGLE3 deferred, fresh cold bracket required for any
+successor.
+
+=== REVIEWER OUTPUT (raw JSON) ===
+{"is_error":false,"duration_api_ms":224078,"num_turns":11,"stop_reason":"end_turn","session_id":"8be60e83-6c34-4998-980a-c4c87bc8e36e","total_cost_usd":2.415683,"usage":{"input_tokens":16,"cache_creation_input_tokens":150213,"cache_read_input_tokens":950546,"output_tokens":17528,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":150213,"ephemeral_5m_input_tokens":0},"inference_geo":"global","iterations":[{"input_tokens":2,"output_tokens":3631,"cache_read_input_tokens":148404,"cache_creation_input_tokens":5456,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":5456},"type":"message"}],"speed":"standard"},"modelUsage":{"claude-opus-5":{"inputTokens":16,"outputTokens":17528,"cacheReadInputTokens":950546,"cacheCreationInputTokens":150213,"webSearchRequests":0,"costUSD":2.415683,"contextWindow":1000000,"maxOutputTokens":64000,"canonicalModel":"claude-opus-5","provider":"firstParty"}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","fast_mode_disabled_reason":"sdk_opt_in_required","subtype":"success","api_error_status":null,"result":"Re-reviewed `19cb154` against its parent and the current files. Items 2–7, 9 and 10 are properly closed. I hand-verified the six new tests against the unchanged analyzer (all six reach their asserted verdicts, including a genuine tail-only case where p95 = 1.091667 passes and max = 1.166667 fails), confirmed the count is 13, re-derived the identity at `TIMED_NOTES.md:96-97` (`target_verify/acceptance × 512/511 ≡ tpot` exactly), and re-checked +32.30% (324.9177/245.5891 = 1.323014) and both counterfactual estimators (3.6953 ms/+2.93% mean-of-means, 3.6987 ms/+3.03% matched per-index). `analyze_h43_i3_endpoint.py` and `ENDPOINT_ANALYSIS.json` are unchanged, so the published numbers still stand. The revised next step is evidence-proportional: it now requires independent server accept-length telemetry before the acceptance claim can be made, adds H43 prefill/TTFT profiling as a co-equal target, keeps EAGLE3 deferred on a measure-before-switching rationale rather than on the unproven mechanism, and retains the fresh cold bracket requirement.\n\nItem 1 is not closed. One remaining finding.\n\n---\n\n## 1. The new disarm artifact contradicts the ordering it is cited for, and the timer-safety window is still unproven (medium-high)\n\nTimestamps in the files:\n\n| Event | Source | Time (UTC) |\n|---|---|---|\n| CT14 restore marker | `restore-final-ct14.txt:13` (`completed_epoch=1785471853`) | 04:24:13 |\n| CT13 restore marker | `restore-final-ct13.txt:13` (`completed_epoch=1785471865`) | 04:24:25 |\n| Coordinator state → `DISARMED` | `coordinator/final-status-and-timers.txt:7-8` (`updated_epoch 1785471877.19516`) | **04:24:37** |\n| CT13 capture — **both timers armed** | `restore-final-ct13.txt:1,19-20` | **04:25:47** |\n| CT14 capture — **both timers armed** | `restore-final-ct14.txt:1,19-20` | **04:25:49** |\n| `TIMER_STATES` all inactive | `coordinator/final-status-and-timers.txt:10-16` | **no timestamp** |\n\nThe `restore-final-*` captures come **70 and 72 seconds after** the recorded disarm, not before it. So these three claims are inverted as written:\n\n- `timed/TIMED_NOTES.md:80-82` — \"as captured after disarm… The earlier `restore-final-ct13/14.txt` files were intentionally captured before disarm\"\n- `vault/H43-I3.md:1123-1124` — \"The earlier `restore-final-ct13/14.txt` captures intentionally precede disarm\"\n- `vault/Reflection-Ledger.md:742-743` — \"the final post-disarm artifact proves all timers inactive\"\n\nThe reconciling reading is that the coordinator state machine and the six systemd deadline timers are two different things — which is exactly what `vault/H43-I3.md:1003-1004` says (\"the timer and coordinator remain independent floors\"). Under that reading the timers were genuinely still armed at 04:25:47/49 and were disarmed later. But `coordinator/final-status-and-timers.txt` carries no `date` line for the `TIMER_STATES` query, unlike both `restore-final-*` files, so \"after disarm\" cannot be checked, and the notes describe a single disarm event that the two artifacts bracket — which the timestamps contradict either way.\n\nThe safety question from round one therefore remains open rather than answered. The last timestamped proof is that `h43-i3-phase-fp8-post.timer` → `h43-i3-deadline@phase-fp8-post.service` was armed at 04:25:49 to fire at **04:39:23**, roughly 13.5 minutes later, with the restored accepted E2M1 N2 service already running since 04:19:48. Nothing in the snapshot establishes whether that timer was disarmed before 04:39:23 or whether the deadline unit fired against the restored production service.\n\n**Minimal fix:**\n\n1. Prepend a `date` (and hostname) line to `timed/coordinator/final-status-and-timers.txt`, matching the `restore-final-*` convention, so the `TIMER_STATES` query has a capture time postdating 04:25:49. To close the safety question rather than just the ordering one, pair it with either a capture time before 04:39:23 or `systemctl status h43-i3-deadline@phase-fp8-post.service` showing the unit never activated.\n2. Reword `TIMED_NOTES.md:80-82`, `vault/H43-I3.md:1123-1125` and `vault/Reflection-Ledger.md:742-743` to name two distinct events instead of one: coordinator state-machine disarm at 04:24:37 (which *precedes* the `restore-final-*` captures) and systemd timer disarm at ⟨T⟩ (which follows them). Delete \"the restore-final captures precede disarm\".\n\n---\n\nTwo sub-medium items, noted only because they sit in the same edits:\n\n- `timed/TIMED_NOTES.md:31-32` still reads \"Three Claude Opus 5 review rounds… the final round returned `LGTM`\". The parallel sentence was deliberately removed from `vault/H43-I3.md:1095-1097` in this commit; one instance was missed, and it now reads as a claim about this review series, which has returned findings in both rounds.\n- `timed/TIMED_NOTES.md:83-85` says the restore contract pins \"each node's exact image ID, configured image, full container ID, and overlay digests\". The captures in `timed/restore/*` show only image ID, container ID, name and StartedAt — the configured image and overlay digests appear nowhere in the snapshot. The explanation for the differing rank-local image IDs is fine as an out-of-snapshot attestation, but it should be labeled as attested rather than shown, the way the memory figures are.","ttft_ms":6579,"ttft_stream_ms":5608,"time_to_request_ms":425,"type":"result","duration_ms":224974,"uuid":"a1df8c47-a458-41b4-a1cb-5d3bf18e4daa"}
+
+=== REVIEWER OUTPUT (clean text) ===
+Re-reviewed `19cb154` against its parent and the current files. Items 2–7, 9 and 10 are properly closed. I hand-verified the six new tests against the unchanged analyzer (all six reach their asserted verdicts, including a genuine tail-only case where p95 = 1.091667 passes and max = 1.166667 fails), confirmed the count is 13, re-derived the identity at `TIMED_NOTES.md:96-97` (`target_verify/acceptance × 512/511 ≡ tpot` exactly), and re-checked +32.30% (324.9177/245.5891 = 1.323014) and both counterfactual estimators (3.6953 ms/+2.93% mean-of-means, 3.6987 ms/+3.03% matched per-index). `analyze_h43_i3_endpoint.py` and `ENDPOINT_ANALYSIS.json` are unchanged, so the published numbers still stand. The revised next step is evidence-proportional: it now requires independent server accept-length telemetry before the acceptance claim can be made, adds H43 prefill/TTFT profiling as a co-equal target, keeps EAGLE3 deferred on a measure-before-switching rationale rather than on the unproven mechanism, and retains the fresh cold bracket requirement.
+
+Item 1 is not closed. One remaining finding.
+
+---
+
+## 1. The new disarm artifact contradicts the ordering it is cited for, and the timer-safety window is still unproven (medium-high)
+
+Timestamps in the files:
+
+| Event | Source | Time (UTC) |
+|---|---|---|
+| CT14 restore marker | `restore-final-ct14.txt:13` (`completed_epoch=1785471853`) | 04:24:13 |
+| CT13 restore marker | `restore-final-ct13.txt:13` (`completed_epoch=1785471865`) | 04:24:25 |
+| Coordinator state → `DISARMED` | `coordinator/final-status-and-timers.txt:7-8` (`updated_epoch 1785471877.19516`) | **04:24:37** |
+| CT13 capture — **both timers armed** | `restore-final-ct13.txt:1,19-20` | **04:25:47** |
+| CT14 capture — **both timers armed** | `restore-final-ct14.txt:1,19-20` | **04:25:49** |
+| `TIMER_STATES` all inactive | `coordinator/final-status-and-timers.txt:10-16` | **no timestamp** |
+
+The `restore-final-*` captures come **70 and 72 seconds after** the recorded disarm, not before it. So these three claims are inverted as written:
+
+- `timed/TIMED_NOTES.md:80-82` — "as captured after disarm… The earlier `restore-final-ct13/14.txt` files were intentionally captured before disarm"
+- `vault/H43-I3.md:1123-1124` — "The earlier `restore-final-ct13/14.txt` captures intentionally precede disarm"
+- `vault/Reflection-Ledger.md:742-743` — "the final post-disarm artifact proves all timers inactive"
+
+The reconciling reading is that the coordinator state machine and the six systemd deadline timers are two different things — which is exactly what `vault/H43-I3.md:1003-1004` says ("the timer and coordinator remain independent floors"). Under that reading the timers were genuinely still armed at 04:25:47/49 and were disarmed later. But `coordinator/final-status-and-timers.txt` carries no `date` line for the `TIMER_STATES` query, unlike both `restore-final-*` files, so "after disarm" cannot be checked, and the notes describe a single disarm event that the two artifacts bracket — which the timestamps contradict either way.
+
+The safety question from round one therefore remains open rather than answered. The last timestamped proof is that `h43-i3-phase-fp8-post.timer` → `h43-i3-deadline@phase-fp8-post.service` was armed at 04:25:49 to fire at **04:39:23**, roughly 13.5 minutes later, with the restored accepted E2M1 N2 service already running since 04:19:48. Nothing in the snapshot establishes whether that timer was disarmed before 04:39:23 or whether the deadline unit fired against the restored production service.
+
+**Minimal fix:**
+
+1. Prepend a `date` (and hostname) line to `timed/coordinator/final-status-and-timers.txt`, matching the `restore-final-*` convention, so the `TIMER_STATES` query has a capture time postdating 04:25:49. To close the safety question rather than just the ordering one, pair it with either a capture time before 04:39:23 or `systemctl status h43-i3-deadline@phase-fp8-post.service` showing the unit never activated.
+2. Reword `TIMED_NOTES.md:80-82`, `vault/H43-I3.md:1123-1125` and `vault/Reflection-Ledger.md:742-743` to name two distinct events instead of one: coordinator state-machine disarm at 04:24:37 (which *precedes* the `restore-final-*` captures) and systemd timer disarm at ⟨T⟩ (which follows them). Delete "the restore-final captures precede disarm".
+
+---
+
+Two sub-medium items, noted only because they sit in the same edits:
+
+- `timed/TIMED_NOTES.md:31-32` still reads "Three Claude Opus 5 review rounds… the final round returned `LGTM`". The parallel sentence was deliberately removed from `vault/H43-I3.md:1095-1097` in this commit; one instance was missed, and it now reads as a claim about this review series, which has returned findings in both rounds.
+- `timed/TIMED_NOTES.md:83-85` says the restore contract pins "each node's exact image ID, configured image, full container ID, and overlay digests". The captures in `timed/restore/*` show only image ID, container ID, name and StartedAt — the configured image and overlay digests appear nowhere in the snapshot. The explanation for the differing rank-local image IDs is fine as an out-of-snapshot attestation, but it should be labeled as attested rather than shown, the way the memory figures are.
+=== END ===

@@ -1,0 +1,20 @@
+Fri Jul 31 04:25:47 UTC 2026
+ACCEPTED_IDENTITY
+id=03b4ce2c1c9c9d02486331feecef2cdaaf99a80a3110d99cfb14d09aa6efa976 name=/tq-native-p28-e2m1-dflash-layers-0e68a197-r0 running=true oom=false started=2026-07-31T04:19:48.926275465Z image=sha256:cc6fa1f338da513f9da20ee9310ba8dafbc964e2d9a6b7d528bdef9500c1920c
+HEALTH
+200
+GPU
+0, P0, 1965 MHz, 4000 MHz, 0
+1, P0, 1965 MHz, 4000 MHz, 0
+2, P0, 1965 MHz, 4000 MHz, 0
+3, P0, 1965 MHz, 4000 MHz, 0
+XID_SXID
+MARKER
+completed_epoch=1785471865
+accepted_id=03b4ce2c1c9c9d02486331feecef2cdaaf99a80a3110d99cfb14d09aa6efa976
+accepted_image=sha256:cc6fa1f338da513f9da20ee9310ba8dafbc964e2d9a6b7d528bdef9500c1920c
+accepted_started_at=2026-07-31T04:19:48.926275465Z
+outcome=PASS
+TIMERS
+Fri 2026-07-31 04:39:23 UTC 13min left     n/a                         n/a          h43-i3-phase-fp8-post.timer    h43-i3-deadline@phase-fp8-post.service
+Fri 2026-07-31 06:27:51 UTC 2h 2min left   n/a                         n/a          h43-i3-endpoint-absolute.timer h43-i3-deadline@endpoint-absolute.service
