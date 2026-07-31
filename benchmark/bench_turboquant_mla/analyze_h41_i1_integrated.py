@@ -136,6 +136,23 @@ def balanced_process_delta(pairs: list[dict[str, Any]]) -> tuple[float, dict[str
     )
 
 
+def process_environment_reasons(value: dict[str, Any]) -> list[str]:
+    """Return analyzer-equivalent process telemetry failures before selection."""
+
+    reasons: list[str] = []
+    try:
+        validate_gpu_covariates(value)
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        reasons.append(f"process GPU covariates fail analyzer validation: {exc}")
+    try:
+        balanced_process_delta(value["pairs"])
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        reasons.append(
+            f"process retained-pair balance fails analyzer validation: {exc}"
+        )
+    return reasons
+
+
 def load_sequence(root: Path, context: int, sequence: int) -> dict[str, Any]:
     path = root / f"context{context}" / f"seq{sequence:02d}" / "result.json"
     value = json.loads(path.read_text())
