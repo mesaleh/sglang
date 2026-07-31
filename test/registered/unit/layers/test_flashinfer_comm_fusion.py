@@ -322,7 +322,7 @@ class TestFlashInferCommFusion(unittest.TestCase):
             patch.object(fusion, "get_attn_tp_group", return_value=coordinator),
             patch.object(fusion, "get_tp_group", return_value=coordinator),
             patch.object(
-                fusion, "get_global_server_args", return_value=types.SimpleNamespace()
+                fusion, "get_server_args", return_value=types.SimpleNamespace()
             ),
             patch.object(fusion, "_get_workspace_manager", return_value=manager),
             patch.object(
