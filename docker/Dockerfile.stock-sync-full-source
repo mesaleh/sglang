@@ -1,0 +1,129 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BASE_IMAGE=lmsysorg/sglang:v0.5.16-cu129-runtime@sha256:f9a7b74fb843cb2089320fa7f09b6bc7892e3ce5da3b284134c466ed8d897a93
+FROM ${BASE_IMAGE}
+
+ARG BASE_IMAGE
+ARG SGLANG_BUILD_COMMIT
+ARG SGLANG_IMAGE_TAG
+ARG FLASHINFER_BUILD_COMMIT
+ARG TOKENSPEED_MLA_BUILD_COMMIT
+ARG SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_ARCHES=ON
+ARG SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_NVFP4=ON
+ARG SGL_KERNEL_ENABLE_FA3=OFF
+ARG SGL_KERNEL_ENABLE_SM100A=ON
+ARG LOCAL_SGL_KERNEL_BUILD_PARALLEL_LEVEL=8
+ARG LOCAL_SGL_KERNEL_COMPILE_THREADS=8
+
+ENV PATH="/root/.cargo/bin:${PATH}" \
+    SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG} \
+    FLASHINFER_BUILD_COMMIT=${FLASHINFER_BUILD_COMMIT} \
+    TOKENSPEED_MLA_BUILD_COMMIT=${TOKENSPEED_MLA_BUILD_COMMIT} \
+    SGLANG_LOCAL_SGL_KERNEL=1
+
+COPY . /opt/omniva-src/sglang
+COPY --from=flashinfer_src . /opt/omniva-src/flashinfer
+COPY --from=tokenspeed_repo_src . /opt/omniva-src/tokenspeed
+
+RUN test -n "${SGLANG_BUILD_COMMIT}" \
+    && test "${SGLANG_BUILD_COMMIT}" != "unknown" \
+    && test -n "${FLASHINFER_BUILD_COMMIT}" \
+    && test "${FLASHINFER_BUILD_COMMIT}" != "unknown" \
+    && test -n "${TOKENSPEED_MLA_BUILD_COMMIT}" \
+    && test "${TOKENSPEED_MLA_BUILD_COMMIT}" != "unknown" \
+    && test -f /opt/omniva-src/flashinfer/3rdparty/cutlass/include/cutlass/arch/barrier.h \
+    && test -d /opt/omniva-src/flashinfer/3rdparty/spdlog/include/spdlog \
+    && test -f /opt/omniva-src/tokenspeed/tokenspeed-mla/pyproject.toml
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install --upgrade \
+        "setuptools>=80,<82" "setuptools-rust>=1.10" "setuptools-scm>=8" \
+        wheel cmake ninja \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf \
+        https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
+    && rustc --version \
+    && cargo --version \
+    && rm -rf /tmp/sgl-kernel-wheels \
+    && mkdir -p /tmp/sgl-kernel-wheels \
+    && cd /opt/omniva-src/sglang/sgl-kernel \
+    && CMAKE_BUILD_PARALLEL_LEVEL="${LOCAL_SGL_KERNEL_BUILD_PARALLEL_LEVEL}" \
+       python3 -m pip wheel \
+        --config-settings=cmake.define.SGL_KERNEL_COMPILE_THREADS="${LOCAL_SGL_KERNEL_COMPILE_THREADS}" \
+        --config-settings=cmake.define.SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_ARCHES="${SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_ARCHES}" \
+        --config-settings=cmake.define.SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_NVFP4="${SGL_KERNEL_ENABLE_CUDA_12_8_PLUS_NVFP4}" \
+        --config-settings=cmake.define.SGL_KERNEL_ENABLE_FA3="${SGL_KERNEL_ENABLE_FA3}" \
+        --config-settings=cmake.define.SGL_KERNEL_ENABLE_SM100A="${SGL_KERNEL_ENABLE_SM100A}" \
+        --no-build-isolation --no-deps -w /tmp/sgl-kernel-wheels . \
+    && python3 -m pip install --force-reinstall --no-deps \
+        /tmp/sgl-kernel-wheels/sglang_kernel-*.whl \
+    && mkdir -p /opt/omniva-wheels \
+    && cp /tmp/sgl-kernel-wheels/sglang_kernel-*.whl /opt/omniva-wheels/
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip uninstall -y flashinfer-python flashinfer-jit-cache tokenspeed-mla sglang \
+    && python3 -m pip install --no-build-isolation --no-deps \
+        -e /opt/omniva-src/flashinfer \
+    && python3 -m pip install --no-build-isolation --no-deps \
+        -e /opt/omniva-src/tokenspeed/tokenspeed-mla \
+    && SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SGLANG="0.5.16+omniva.${SGLANG_BUILD_COMMIT}" \
+       python3 -m pip install --no-build-isolation --no-deps \
+        -e /opt/omniva-src/sglang/python \
+    && rm -rf /sgl-workspace/sglang \
+    && ln -s /opt/omniva-src/sglang /sgl-workspace/sglang
+
+RUN python3 -m compileall -q \
+        /opt/omniva-src/sglang/python/sglang \
+        /opt/omniva-src/flashinfer/flashinfer \
+        /opt/omniva-src/tokenspeed/tokenspeed-mla/python/tokenspeed_mla \
+    && python3 - <<'PY'
+import inspect
+from pathlib import Path
+
+import flashinfer
+import flashinfer.comm as comm
+import sglang
+import tokenspeed_mla
+
+expected_roots = {
+    "sglang": Path("/opt/omniva-src/sglang"),
+    "flashinfer": Path("/opt/omniva-src/flashinfer"),
+    "tokenspeed_mla": Path("/opt/omniva-src/tokenspeed"),
+}
+modules = {
+    "sglang": sglang,
+    "flashinfer": flashinfer,
+    "tokenspeed_mla": tokenspeed_mla,
+}
+for name, module in modules.items():
+    module_path = Path(module.__file__).resolve()
+    assert module_path.is_relative_to(expected_roots[name]), (name, module_path)
+
+ts_params = inspect.signature(tokenspeed_mla.tokenspeed_mla_decode).parameters
+fi_params = inspect.signature(comm.allreduce_fusion).parameters
+pattern = comm.AllReduceFusionPattern.kARResidualRMSNorm
+assert {"custom_mask", "cmask_off"} <= ts_params.keys()
+assert "pre_allreduce_add" in fi_params
+assert comm.supports_pre_allreduce_add("trtllm", pattern)
+assert comm.supports_pre_allreduce_add("mnnvl", pattern)
+assert next(Path("/opt/omniva-wheels").glob("sglang_kernel-*.whl"), None) is not None
+from sglang.srt.grpc import _core as grpc_core
+from sglang.srt.multimodal import _core as multimodal_core
+from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration
+PY
+
+LABEL org.opencontainers.image.source="git@gitlab.aws.omniva.com:acls/security-analytics/sglang.git" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      omniva.base.image="${BASE_IMAGE}" \
+      omniva.sglang.revision="${SGLANG_BUILD_COMMIT}" \
+      omniva.sglang.local_sgl_kernel="true" \
+      omniva.sgl_kernel.revision="${SGLANG_BUILD_COMMIT}" \
+      omniva.flashinfer.revision="${FLASHINFER_BUILD_COMMIT}" \
+      omniva.tokenspeed_mla.revision="${TOKENSPEED_MLA_BUILD_COMMIT}"
+
+WORKDIR /sgl-workspace/sglang
