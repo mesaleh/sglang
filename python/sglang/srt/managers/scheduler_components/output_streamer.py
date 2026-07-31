@@ -45,6 +45,7 @@ class SchedulerOutputStreamer:
     spec_algorithm: SpeculativeAlgorithm
     disaggregation_mode: DisaggregationMode
     enable_hicache_storage: Callable[[], bool]
+    record_completed_spec_request_metrics: Optional[Callable[[int, int], None]] = None
     _test_stream_output_count: int = 0
 
     def _get_storage_backend_type(self) -> str:
@@ -143,6 +144,9 @@ class SchedulerOutputStreamer:
             default_stream_interval=self.server_args.stream_interval,
             default_force_stream_interval=DEFAULT_FORCE_STREAM_INTERVAL,
             get_cached_tokens_details=self.get_cached_tokens_details,
+            record_completed_spec_request_metrics=(
+                self.record_completed_spec_request_metrics
+            ),
         )
         for req in reqs:
             if req is skip_req:
@@ -285,6 +289,7 @@ class _GenerationStreamAccumulator:
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
+    record_completed_spec_request_metrics: Optional[Callable[[int, int], None]] = None
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -323,6 +328,13 @@ class _GenerationStreamAccumulator:
     def accept(self, *, req: Req) -> None:
         if req.finished():
             assert not req.finished_output
+            if (
+                not self.spec_algorithm.is_none()
+                and self.record_completed_spec_request_metrics is not None
+            ):
+                self.record_completed_spec_request_metrics(
+                    req.spec_verify_ct, req.spec_num_correct_drafts
+                )
             req.finished_output = True
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)

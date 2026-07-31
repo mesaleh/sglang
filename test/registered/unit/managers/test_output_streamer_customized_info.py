@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.managers.scheduler_components.output_streamer import (
+    SchedulerOutputStreamer,
     _GenerationStreamAccumulator,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -12,11 +13,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
+class _FakeFinishReason:
+    def to_json(self):
+        return {"type": "length"}
+
+
 class _FakeReq:
-    def __init__(self, rid, output_ids, customized_info=None):
+    def __init__(self, rid, output_ids, customized_info=None, *, finished=False):
         self.rid = rid
         self.http_worker_ipc = None
-        self.finished_reason = None
+        self.finished_reason = _FakeFinishReason() if finished else None
         self.finished_output = False
         self.finished_len = None
         self.stream = False
@@ -35,6 +41,9 @@ class _FakeReq:
         self.origin_input_ids = []
         self.reasoning_tokens = 0
         self.cached_tokens = 0
+        self.cached_tokens_device = 0
+        self.cached_tokens_host = 0
+        self.cached_tokens_storage = 0
         self.retraction_count = 0
         self.time_stats = None
         self.mm_image_tokens = 0
@@ -42,9 +51,16 @@ class _FakeReq:
         self.mm_video_tokens = 0
         self.multimodal_inputs = None
         self.customized_info = customized_info
+        self.return_hidden_states = False
+        self.return_routed_experts = False
+        self.return_indexer_topk = False
+        self.return_logprob = False
+        self.spec_verify_ct = 0
+        self.spec_num_correct_drafts = 0
+        self.spec_correct_drafts_histogram = []
 
     def finished(self):
-        return False
+        return self.finished_reason is not None
 
     def init_incremental_detokenize(self):
         return self.output_ids_through_stop, 0
@@ -89,6 +105,62 @@ class TestOutputStreamerCustomizedInfo(unittest.TestCase):
             customized_info["other"],
             [[None, None], [None, None, None], [300]],
         )
+
+    def test_completed_spec_request_records_only_request_owned_counts(self):
+        recorded = []
+        accumulator = _GenerationStreamAccumulator(
+            return_logprob=False,
+            return_hidden_states=False,
+            return_routed_experts=False,
+            return_indexer_topk=False,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            disaggregation_mode=DisaggregationMode.NULL,
+            default_stream_interval=1,
+            default_force_stream_interval=1,
+            get_cached_tokens_details=lambda req: None,
+            record_completed_spec_request_metrics=lambda verify, correct: recorded.append(
+                (verify, correct)
+            ),
+        )
+        req = _FakeReq("finished", [10, 11], finished=True)
+        req.spec_verify_ct = 7
+        req.spec_num_correct_drafts = 9
+
+        accumulator.accept(req=req)
+
+        self.assertEqual(recorded, [(7, 9)])
+        self.assertTrue(req.finished_output)
+
+    def test_overlap_duplicate_output_does_not_record_twice(self):
+        recorded = []
+        sent = []
+        streamer = SchedulerOutputStreamer(
+            send_to_detokenizer=SimpleNamespace(
+                send_output=lambda payload: sent.append(payload)
+            ),
+            tree_cache=SimpleNamespace(cache_controller=None),
+            ps=SimpleNamespace(dp_rank=0, attn_tp_rank=0),
+            server_args=SimpleNamespace(
+                stream_interval=1,
+                enable_request_time_stats_logging=False,
+            ),
+            is_generation=True,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            disaggregation_mode=DisaggregationMode.NULL,
+            enable_hicache_storage=lambda: False,
+            record_completed_spec_request_metrics=lambda verify, correct: recorded.append(
+                (verify, correct)
+            ),
+        )
+        req = _FakeReq("finished", [10, 11], finished=True)
+        req.spec_verify_ct = 7
+        req.spec_num_correct_drafts = 9
+
+        streamer.stream_output([req], return_logprob=False)
+        streamer.stream_output([req], return_logprob=False)
+
+        self.assertEqual(recorded, [(7, 9)])
+        self.assertEqual(len(sent), 1)
 
 
 if __name__ == "__main__":

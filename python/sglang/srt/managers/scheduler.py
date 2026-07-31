@@ -1868,6 +1868,9 @@ class Scheduler(
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
+            record_completed_spec_request_metrics=(
+                self.metrics_reporter.update_completed_spec_request_metrics
+            ),
         )
 
     def init_batch_result_processor(self) -> None:
@@ -3803,14 +3806,21 @@ class Scheduler(
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
 
-        if (
-            not self.spec_algorithm.is_none()
-            and self.metrics_reporter.spec_total_num_forward_ct > 0
-        ):
-            ret["avg_spec_accept_length"] = (
-                self.metrics_reporter.spec_total_num_accept_tokens
-                / self.metrics_reporter.spec_total_num_forward_ct
+        if not self.spec_algorithm.is_none():
+            ret["spec_counter_dp_rank"] = (
+                self.ps.dp_rank if self.ps.dp_rank is not None else 0
             )
+            ret["spec_cumulative_num_accept_tokens"] = (
+                self.metrics_reporter.spec_cumulative_num_accept_tokens
+            )
+            ret["spec_cumulative_num_forward_ct"] = (
+                self.metrics_reporter.spec_cumulative_num_forward_ct
+            )
+            if self.metrics_reporter.spec_total_num_forward_ct > 0:
+                ret["avg_spec_accept_length"] = (
+                    self.metrics_reporter.spec_total_num_accept_tokens
+                    / self.metrics_reporter.spec_total_num_forward_ct
+                )
 
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict

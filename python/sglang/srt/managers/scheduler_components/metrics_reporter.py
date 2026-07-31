@@ -132,13 +132,22 @@ class SchedulerMetricsReporter:
             "musa": "musa graph",
         }.get(getattr(self.scheduler, "device", ""), "cuda graph")
 
-        # Cumulative spec-decoding counters (reset every decode_log_interval).
+        # Legacy spec-decoding counters. The interval counters are rolled into
+        # the totals every decode_log_interval; reset_metrics() clears both.
         # Each update adds (num_correct_drafts + bs, bs).
         # `*_accept_tokens` = drafts + bonus; `*_correct_drafts` = drafts-only.
         self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
-        self.spec_total_num_accept_tokens = 0  # lifetime
+        self.spec_total_num_accept_tokens = 0  # since last reset
         self.spec_total_num_forward_ct = 0
+
+        # Completed-request process-lifetime counters for exact attribution.
+        # Unlike the batch-level legacy totals above, these are updated once
+        # when a request emits its final scheduler output. They therefore omit
+        # overlap scheduling's trailing work for an already-finished request.
+        # They are never rolled or reset while the scheduler process is alive.
+        self.spec_cumulative_num_accept_tokens = 0
+        self.spec_cumulative_num_forward_ct = 0
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -345,11 +354,23 @@ class SchedulerMetricsReporter:
         }
 
     def update_spec_metrics(self, bs: int, num_correct_drafts: int):
-        self.spec_num_accept_tokens += num_correct_drafts + bs
+        num_accept_tokens = num_correct_drafts + bs
+        self.spec_num_accept_tokens += num_accept_tokens
         self.spec_num_forward_ct += bs
 
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_correct_drafts
+
+    def update_completed_spec_request_metrics(
+        self, num_verify_ct: int, num_correct_drafts: int
+    ):
+        self.spec_cumulative_num_accept_tokens += num_correct_drafts + num_verify_ct
+        self.spec_cumulative_num_forward_ct += num_verify_ct
+
+    def _roll_spec_interval_metrics(self):
+        self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
+        self.spec_total_num_forward_ct += self.spec_num_forward_ct
+        self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -742,9 +763,7 @@ class SchedulerMetricsReporter:
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
-            self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
-            self.spec_total_num_forward_ct += self.spec_num_forward_ct
-            self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
+            self._roll_spec_interval_metrics()
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
 
             if self.current_scheduler_metrics_enabled:

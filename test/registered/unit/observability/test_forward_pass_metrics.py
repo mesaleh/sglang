@@ -324,5 +324,56 @@ class TestForwardPassMetrics(unittest.TestCase):
         self.assertFalse(scheduler.enable_fpm)
 
 
+class TestSpecCumulativeMetrics(unittest.TestCase):
+    def setUp(self):
+        self.reporter = _make_reporter(types.SimpleNamespace())
+
+    def test_completed_requests_track_exact_accept_tokens_and_forward_count(self):
+        self.assertEqual(self.reporter.spec_cumulative_num_accept_tokens, 0)
+        self.assertEqual(self.reporter.spec_cumulative_num_forward_ct, 0)
+
+        self.reporter.update_spec_metrics(bs=2, num_correct_drafts=3)
+        self.assertEqual(self.reporter.spec_cumulative_num_accept_tokens, 0)
+        self.assertEqual(self.reporter.spec_cumulative_num_forward_ct, 0)
+
+        self.reporter.update_completed_spec_request_metrics(
+            num_verify_ct=2, num_correct_drafts=3
+        )
+        self.reporter.update_completed_spec_request_metrics(
+            num_verify_ct=1, num_correct_drafts=4
+        )
+
+        self.assertEqual(self.reporter.spec_cumulative_num_accept_tokens, 10)
+        self.assertEqual(self.reporter.spec_cumulative_num_forward_ct, 3)
+
+    def test_interval_rollover_does_not_change_cumulative_counters(self):
+        self.reporter.update_spec_metrics(bs=2, num_correct_drafts=3)
+        self.reporter.update_completed_spec_request_metrics(
+            num_verify_ct=2, num_correct_drafts=3
+        )
+        self.reporter._roll_spec_interval_metrics()
+
+        self.assertEqual(self.reporter.spec_num_accept_tokens, 0)
+        self.assertEqual(self.reporter.spec_num_forward_ct, 0)
+        self.assertEqual(self.reporter.spec_total_num_accept_tokens, 5)
+        self.assertEqual(self.reporter.spec_total_num_forward_ct, 2)
+        self.assertEqual(self.reporter.spec_cumulative_num_accept_tokens, 5)
+        self.assertEqual(self.reporter.spec_cumulative_num_forward_ct, 2)
+
+    def test_cache_metric_reset_does_not_change_cumulative_counters(self):
+        self.reporter.update_spec_metrics(bs=2, num_correct_drafts=3)
+        self.reporter.update_completed_spec_request_metrics(
+            num_verify_ct=2, num_correct_drafts=3
+        )
+        self.reporter.reset_metrics()
+
+        self.assertEqual(self.reporter.spec_num_accept_tokens, 0)
+        self.assertEqual(self.reporter.spec_num_forward_ct, 0)
+        self.assertEqual(self.reporter.spec_total_num_accept_tokens, 0)
+        self.assertEqual(self.reporter.spec_total_num_forward_ct, 0)
+        self.assertEqual(self.reporter.spec_cumulative_num_accept_tokens, 5)
+        self.assertEqual(self.reporter.spec_cumulative_num_forward_ct, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
