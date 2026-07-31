@@ -7,12 +7,12 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import stat
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 _prior_dont_write_bytecode = sys.dont_write_bytecode
@@ -182,7 +182,7 @@ def seal(args: argparse.Namespace) -> dict[str, Any]:
         raise SealError("complete-I1 staging root is not bound to its phase")
     if root.is_symlink():
         raise SealError("complete-I1 staging root is symlinked")
-    final_root = gate_root / args.phase
+    final_root = gate_root / f"{args.phase}-{args.source_commit}"
     if final_root.exists() or final_root.is_symlink():
         raise SealError("complete-I1 final input root already exists")
     manifest_path = root / "input-manifest.json"

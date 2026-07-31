@@ -6,12 +6,12 @@ import argparse
 import importlib.util
 import json
 import os
-from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("seal_h44_complete_i1_inputs.py")
@@ -83,6 +83,10 @@ class SealCompleteI1InputsTests(unittest.TestCase):
         commit_payload = f"tree {source_tree}\n\nH44 test commit\n".encode()
         source_commit = sealer.runner._git_object_oid("commit", commit_payload).hex()
         (self.root / "provenance" / "source-commit-object").write_bytes(commit_payload)
+        legacy_root = self.gate_root / "phase0_complete_i1"
+        legacy_root.mkdir()
+        legacy_marker = legacy_root / "accepted-h44-marker"
+        legacy_marker.write_text("unchanged\n", encoding="utf-8")
         image_id = "sha256:" + "c" * 64
         native_sha256 = "d" * 64
         image_ref = "registry/image@sha256:" + "f" * 64
@@ -132,7 +136,7 @@ class SealCompleteI1InputsTests(unittest.TestCase):
         self.assertEqual(manifest["image_id"], image_id)
         self.assertEqual(manifest["image_runtime_sha256"], image_runtime_sha256)
         self.assertEqual(result["status"], "PASS")
-        final_root = self.gate_root.resolve() / "phase0_complete_i1"
+        final_root = self.gate_root.resolve() / f"phase0_complete_i1-{source_commit}"
         self.assertEqual(
             result["input_manifest_path"], str(final_root / "input-manifest.json")
         )
@@ -143,6 +147,25 @@ class SealCompleteI1InputsTests(unittest.TestCase):
         executable = self.root / "executable" / "run_h44_complete_i1.py"
         self.assertTrue(stat.S_IMODE(executable.stat().st_mode) & 0o111)
         self.assertFalse(stat.S_IMODE(manifest_path.stat().st_mode) & 0o222)
+        self.assertEqual(legacy_marker.read_text(encoding="utf-8"), "unchanged\n")
+
+    def test_seal_refuses_an_existing_same_phase_source_destination(self) -> None:
+        source_commit = "e" * 40
+        final_root = self.gate_root / f"phase0_complete_i1-{source_commit}"
+        final_root.mkdir()
+        args = argparse.Namespace(
+            phase="phase0_complete_i1",
+            source_commit=source_commit,
+            source_tree="f" * 40,
+            image_ref="registry/image@sha256:" + "a" * 64,
+            root=self.root,
+        )
+        with (
+            mock.patch.object(sealer.os, "geteuid", return_value=0),
+            mock.patch.object(sealer.runner, "SEALED_GATE_ROOT", self.gate_root),
+            self.assertRaisesRegex(sealer.SealError, "already exists"),
+        ):
+            sealer.seal(args)
 
     def test_seal_refuses_a_root_not_bound_to_phase(self) -> None:
         args = argparse.Namespace(
