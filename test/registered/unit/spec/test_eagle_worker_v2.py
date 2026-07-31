@@ -1,12 +1,11 @@
 import unittest
-from types import SimpleNamespace
 
 import torch
 
 from sglang.srt.layers.attention.tokenspeed_workspace import (
     tokenspeed_workspace_bytes,
 )
-from sglang.srt.speculative.eagle_worker_v2 import EAGLEWorkerV2
+from sglang.srt.speculative.eagle_worker_common import _compact_accept_to_front
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
@@ -26,12 +25,11 @@ class TestCompactTreeAcceptOutputs(unittest.TestCase):
         )
         accept_lens = torch.tensor([3, 3], dtype=torch.int32)
 
-        worker = SimpleNamespace(speculative_num_draft_tokens=draft_token_num)
-        compact_predict = EAGLEWorkerV2._compact_accept_to_front(
-            worker, predict, accept_index, bs=2
+        compact_predict = _compact_accept_to_front(
+            predict, accept_index, bs=2, num_draft_tokens=draft_token_num
         )
-        compact_hidden = EAGLEWorkerV2._compact_accept_to_front(
-            worker, hidden_states, accept_index, bs=2
+        compact_hidden = _compact_accept_to_front(
+            hidden_states, accept_index, bs=2, num_draft_tokens=draft_token_num
         )
         compact_predict_2d = compact_predict.reshape(2, draft_token_num)
         bonus_tokens = compact_predict_2d[

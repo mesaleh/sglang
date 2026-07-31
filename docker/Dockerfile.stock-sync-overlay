@@ -5,10 +5,12 @@ FROM ${BASE_IMAGE}
 
 ARG SGLANG_BUILD_COMMIT
 ARG SGLANG_IMAGE_TAG
+ARG FLASHINFER_BUILD_COMMIT
 ARG TOKENSPEED_MLA_BUILD_COMMIT
 
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG} \
+    FLASHINFER_BUILD_COMMIT=${FLASHINFER_BUILD_COMMIT} \
     TOKENSPEED_MLA_BUILD_COMMIT=${TOKENSPEED_MLA_BUILD_COMMIT}
 
 WORKDIR /sgl-workspace/sglang
@@ -18,4 +20,6 @@ COPY --from=tokenspeed_mla_src . /usr/local/lib/python3.12/dist-packages/tokensp
 
 RUN python3 -m py_compile \
         python/sglang/srt/layers/attention/tokenspeed_mla_backend.py \
-    && python3 -c "import inspect; import tokenspeed_mla; from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration; params = inspect.signature(tokenspeed_mla.tokenspeed_mla_decode).parameters; assert {'custom_mask', 'cmask_off'} <= params.keys()"
+    && test -n "${FLASHINFER_BUILD_COMMIT}" \
+    && test "${FLASHINFER_BUILD_COMMIT}" != "unknown" \
+    && python3 -c "import inspect; import flashinfer.comm as comm; import tokenspeed_mla; from sglang.srt.models.kimi_k25 import KimiK25ForConditionalGeneration; ts_params = inspect.signature(tokenspeed_mla.tokenspeed_mla_decode).parameters; fi_params = inspect.signature(comm.allreduce_fusion).parameters; pattern = comm.AllReduceFusionPattern.kARResidualRMSNorm; assert {'custom_mask', 'cmask_off'} <= ts_params.keys(); assert 'pre_allreduce_add' in fi_params; assert comm.supports_pre_allreduce_add('trtllm', pattern); assert comm.supports_pre_allreduce_add('mnnvl', pattern)"

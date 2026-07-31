@@ -1,9 +1,13 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+    _bind_eagle_tree_mask_buffer,
+    _refresh_eagle_tree_mask,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -21,6 +25,55 @@ class _RecordingBackend:
 
 
 class TestDecodeCudaGraphRunner(unittest.TestCase):
+    def test_eagle_tree_mask_binds_backend_owned_storage(self):
+        original = torch.ones(4, dtype=torch.bool)
+        backend_mask = torch.zeros(16, dtype=torch.bool)
+        buffers = SimpleNamespace(custom_mask=original)
+        backend = SimpleNamespace(
+            get_verify_buffers_to_fill_after_draft=lambda: [backend_mask, None]
+        )
+
+        _bind_eagle_tree_mask_buffer(
+            buffers,
+            backend,
+            max_total_num_tokens=64,
+            max_num_token=8,
+            captured_req_width=4,
+            device=torch.device("cpu"),
+        )
+
+        self.assertIs(buffers.custom_mask, backend_mask)
+        self.assertIs(
+            _refresh_eagle_tree_mask(buffers.custom_mask, backend_mask), backend_mask
+        )
+
+    def test_eagle_tree_mask_fallback_uses_capture_width(self):
+        buffers = SimpleNamespace(custom_mask=torch.ones(4, dtype=torch.bool))
+        backend = SimpleNamespace(
+            get_verify_buffers_to_fill_after_draft=lambda: [None, None]
+        )
+
+        _bind_eagle_tree_mask_buffer(
+            buffers,
+            backend,
+            max_total_num_tokens=10,
+            max_num_token=6,
+            captured_req_width=3,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(buffers.custom_mask.numel(), 48)
+        replay_mask = torch.tensor([False, True, False], dtype=torch.bool)
+        refreshed = _refresh_eagle_tree_mask(buffers.custom_mask, replay_mask)
+        self.assertEqual(refreshed[:3].tolist(), replay_mask.tolist())
+
+    def test_eagle_tree_mask_rejects_oversized_replay(self):
+        with self.assertRaisesRegex(RuntimeError, "exceeds"):
+            _refresh_eagle_tree_mask(
+                torch.ones(2, dtype=torch.bool),
+                torch.zeros(3, dtype=torch.bool),
+            )
+
     def test_disable_padding_uses_typed_capture_key(self):
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         runner.require_mlp_tp_gather = False
@@ -32,6 +85,8 @@ class TestDecodeCudaGraphRunner(unittest.TestCase):
         runner.capture_hidden_mode = CaptureHiddenMode.FULL
         runner.enable_two_batch_overlap = False
         runner.record_nolora_graph = False
+        runner.ragged_verify_mode = False
+        runner.captured_req_width = 1
         runner.backend = _RecordingBackend()
         runner.model_runner = SimpleNamespace(
             spec_algorithm=SimpleNamespace(is_ngram=lambda: False)
@@ -41,7 +96,10 @@ class TestDecodeCudaGraphRunner(unittest.TestCase):
             replace_embeds=None,
             batch_size=3,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            spec_info=SimpleNamespace(capture_hidden_mode=CaptureHiddenMode.FULL),
+            spec_info=SimpleNamespace(
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                num_tokens_per_req=0,
+            ),
         )
 
         self.assertTrue(runner.can_run_graph(forward_batch))
