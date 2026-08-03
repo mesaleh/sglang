@@ -222,6 +222,7 @@ def build_draft_frontier_page_table_kernel(
     topk: tl.constexpr,
     speculative_num_steps: tl.constexpr,
     page_table_width: tl.constexpr,
+    padding_page_id: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
     cand_id = tl.program_id(0)
@@ -250,7 +251,7 @@ def build_draft_frontier_page_table_kernel(
     in_width = slots < page_table_width
     table_ptr = block_tables_ptr + cand_id * block_table_stride + slots
 
-    page_ids = tl.full((BLOCK_PAGES,), -1, tl.int32)
+    page_ids = tl.full((BLOCK_PAGES,), padding_page_id, tl.int32)
     prefix_mask = slots < full_prefix_pages
     branch_slot = slots - full_prefix_pages
     branch_mask = (branch_slot >= 0) & (branch_slot < branch_pages)
@@ -427,6 +428,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # CUDA graph state
         self.decode_cuda_graph_metadata = {}
         self.decode_cuda_graph_kv_indices = None
+        self.decode_cuda_graph_frontier_kv_indices = None
         self.padded_q_buffer = None
         self.unpad_output_buffer = None
         self.forward_prefill_metadata: Optional[TRTLLMMLAPrefillMetadata] = None
@@ -466,6 +468,9 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             blocks = triton.cdiv(blocks, constraint_lcm) * constraint_lcm
         return blocks
 
+    def _page_table_padding_value(self) -> int:
+        return -1
+
     def _create_block_kv_indices(
         self,
         batch_size: int,
@@ -488,7 +493,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             Block KV indices tensor
         """
         block_kv_indices = torch.full(
-            (batch_size, max_blocks), -1, dtype=torch.int32, device=device
+            (batch_size, max_blocks),
+            self._page_table_padding_value(),
+            dtype=torch.int32,
+            device=device,
         )
 
         create_flashmla_kv_indices_triton[
@@ -517,7 +525,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Initialize CUDA graph state for TRTLLM MLA."""
 
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        max_blocks_per_seq = self._calc_padded_blocks(
+            self.get_cuda_graph_max_seq_len()
+        )
+        frontier_max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
 
         # Draft tree frontiers flatten to bs*topk query rows. Allocate enough rows
         # for either regular decode/verify (max_bs) or draft frontier decode
@@ -525,16 +536,35 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         max_decode_rows = max(max_bs, max_num_tokens)
         self.decode_cuda_graph_kv_indices = torch.full(
             (max_decode_rows, max_blocks_per_seq),
-            -1,
+            self._page_table_padding_value(),
             dtype=torch.int32,
             device=self.device,
         )
+        if frontier_max_blocks_per_seq == max_blocks_per_seq:
+            self.decode_cuda_graph_frontier_kv_indices = (
+                self.decode_cuda_graph_kv_indices
+            )
+        else:
+            # Draft-frontier graphs retain the full-context page table while
+            # regular decode/verify uses a contiguous bounded table. A column
+            # slice of the full table is not contiguous for bs>1 and cannot be
+            # passed to either the page-table writer or TokenSpeed's ABI.
+            self.decode_cuda_graph_frontier_kv_indices = torch.full(
+                (max_decode_rows, frontier_max_blocks_per_seq),
+                self._page_table_padding_value(),
+                dtype=torch.int32,
+                device=self.device,
+            )
         self.decode_cuda_graph_seq_lens_k = torch.zeros(
             (max_decode_rows,), dtype=torch.int32, device=self.device
         )
         if self.supports_custom_decode_mask:
             self.decode_cuda_graph_custom_mask = torch.zeros(
-                (max_decode_rows * max_blocks_per_seq * self.page_size,),
+                (
+                    max_decode_rows
+                    * frontier_max_blocks_per_seq
+                    * self.page_size,
+                ),
                 dtype=torch.bool,
                 device=self.device,
             )
@@ -697,6 +727,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             topk,
             int(self.speculative_num_steps),
             page_table_width,
+            self._page_table_padding_value(),
             BLOCK_PAGES=block_pages,
         )
 
@@ -762,7 +793,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 getattr(spec_info, "positions", None),
                 req_pool_indices,
                 device,
-                block_kv_indices_buf=self.decode_cuda_graph_kv_indices,
+                block_kv_indices_buf=self.decode_cuda_graph_frontier_kv_indices,
                 seq_lens_k_buf=self.decode_cuda_graph_seq_lens_k,
                 custom_mask_buf=self.decode_cuda_graph_custom_mask,
                 custom_mask_offsets_buf=self.decode_cuda_graph_custom_mask_offsets,
@@ -780,11 +811,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self.forward_decode_metadata = metadata
             return
 
-        # Capture with full width so future longer sequences are safe during replay.
-        max_blocks_per_seq = self._calc_padded_blocks(self.max_context_len)
+        # A backend may capture a bounded fast path while retaining a larger
+        # eager-mode KV pool. Its replay policy must reject longer sequences.
+        graph_max_seq_len = self.get_cuda_graph_max_seq_len()
+        max_blocks_per_seq = self._calc_padded_blocks(graph_max_seq_len)
         block_kv_indices = self.decode_cuda_graph_kv_indices[:bs, :max_blocks_per_seq]
         metadata.block_kv_indices = block_kv_indices
-        metadata.max_seq_len_k = self.max_context_len
+        metadata.max_seq_len_k = graph_max_seq_len
         metadata.batch_size = bs
 
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -859,6 +892,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1
+
+    def get_cuda_graph_max_seq_len(self) -> int:
+        """Maximum KV length represented by captured decode metadata."""
+        return self.max_context_len
 
     def init_mha_chunk_metadata(
         self, forward_batch: ForwardBatch, disable_flashinfer_ragged: bool = False
@@ -1184,6 +1221,14 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
         )
 
+    def _get_decode_kv_cache(self, layer: RadixAttention) -> torch.Tensor:
+        """Return the paged cache representation consumed by decode."""
+        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        return k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+
+    def _validate_decode_kv_cache(self, kv_cache: torch.Tensor) -> None:
+        assert kv_cache.dtype == self.data_type
+
     def forward_decode(
         self,
         q: torch.Tensor,  # q_nope
@@ -1261,8 +1306,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
 
         # Prepare KV cache inline
-        k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+        kv_cache = self._get_decode_kv_cache(layer)
 
         # Get metadata
         metadata = (
@@ -1406,8 +1450,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             # Ensure query has shape [bs, num_draft_tokens, num_q_heads, head_dim]
             bs = forward_batch.batch_size
 
-            k_cache = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
-            kv_cache = k_cache.view(-1, self.page_size, self.kv_cache_dim).unsqueeze(1)
+            kv_cache = self._get_decode_kv_cache(layer)
 
             q = q.to(self.data_type)
 
@@ -1463,7 +1506,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_cu_seqlens_q = actual_cu_seqlens_q
                     unpad_sum_seq_lens_q = total_tokens
 
-            assert kv_cache.dtype == self.data_type
+            self._validate_decode_kv_cache(kv_cache)
 
             # Omniva MLA tree-spec: pass SGLang's tree attention mask to the verify
             # kernel only for tree drafting (topk>1). For topk=1 the tree is a chain

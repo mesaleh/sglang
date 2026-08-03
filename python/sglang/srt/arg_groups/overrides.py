@@ -60,6 +60,10 @@ from sglang.srt.utils.common import (
 
 logger = logging.getLogger(__name__)
 
+_TOKENSPEED_MLA_TQ4_DTYPES = frozenset(
+    {"turboquant_4bit", "turboquant_4bit_uniform", "turboquant_k4v2"}
+)
+
 # Constant per-architecture overrides (populated by the migration sweeps).
 MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
     # These models run in bfloat16 regardless of the requested dtype
@@ -1714,11 +1718,19 @@ def _mla_backend_page_constraints(view: Any) -> dict:
         view.attention_backend == "tokenspeed_mla"
         or view.decode_attention_backend == "tokenspeed_mla"
     ):
-        if page_size not in [32, 64]:
+        is_turboquant = view.kv_cache_dtype in _TOKENSPEED_MLA_TQ4_DTYPES
+        supported_page_sizes = [32] if is_turboquant else [32, 64]
+        if page_size not in supported_page_sizes:
+            target_page_size = 32 if is_turboquant else 64
             logger.warning(
-                f"tokenspeed_mla only supports page_size of 32 or 64, changing page_size from {page_size} to 64."
+                "tokenspeed_mla with kv-cache-dtype=%s only supports "
+                "page_size in %s, changing page_size from %s to %s.",
+                view.kv_cache_dtype,
+                supported_page_sizes,
+                page_size,
+                target_page_size,
             )
-            page_size = 64
+            page_size = target_page_size
     if (
         view.attention_backend == "cutedsl_mla"
         or view.decode_attention_backend == "cutedsl_mla"
@@ -1770,9 +1782,11 @@ def _mla_kv_cache_dtype_checks(view: Any) -> dict:
             raise ValueError(
                 "tokenspeed_mla backend is only supported on Blackwell GPUs (SM100/SM12x)."
             )
-        if view.kv_cache_dtype not in ["fp8_e4m3"]:
+        is_turboquant = view.kv_cache_dtype in _TOKENSPEED_MLA_TQ4_DTYPES
+        if view.kv_cache_dtype != "fp8_e4m3" and not is_turboquant:
             raise ValueError(
-                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3, "
+                "tokenspeed_mla backend requires kv-cache-dtype=fp8_e4m3 or a "
+                "4-bit MLA TurboQuant mode, "
                 f"got {view.kv_cache_dtype}."
             )
     return {}

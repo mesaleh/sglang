@@ -42,12 +42,23 @@ def validate_turboquant_transfer_compatibility(
             "deterministic inference or use a supported --kv-cache-dtype."
         )
 
+    native_tokenspeed_mla = (
+        prefill_attention_backend == "tokenspeed_mla"
+        and decode_attention_backend == "tokenspeed_mla"
+    )
+
+    if use_mla_backend and native_tokenspeed_mla:
+        # The native TokenSpeed backend consumes the packed MLA pool directly
+        # and validates its TQ4 side-library ABI during backend construction.
+        # It does not use the older env-gated FlashMLA research dispatcher.
+        return
+
     if use_mla_backend and not mla_fused_decode_enabled:
         raise ValueError(
             "MLA TurboQuant KV cache requires SGLANG_TQ_MLA_FUSED_DECODE=1: "
-            "the generic MLA attention backends reconstruct the entire packed "
-            "KV pool on every layer and forward. Enable the fused research path "
-            "or use a supported --kv-cache-dtype."
+            "use the env-gated flashmla fused research path, select native "
+            "tokenspeed_mla for both prefill and decode, or use a supported "
+            "--kv-cache-dtype."
         )
 
     if use_mla_backend and (
@@ -55,8 +66,8 @@ def validate_turboquant_transfer_compatibility(
         or decode_attention_backend != "flashmla"
     ):
         raise ValueError(
-            "MLA TurboQuant KV cache requires flashmla for both prefill and "
-            "decode so SGLANG_TQ_MLA_FUSED_DECODE selects "
-            "TurboQuantMLABackend. Set --attention-backend flashmla or use a "
-            "supported --kv-cache-dtype."
+            "MLA TurboQuant KV cache requires either native tokenspeed_mla for "
+            "both prefill and decode, or flashmla for both so "
+            "SGLANG_TQ_MLA_FUSED_DECODE selects TurboQuantMLABackend. Set one "
+            "complete backend pair or use a supported --kv-cache-dtype."
         )

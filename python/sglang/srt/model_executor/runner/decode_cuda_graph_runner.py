@@ -592,6 +592,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if forward_batch.replace_embeds is not None:
             return False
 
+        if not self._attention_backend_can_run_cuda_graph(forward_batch):
+            return False
+
         ragged_layout = (
             resolve_ragged_verify_layout(forward_batch)
             if self.ragged_verify_mode
@@ -678,6 +681,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and capture_hidden_mode_matches
             and is_ngram_supported
         )
+
+    def _attention_backend_can_run_cuda_graph(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        attention_graph_policy = getattr(
+            getattr(self, "attn_backend", None), "can_run_cuda_graph", None
+        )
+        return attention_graph_policy is None or attention_graph_policy(forward_batch)
 
     def _can_run_ragged_verify_graph(self, forward_batch: ForwardBatch, ragged_layout):
         if not self.attn_backend.supports_ragged_verify_graph:

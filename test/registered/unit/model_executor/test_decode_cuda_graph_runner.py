@@ -105,10 +105,46 @@ class TestDecodeCudaGraphRunner(unittest.TestCase):
         self.assertTrue(runner.can_run_graph(forward_batch))
         self.assertEqual(runner.backend.shape_key, ShapeKey(size=3))
 
+        runner.attn_backend = SimpleNamespace(
+            can_run_cuda_graph=lambda forward_batch: False
+        )
+        runner.backend.shape_key = None
+        self.assertFalse(runner.can_run_graph(forward_batch))
+        self.assertIsNone(runner.backend.shape_key)
+
+        runner.attn_backend = SimpleNamespace(
+            can_run_cuda_graph=lambda forward_batch: True
+        )
         runner.backend.shape_key = None
         forward_batch.disable_decode_cuda_graph = True
         self.assertFalse(runner.can_run_graph(forward_batch))
         self.assertIsNone(runner.backend.shape_key)
+
+    def test_spec_graph_runners_honor_attention_replay_policy(self):
+        from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
+            EAGLEDraftCudaGraphRunner,
+        )
+        from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
+            EAGLEDraftExtendCudaGraphRunner,
+        )
+        from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
+            FrozenKVMTPCudaGraphRunner,
+        )
+        from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
+            MultiLayerEagleDraftExtendCudaGraphRunner,
+        )
+
+        for runner_type in (
+            EAGLEDraftCudaGraphRunner,
+            EAGLEDraftExtendCudaGraphRunner,
+            MultiLayerEagleDraftExtendCudaGraphRunner,
+            FrozenKVMTPCudaGraphRunner,
+        ):
+            runner = runner_type.__new__(runner_type)
+            runner.attn_backend = SimpleNamespace(
+                can_run_cuda_graph=lambda forward_batch: False
+            )
+            self.assertFalse(runner.can_run_graph(SimpleNamespace()))
 
 
 if __name__ == "__main__":

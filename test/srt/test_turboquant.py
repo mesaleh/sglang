@@ -251,11 +251,26 @@ class TestTurboQuantCLI(unittest.TestCase):
                 prefill_attention_backend="flashmla",
                 decode_attention_backend="flashmla",
             )
-        with self.assertRaisesRegex(ValueError, "requires flashmla"):
+        with self.assertRaisesRegex(ValueError, "requires either native"):
             validate_turboquant_transfer_compatibility(
                 **common,
                 prefill_attention_backend="trtllm_mla",
                 decode_attention_backend="flashmla",
+                mla_fused_decode_enabled=True,
+            )
+
+        # The reviewed native TokenSpeed reader consumes the packed pool
+        # directly and is independent of the older FlashMLA env gate.
+        validate_turboquant_transfer_compatibility(
+            **common,
+            prefill_attention_backend="tokenspeed_mla",
+            decode_attention_backend="tokenspeed_mla",
+        )
+        with self.assertRaisesRegex(ValueError, "complete backend pair"):
+            validate_turboquant_transfer_compatibility(
+                **common,
+                prefill_attention_backend="flashmla",
+                decode_attention_backend="tokenspeed_mla",
                 mla_fused_decode_enabled=True,
             )
 

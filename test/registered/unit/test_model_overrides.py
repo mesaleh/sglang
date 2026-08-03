@@ -1617,7 +1617,35 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # trtllm_mla with already-valid page: no declaration
         self.assertEqual(
             _mla_backend_page_constraints(
-                _view(attention_backend="trtllm_mla", page_size=32)
+                _view(
+                    attention_backend="trtllm_mla",
+                    kv_cache_dtype="bf16",
+                    page_size=32,
+                )
+            ),
+            {},
+        )
+        # Native TurboQuant TokenSpeed reads page-32 packed rows. It must
+        # override both the generic page-1 default and TokenSpeed's FP8-valid
+        # page-64 layout.
+        for page_size in (1, 64):
+            self.assertEqual(
+                _mla_backend_page_constraints(
+                    _view(
+                        decode_attention_backend="tokenspeed_mla",
+                        kv_cache_dtype="turboquant_4bit",
+                        page_size=page_size,
+                    )
+                ),
+                {"page_size": 32},
+            )
+        self.assertEqual(
+            _mla_backend_page_constraints(
+                _view(
+                    decode_attention_backend="tokenspeed_mla",
+                    kv_cache_dtype="fp8_e4m3",
+                    page_size=64,
+                )
             ),
             {},
         )
@@ -1675,6 +1703,40 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+
+    def test_tokenspeed_mla_accepts_only_fp8_or_turboquant_kv(self):
+        from sglang.srt.arg_groups.overrides import (
+            ResolvedView,
+            _mla_kv_cache_dtype_checks,
+        )
+
+        def _view(kv_cache_dtype):
+            return ResolvedView(
+                SimpleNamespace(
+                    attention_backend=None,
+                    decode_attention_backend="tokenspeed_mla",
+                    kv_cache_dtype=kv_cache_dtype,
+                )
+            )
+
+        with patch.object(
+            overrides_module, "is_blackwell_supported", return_value=True
+        ):
+            self.assertEqual(_mla_kv_cache_dtype_checks(_view("fp8_e4m3")), {})
+            self.assertEqual(
+                _mla_kv_cache_dtype_checks(_view("turboquant_4bit")), {}
+            )
+            self.assertEqual(
+                _mla_kv_cache_dtype_checks(_view("turboquant_4bit_uniform")),
+                {},
+            )
+            self.assertEqual(
+                _mla_kv_cache_dtype_checks(_view("turboquant_k4v2")), {}
+            )
+            with self.assertRaisesRegex(ValueError, "4-bit MLA TurboQuant"):
+                _mla_kv_cache_dtype_checks(_view("bf16"))
+            with self.assertRaisesRegex(ValueError, "4-bit MLA TurboQuant"):
+                _mla_kv_cache_dtype_checks(_view("turboquant_2bit"))
 
     def test_monolith_attention_families_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import (
