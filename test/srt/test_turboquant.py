@@ -26,6 +26,29 @@ import torch
 
 class TestTurboQuantCLI(unittest.TestCase):
 
+    def test_mha_pool_accepts_v0516_configurator_kwargs(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MHATokenToKVPoolTurboQuant,
+        )
+
+        with patch.object(MHATokenToKVPool, "__init__", return_value=None) as init:
+            MHATokenToKVPoolTurboQuant(
+                32,
+                page_size=32,
+                dtype=torch.bfloat16,
+                head_num=1,
+                head_dim=128,
+                layer_num=1,
+                device="cpu",
+                enable_memory_saver=False,
+                enable_alt_stream=True,
+                enable_kv_cache_copy=True,
+            )
+
+        self.assertFalse(init.call_args.kwargs["enable_alt_stream"])
+        self.assertFalse(init.call_args.kwargs["enable_kv_cache_copy"])
+
     def test_preserved_kv_cache_dtype_choices_parse(self):
         from sglang.srt.server_args import ServerArgs
 

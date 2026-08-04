@@ -3223,6 +3223,8 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
         v_head_dim: Optional[int] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
     ):
         self.turboquant_bits = turboquant_bits
         from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
@@ -3249,6 +3251,11 @@ class MHATokenToKVPoolTurboQuant(MHATokenToKVPool):
             v_head_dim=v_head_dim,
             start_layer=start_layer,
             end_layer=end_layer,
+            # TurboQuant owns the packed K/V and scale-buffer move below, so
+            # neither the base pool's alternate stream nor its contiguous-row
+            # copy kernel applies. Accept the configurator knobs to preserve
+            # the v0.5.16 pool-constructor contract, but intentionally use the
+            # TurboQuant-native synchronous move path.
             enable_alt_stream=False,
             enable_kv_cache_copy=False,
         )
