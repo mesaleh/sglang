@@ -147,6 +147,64 @@ class TestTurboQuantCLI(unittest.TestCase):
         self.assertEqual(runner.server_args.prefill_attention_backend, "fa3")
         self.assertEqual(runner.server_args.decode_attention_backend, "flashmla")
 
+    def test_dflash_fa4_draft_owns_unpacked_bf16_kv(self):
+        from copy import deepcopy
+
+        from sglang.srt.model_executor.model_runner import ModelRunner
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        class ServerArgs(SimpleNamespace):
+            def override(self, source, **fields):
+                self.override_source = source
+                for name, value in fields.items():
+                    setattr(self, name, value)
+
+        target_args = ServerArgs(
+            kv_cache_dtype="turboquant_4bit",
+            speculative_draft_attention_backend="fa4",
+            attention_backend=None,
+            prefill_attention_backend="tokenspeed_mla",
+            decode_attention_backend="tokenspeed_mla",
+            disable_cuda_graph=False,
+        )
+        draft_args = deepcopy(target_args)
+        draft_args.attention_backend = "fa4"
+        draft_args.prefill_attention_backend = None
+        draft_args.decode_attention_backend = None
+
+        target = object.__new__(ModelRunner)
+        target.server_args = target_args
+        target.model = SimpleNamespace(quant_config=None)
+        target.dtype = torch.bfloat16
+        target.is_draft_worker = False
+        target.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        target.use_mla_backend = True
+
+        draft = object.__new__(ModelRunner)
+        draft.server_args = draft_args
+        draft.model = SimpleNamespace(quant_config=None)
+        draft.dtype = torch.bfloat16
+        draft.is_draft_worker = True
+        draft.spec_algorithm = SpeculativeAlgorithm.DFLASH
+        draft.use_mla_backend = False
+
+        target.configure_kv_cache_dtype()
+        draft.configure_kv_cache_dtype()
+
+        self.assertEqual(target.server_args.kv_cache_dtype, "turboquant_4bit")
+        self.assertEqual(target.kv_cache_dtype, torch.bfloat16)
+        self.assertEqual(target.turboquant_k_bits, 4)
+        self.assertEqual(target.server_args.decode_attention_backend, "tokenspeed_mla")
+
+        self.assertEqual(draft.server_args.kv_cache_dtype, "bf16")
+        self.assertEqual(draft.kv_cache_dtype, torch.bfloat16)
+        self.assertEqual(draft.server_args.attention_backend, "fa4")
+        self.assertIsNone(draft.server_args.prefill_attention_backend)
+        self.assertIsNone(draft.server_args.decode_attention_backend)
+        self.assertFalse(hasattr(draft, "turboquant_bits"))
+        self.assertFalse(hasattr(draft, "turboquant_k_bits"))
+        self.assertFalse(hasattr(draft, "turboquant_v_bits"))
+
     def test_output_rotation_fusion_is_all_or_nothing(self):
         from sglang.srt.model_executor.model_runner_components.turboquant_rotation import (
             fuse_turboquant_output_rotation_weights,

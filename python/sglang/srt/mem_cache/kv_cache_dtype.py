@@ -32,6 +32,7 @@ def configure_kv_cache_dtype(
     speculative_draft_attention_backend: str,
 ) -> tuple[Optional[str], torch.dtype]:
     resolved_kv_cache_dtype: Optional[str] = None
+    turboquant_config = parse_turboquant_kv_cache_dtype(server_args_kv_cache_dtype)
     if server_args_kv_cache_dtype == "auto":
         quant_config = getattr(model, "quant_config", None)
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
@@ -75,7 +76,7 @@ def configure_kv_cache_dtype(
                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
                 "with CUDA 12.8+."
             )
-    elif parse_turboquant_kv_cache_dtype(server_args_kv_cache_dtype) is not None:
+    elif turboquant_config is not None:
         # TurboQuant stores packed tensors in a specialized pool and exposes
         # dequantized bf16 tensors to ordinary attention backends.
         kv_cache_dtype = torch.bfloat16
@@ -88,14 +89,23 @@ def configure_kv_cache_dtype(
         is_draft_worker
         and is_dflash
         and speculative_draft_attention_backend == "fa4"
-        and kv_cache_dtype != model_dtype
+        and (kv_cache_dtype != model_dtype or turboquant_config is not None)
     ):
         logger.info(
-            "DFLASH fa4 draft: overriding KV cache dtype %s -> %s "
+            "DFLASH fa4 draft: overriding KV cache representation %s (%s) -> %s "
             "(fa4 needs K.dtype == Q.dtype; cannot read the target's quantized KV).",
+            server_args_kv_cache_dtype,
             kv_cache_dtype,
             model_dtype,
         )
         kv_cache_dtype = model_dtype
+        if turboquant_config is not None:
+            # TQ's logical dtype is BF16, so torch-dtype equality alone cannot
+            # express that this draft must use an ordinary, unpacked pool.
+            # ModelRunner records this value on the draft's private ServerArgs
+            # before pool selection, backend policy, warmup, or rotation fusion.
+            resolved_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR.get(
+                model_dtype, "auto"
+            )
 
     return resolved_kv_cache_dtype, kv_cache_dtype
