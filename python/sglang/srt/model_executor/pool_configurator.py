@@ -77,7 +77,7 @@ logger = logging.getLogger(__name__)
 
 
 def _get_turboquant_bits(kvc: KVCacheConfigurator) -> Optional[tuple[int, int]]:
-    config = parse_turboquant_kv_cache_dtype(kvc.server_args.kv_cache_dtype)
+    config = parse_turboquant_kv_cache_dtype(kvc.kv_cache_dtype_str)
     if config is None:
         return None
     k_bits, v_bits, _ = config

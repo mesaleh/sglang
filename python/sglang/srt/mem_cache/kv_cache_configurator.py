@@ -907,7 +907,7 @@ class KVCacheConfigurator:
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_dsa_model
-            if parse_turboquant_kv_cache_dtype(self.server_args.kv_cache_dtype):
+            if parse_turboquant_kv_cache_dtype(self.kv_cache_dtype_str):
                 token_to_kv_pool = self._build_mla_turboquant_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
@@ -938,9 +938,7 @@ class KVCacheConfigurator:
                 )
             else:
                 quant_method = None
-                if parse_turboquant_kv_cache_dtype(
-                    self.server_args.kv_cache_dtype
-                ):
+                if parse_turboquant_kv_cache_dtype(self.kv_cache_dtype_str):
                     assert not enable_page_major, (
                         "page-major KV layout is not supported with TurboQuant "
                         "KV cache"
@@ -1252,7 +1250,7 @@ class KVCacheConfigurator:
     def _build_mla_turboquant_kv_pool(
         self, *, max_total_num_tokens: int
     ) -> KVCache:
-        config = parse_turboquant_kv_cache_dtype(self.server_args.kv_cache_dtype)
+        config = parse_turboquant_kv_cache_dtype(self.kv_cache_dtype_str)
         assert config is not None
         k_bits, v_bits, uniform = config
         token_to_kv_pool = MLATokenToKVPoolTurboQuant(
@@ -1296,9 +1294,7 @@ class KVCacheConfigurator:
         mha_pool_class: type,
     ) -> KVCache:
         kwargs = {}
-        turboquant_config = parse_turboquant_kv_cache_dtype(
-            self.server_args.kv_cache_dtype
-        )
+        turboquant_config = parse_turboquant_kv_cache_dtype(self.kv_cache_dtype_str)
         if self.is_hybrid_swa_compress:
             kwargs = {
                 "swa_head_num": max(
@@ -1482,9 +1478,7 @@ class KVCacheConfigurator:
     def _build_mha_kv_pool(
         self, *, max_total_num_tokens: int, mha_pool_class: type, quant_method=None
     ) -> KVCache:
-        turboquant_config = parse_turboquant_kv_cache_dtype(
-            self.server_args.kv_cache_dtype
-        )
+        turboquant_config = parse_turboquant_kv_cache_dtype(self.kv_cache_dtype_str)
         if turboquant_config is not None:
             assert not self.server_args.prefill_only_disable_kv_cache, (
                 "TurboQuant cannot be combined with "

@@ -1245,9 +1245,7 @@ class ModelRunner:
             else self.server_args.kv_cache_dtype
         )
 
-        turboquant_config = parse_turboquant_kv_cache_dtype(
-            self.server_args.kv_cache_dtype
-        )
+        turboquant_config = parse_turboquant_kv_cache_dtype(self.kv_cache_dtype_str)
         if turboquant_config is None:
             return
 
