@@ -1,5 +1,8 @@
 import unittest
+from array import array
+import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -11,6 +14,13 @@ from sglang.srt.speculative.dflash_draft_ring import (
     dflash_draft_ring_reprefill_tail_tokens,
     draft_ring_cache_locs,
     select_dflash_ring_prefill_slices,
+)
+from sglang.srt.speculative.dflash_draft_snapshot import (
+    DFlashDraftSnapshotDirectory,
+    DFlashDraftSnapshotStore,
+    build_dflash_draft_snapshot_config,
+    build_dflash_snapshot_keys,
+    match_prefix_with_dflash_snapshot,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -266,6 +276,361 @@ class TestDFlashDraftRing(unittest.TestCase):
         self.assertIsNone(captured["allocator"])
         self.assertEqual(fake_worker._draft_ring_config.padded_tokens, 19328)
 
+    def test_worker_snapshot_allocation_uses_bounded_pool(self):
+        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        draft_runner = SimpleNamespace()
+        captured = {}
+        fake_store = object()
+
+        class FakeDraftWorker:
+            def alloc_memory_pool(self, *, memory_pool_config, **_):
+                captured["config"] = memory_pool_config
+                draft_runner.req_to_token_pool = SimpleNamespace(_alloc_size=9)
+                draft_runner.token_to_kv_pool = SimpleNamespace(
+                    size=62304,
+                    get_kv_size_bytes=lambda: 6_291_456,
+                )
+
+        fake_worker = SimpleNamespace(
+            use_physical_draft_ring=True,
+            use_compact_draft_cache=True,
+            use_draft_snapshot=True,
+            draft_window_size=2048,
+            page_size=32,
+            block_size=5,
+            server_args=SimpleNamespace(
+                speculative_algorithm="DFLASH",
+                speculative_num_steps=1,
+                speculative_eagle_topk=1,
+                max_speculative_num_draft_tokens=5,
+                page_size=32,
+            ),
+            _draft_worker=FakeDraftWorker(),
+            draft_model_runner=draft_runner,
+            _draft_ring_config=None,
+            _draft_snapshot_config=None,
+            _draft_snapshot_store=None,
+            ps=SimpleNamespace(tp_rank=1),
+        )
+        with patch(
+            "sglang.srt.speculative.dflash_worker_v2.DFlashDraftSnapshotStore",
+            return_value=fake_store,
+        ) as store_cls:
+            DFlashWorkerV2.alloc_memory_pool(
+                fake_worker,
+                memory_pool_config=MemoryPoolConfig(
+                    max_total_num_tokens=262144,
+                    max_running_requests=8,
+                ),
+                req_to_token_pool=SimpleNamespace(_alloc_size=9),
+                token_to_kv_pool_allocator=object(),
+            )
+
+        self.assertEqual(captured["config"].max_total_num_tokens, 62304)
+        self.assertEqual(fake_worker._draft_snapshot_config.padded_tokens, 62336)
+        self.assertIs(fake_worker._draft_snapshot_store, fake_store)
+        store_cls.assert_called_once_with(
+            draft_runner.token_to_kv_pool, fake_worker._draft_snapshot_config
+        )
+
+    def test_worker_snapshot_publication_requires_cross_rank_agreement(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        ring = build_dflash_draft_ring_config(
+            window_size=2048,
+            page_size=32,
+            block_size=5,
+            alloc_reserve=10,
+            request_rows=9,
+        )
+        config = build_dflash_draft_snapshot_config(ring)
+        directory = DFlashDraftSnapshotDirectory(config, namespace="test")
+        key = directory.make_key(list(range(32)), 32, extra_key=None)
+        req = SimpleNamespace(rid="rank-agreement", req_pool_idx=3)
+        candidates = [(req, key, 32, None)]
+        fake_worker = SimpleNamespace(ps=SimpleNamespace(tp_size=2))
+
+        with patch(
+            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            return_value=SimpleNamespace(
+                all_gather_object=lambda value: [value, value]
+            ),
+        ):
+            DFlashWorkerV2._require_snapshot_publication_batch_rank_agreement(
+                fake_worker, directory=directory, candidates=candidates
+            )
+        self.assertEqual(directory.stats()["pending"], 0)
+
+        def divergent_gather(value):
+            directory_signature, candidate_signature = value
+            divergent = (
+                directory_signature,
+                (*candidate_signature, ("other-rid", 4, 32, b"x" * 32, 32, None)),
+            )
+            return [value, divergent]
+
+        with patch(
+            "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+            return_value=SimpleNamespace(all_gather_object=divergent_gather),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "diverged across TP ranks"):
+                DFlashWorkerV2._require_snapshot_publication_batch_rank_agreement(
+                    fake_worker, directory=directory, candidates=candidates
+                )
+        self.assertEqual(directory.stats()["pending"], 0)
+        self.assertEqual(directory.stats()["free"], config.physical_slots)
+
+    def test_worker_snapshot_publication_batches_one_collective_and_reuses_reserve(
+        self,
+    ):
+        from sglang.srt.environ import envs
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        ring = build_dflash_draft_ring_config(
+            window_size=2048,
+            page_size=32,
+            block_size=5,
+            alloc_reserve=10,
+            request_rows=9,
+        )
+        config = build_dflash_draft_snapshot_config(ring)
+        directory = DFlashDraftSnapshotDirectory(config, namespace="test")
+        for value in range(20):
+            tokens = list(range(value, value + 32))
+            key = directory.make_key(tokens, 32, extra_key=None)
+            publication = directory.begin_publish(key, valid_rows=32)
+            directory.commit_publish(publication)
+
+        copied = []
+        gather_calls = []
+        worker = SimpleNamespace(
+            use_draft_snapshot=True,
+            _draft_snapshot_directory=directory,
+            _draft_snapshot_store=SimpleNamespace(
+                publish=lambda publication, request_pool_index: copied.append(
+                    (publication, request_pool_index)
+                ),
+                row_elements=128,
+                kv_pool=SimpleNamespace(k_buffer=[object()] * 6),
+            ),
+            _draft_snapshot_config=config,
+            page_size=32,
+            ps=SimpleNamespace(tp_size=8, tp_rank=0),
+            _logged_first_draft_snapshot_publication=True,
+        )
+        worker._require_snapshot_publication_batch_rank_agreement = lambda **kwargs: (
+            DFlashWorkerV2._require_snapshot_publication_batch_rank_agreement(
+                worker, **kwargs
+            )
+        )
+        worker._log_dflash_snapshot_telemetry = lambda event, **fields: (
+            DFlashWorkerV2._log_dflash_snapshot_telemetry(worker, event, **fields)
+        )
+        worker._snapshot_handle_telemetry = DFlashWorkerV2._snapshot_handle_telemetry
+        reqs = [
+            SimpleNamespace(
+                rid=f"batch-{index}",
+                req_pool_idx=index + 1,
+                kv_committed_len=config.snapshot_rows,
+                cache_protected_len=config.snapshot_rows,
+                extra_key=None,
+                get_fill_ids=lambda value=value: list(
+                    range(value, value + config.snapshot_rows)
+                ),
+            )
+            for index, value in enumerate(range(100, 108))
+        ]
+        tree_cache = SimpleNamespace(dflash_snapshot_directory=lambda: directory)
+
+        def gather(value):
+            gather_calls.append(value)
+            return [value] * 8
+
+        with (
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.override(True),
+            patch(
+                "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+                return_value=SimpleNamespace(all_gather_object=gather),
+            ),
+            patch("sglang.srt.speculative.dflash_worker_v2.logger.info") as log_info,
+        ):
+            publications = DFlashWorkerV2.maybe_publish_dflash_snapshots(
+                worker, reqs=reqs, tree_cache=tree_cache
+            )
+
+        self.assertEqual(len(gather_calls), 1)
+        self.assertEqual(len(publications), 8)
+        self.assertEqual(len(copied), 8)
+        self.assertEqual(directory.stats()["resident"], 20)
+        self.assertEqual(directory.stats()["pending"], 0)
+        self.assertEqual(directory.stats()["free"], 1)
+        telemetry = [
+            json.loads(call.args[2])
+            for call in log_info.call_args_list
+            if call.args[:2] == ("%s%s", "DFLASH_SNAPSHOT_TELEMETRY ")
+        ]
+        self.assertEqual(len(telemetry), 8)
+        self.assertTrue(all(item["event"] == "publication" for item in telemetry))
+        self.assertTrue(all(item["copied_bytes"] == 6_291_456 for item in telemetry))
+
+    def test_worker_snapshot_invalid_candidate_joins_collective_before_error(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        ring = build_dflash_draft_ring_config(
+            window_size=2048,
+            page_size=32,
+            block_size=5,
+            alloc_reserve=10,
+            request_rows=9,
+        )
+        config = build_dflash_draft_snapshot_config(ring)
+        directory = DFlashDraftSnapshotDirectory(config, namespace="test")
+        worker = SimpleNamespace(
+            use_draft_snapshot=True,
+            _draft_snapshot_directory=directory,
+            _draft_snapshot_store=SimpleNamespace(),
+            _draft_snapshot_config=config,
+            page_size=32,
+            ps=SimpleNamespace(tp_size=8, tp_rank=1),
+        )
+        worker._require_snapshot_publication_batch_rank_agreement = lambda **kwargs: (
+            DFlashWorkerV2._require_snapshot_publication_batch_rank_agreement(
+                worker, **kwargs
+            )
+        )
+        req = SimpleNamespace(
+            rid="invalid",
+            req_pool_idx=None,
+            kv_committed_len=32,
+            cache_protected_len=32,
+            extra_key=None,
+            get_fill_ids=lambda: list(range(32)),
+        )
+        gathered = []
+
+        def gather(value):
+            gathered.append(value)
+            return [value] * 8
+
+        with (
+            patch(
+                "sglang.srt.speculative.dflash_worker_v2.get_tp_group",
+                return_value=SimpleNamespace(all_gather_object=gather),
+            ),
+            self.assertRaisesRegex(RuntimeError, "requires a request row"),
+        ):
+            DFlashWorkerV2.maybe_publish_dflash_snapshots(
+                worker,
+                reqs=[req],
+                tree_cache=SimpleNamespace(dflash_snapshot_directory=lambda: directory),
+            )
+        self.assertEqual(len(gathered), 1)
+        self.assertEqual(directory.stats()["pending"], 0)
+
+    def test_worker_snapshot_restore_consumes_handle_but_retains_pin_lifecycle(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        restored = []
+        store = SimpleNamespace(restore=lambda items: restored.append(list(items)))
+        handle = SimpleNamespace(key=SimpleNamespace(prefix_length=64))
+        req = SimpleNamespace(
+            rid="chunked",
+            req_pool_idx=3,
+            dflash_snapshot_handle=handle,
+        )
+        worker = SimpleNamespace(
+            use_draft_snapshot=True,
+            _draft_snapshot_store=store,
+            _logged_first_draft_snapshot_restore=True,
+            ps=SimpleNamespace(tp_rank=1),
+        )
+        batch = SimpleNamespace(reqs=[req], prefix_lens=[64])
+
+        DFlashWorkerV2._restore_dflash_snapshots_for_prefill(worker, batch)
+        self.assertEqual(restored, [[(handle, 3, 64)]])
+        self.assertIsNone(req.dflash_snapshot_handle)
+
+        # A later continuation chunk keeps the directory's request-id pin for
+        # final release, but cannot consume the physical snapshot twice.
+        batch.prefix_lens = [96]
+        DFlashWorkerV2._restore_dflash_snapshots_for_prefill(worker, batch)
+        self.assertEqual(restored[-1], [])
+
+    def test_worker_snapshot_restore_emits_one_structured_decision(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        restored = []
+        store = SimpleNamespace(
+            restore=lambda items: restored.append(list(items)),
+            row_elements=128,
+            kv_pool=SimpleNamespace(k_buffer=[object()] * 6),
+        )
+        handle = SimpleNamespace(
+            key=SimpleNamespace(prefix_length=64, digest=b"d" * 32),
+            slot=2,
+            slot_generation=3,
+            cache_generation=4,
+            valid_rows=64,
+        )
+        req = SimpleNamespace(
+            rid="telemetry",
+            req_pool_idx=3,
+            dflash_snapshot_handle=handle,
+            dflash_snapshot_telemetry_emitted=False,
+            dflash_snapshot_match_duration_ns=1234,
+            dflash_snapshot_match_plan=SimpleNamespace(
+                status="snapshot_selected",
+                normal_boundary=32,
+                full_boundary=64,
+                selected_boundary=64,
+                delta=0,
+            ),
+        )
+        directory = SimpleNamespace(
+            stats=lambda: {
+                "cache_generation": 4,
+                "resident": 1,
+                "pending": 0,
+                "request_refs": 1,
+                "free": 20,
+                "pinned": 1,
+            }
+        )
+        worker = SimpleNamespace(
+            use_draft_snapshot=True,
+            _draft_snapshot_store=store,
+            _draft_snapshot_directory=directory,
+            _logged_first_draft_snapshot_restore=True,
+            ps=SimpleNamespace(tp_rank=0),
+        )
+        worker._log_dflash_snapshot_telemetry = lambda event, **fields: (
+            DFlashWorkerV2._log_dflash_snapshot_telemetry(worker, event, **fields)
+        )
+        worker._snapshot_handle_telemetry = DFlashWorkerV2._snapshot_handle_telemetry
+        batch = SimpleNamespace(reqs=[req], prefix_lens=[64])
+
+        with (
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.override(True),
+            patch("sglang.srt.speculative.dflash_worker_v2.logger.info") as log_info,
+        ):
+            DFlashWorkerV2._restore_dflash_snapshots_for_prefill(worker, batch)
+
+        telemetry = [
+            json.loads(call.args[2])
+            for call in log_info.call_args_list
+            if call.args[:2] == ("%s%s", "DFLASH_SNAPSHOT_TELEMETRY ")
+        ]
+        self.assertEqual(len(telemetry), 1)
+        self.assertEqual(telemetry[0]["event"], "restore_decision")
+        self.assertEqual(telemetry[0]["status"], "snapshot_selected")
+        self.assertEqual(telemetry[0]["copied_bytes"], 196_608)
+        self.assertEqual(telemetry[0]["match_duration_ns"], 1234)
+        self.assertTrue(req.dflash_snapshot_telemetry_emitted)
+        self.assertIsNone(req.dflash_snapshot_handle)
+
     def test_worker_default_off_preserves_allocator_delegation(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
@@ -350,6 +715,413 @@ class TestDFlashDraftRing(unittest.TestCase):
         fake_worker.server_args.enable_unified_memory = True
         with self.assertRaisesRegex(RuntimeError, "unified memory"):
             DFlashWorkerV2._validate_draft_ring_configuration(fake_worker)
+
+        fake_worker.server_args.enable_unified_memory = False
+        fake_worker.server_args.enable_dp_attention = True
+        with self.assertRaisesRegex(RuntimeError, "DP attention"):
+            DFlashWorkerV2._validate_draft_ring_configuration(fake_worker)
+
+
+class TestDFlashDraftSnapshot(unittest.TestCase):
+    def setUp(self):
+        ring = build_dflash_draft_ring_config(
+            window_size=2048,
+            page_size=32,
+            block_size=5,
+            alloc_reserve=10,
+            request_rows=9,
+        )
+        self.config = build_dflash_draft_snapshot_config(ring)
+
+    def _key(self, directory, value, boundary=32):
+        tokens = list(range(value, value + boundary))
+        return directory.make_key(tokens, boundary, extra_key="tenant")
+
+    def _publish(self, directory, value, boundary=32):
+        key = self._key(directory, value, boundary)
+        publication = directory.begin_publish(
+            key, valid_rows=min(boundary, self.config.snapshot_rows)
+        )
+        self.assertTrue(publication.copy_required)
+        return directory.commit_publish(publication)
+
+    def test_snapshot_layout_uses_aligned_window_not_replay_span(self):
+        cfg = self.config
+        self.assertEqual(cfg.snapshot_rows, 2048)
+        self.assertEqual(cfg.snapshot_base, 19328)
+        self.assertEqual(cfg.physical_slots, 21)
+        self.assertEqual(cfg.service_slots, 20)
+        self.assertEqual(cfg.pool_size, 62304)
+        self.assertEqual(cfg.padded_tokens, 62336)
+        self.assertEqual(cfg.slot_base(0), 19328)
+        self.assertEqual(cfg.slot_base(20) + cfg.snapshot_rows, 62336)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            cfg.slot_base(21)
+
+    def test_aligned_snapshot_plus_delta_covers_every_compact_suffix(self):
+        cfg = self.config
+        for boundary in range(0, 256_001, cfg.ring.page_size):
+            snapshot_start = max(0, boundary - cfg.snapshot_rows)
+            for delta in range(0, 2113):
+                end = min(256_000, boundary + delta)
+                compact_len = compact_draft_seq_len(
+                    end, cfg.ring.window_size, cfg.ring.page_size
+                )
+                self.assertGreaterEqual(end - compact_len, snapshot_start)
+
+    def test_content_keys_are_incremental_and_namespace_exact(self):
+        tokens = array("q", range(96))
+        keys = build_dflash_snapshot_keys(
+            tokens,
+            [32, 64, 96],
+            namespace="model|draft|source|rope",
+            extra_key="tenant-a",
+            cache_generation=7,
+        )
+        self.assertEqual(
+            keys[96].digest.hex(),
+            "5ea7d2c06df46ec027baea0d23cc96f6f44b1c0597f7d39f10f3a2f020349dc4",
+        )
+        direct = build_dflash_snapshot_keys(
+            tokens,
+            [96],
+            namespace="model|draft|source|rope",
+            extra_key="tenant-a",
+            cache_generation=7,
+        )
+        self.assertEqual(keys[96], direct[96])
+        none_extra = build_dflash_snapshot_keys(
+            tokens,
+            [96],
+            namespace="model|draft|source|rope",
+            extra_key=None,
+            cache_generation=7,
+        )
+        empty_extra = build_dflash_snapshot_keys(
+            tokens,
+            [96],
+            namespace="model|draft|source|rope",
+            extra_key="",
+            cache_generation=7,
+        )
+        self.assertNotEqual(none_extra[96], empty_extra[96])
+
+    def test_directory_two_phase_reserve_pin_and_generation(self):
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        handles = [self._publish(directory, value) for value in range(20)]
+        self.assertEqual(directory.stats()["resident"], 20)
+        self.assertEqual(directory.stats()["free"], 1)
+
+        self.assertEqual(
+            directory.acquire_for_request(handles[0], request_id="rid-0"),
+            handles[0],
+        )
+        replacement_key = self._key(directory, 100)
+        replacement = directory.begin_publish(replacement_key, valid_rows=32)
+        self.assertTrue(replacement.copy_required)
+        self.assertIsNotNone(replacement.victim)
+        self.assertNotEqual(replacement.victim, handles[0])
+        self.assertEqual(directory.stats()["pending"], 1)
+        replacement_handle = directory.commit_publish(replacement)
+        self.assertEqual(directory.stats()["resident"], 20)
+        self.assertEqual(directory.stats()["free"], 1)
+        self.assertIsNone(
+            directory.acquire_for_request(replacement.victim, request_id="stale-victim")
+        )
+        self.assertEqual(
+            directory.acquire_for_request(replacement_handle, request_id="rid-new"),
+            replacement_handle,
+        )
+        self.assertTrue(directory.release_request("rid-new"))
+        self.assertTrue(directory.release_request("rid-0"))
+        old_generation = directory.cache_generation
+        directory.reset()
+        self.assertEqual(directory.cache_generation, old_generation + 1)
+        self.assertEqual(directory.stats()["resident"], 0)
+        self.assertIsNone(
+            directory.acquire_for_request(replacement_handle, request_id="stale-gen")
+        )
+
+    def test_directory_rank_agreement_signature_covers_lru_and_refs(self):
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        initial = directory.rank_agreement_signature()
+        handle = self._publish(directory, 1)
+        published = directory.rank_agreement_signature()
+        self.assertNotEqual(initial, published)
+        directory.acquire_for_request(handle, request_id="rid")
+        pinned = directory.rank_agreement_signature()
+        self.assertNotEqual(published, pinned)
+        directory.release_request("rid")
+        released = directory.rank_agreement_signature()
+        self.assertNotEqual(pinned, released)
+
+    def test_directory_release_and_reset_telemetry_reconciles_occupancy(self):
+        from sglang.srt.environ import envs
+
+        directory = DFlashDraftSnapshotDirectory(
+            self.config, namespace="test", emit_telemetry=True
+        )
+        handle = self._publish(directory, 1)
+        directory.acquire_for_request(handle, request_id="rid")
+        with (
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.override(True),
+            patch(
+                "sglang.srt.speculative.dflash_draft_snapshot.logger.info"
+            ) as log_info,
+        ):
+            directory.release_request("rid")
+            directory.reset()
+
+        telemetry = [json.loads(call.args[2]) for call in log_info.call_args_list]
+        self.assertEqual([item["event"] for item in telemetry], ["release", "reset"])
+        self.assertEqual(telemetry[0]["request_refs"], 0)
+        self.assertEqual(telemetry[0]["pinned"], 0)
+        self.assertEqual(telemetry[1]["resident"], 0)
+        self.assertEqual(telemetry[1]["free"], 21)
+
+        suppressed = DFlashDraftSnapshotDirectory(
+            self.config, namespace="nonzero-rank", emit_telemetry=False
+        )
+        handle = self._publish(suppressed, 2)
+        suppressed.acquire_for_request(handle, request_id="rank-1")
+        with (
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.override(True),
+            patch(
+                "sglang.srt.speculative.dflash_draft_snapshot.logger.info"
+            ) as suppressed_log,
+        ):
+            suppressed.release_request("rank-1")
+            suppressed.reset()
+        suppressed_log.assert_not_called()
+
+    def test_directory_declines_duplicate_pending_and_all_pinned(self):
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        key = self._key(directory, 1)
+        first = directory.begin_publish(key, valid_rows=32)
+        duplicate = directory.begin_publish(key, valid_rows=32)
+        self.assertEqual(duplicate.reason, "duplicate_pending")
+        directory.abort_publish(first)
+
+        handles = [self._publish(directory, value + 10) for value in range(20)]
+        for index, handle in enumerate(handles):
+            directory.acquire_for_request(handle, request_id=f"rid-{index}")
+        rejected = directory.begin_publish(self._key(directory, 1000), valid_rows=32)
+        self.assertEqual(rejected.reason, "all_residents_pinned")
+        with self.assertRaisesRegex(RuntimeError, "zero references"):
+            directory.reset()
+
+    def test_tentative_lookup_obeys_content_delta_and_generation(self):
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        tokens = array("q", range(256))
+        key = directory.make_key(tokens, 128, extra_key="tenant")
+        publication = directory.begin_publish(key, valid_rows=128)
+        handle = directory.commit_publish(publication)
+        self.assertEqual(
+            directory.find_tentative(
+                tokens,
+                extra_key="tenant",
+                normal_boundary=64,
+                full_boundary=160,
+                max_delta=32,
+            ),
+            handle,
+        )
+        self.assertIsNone(
+            directory.find_tentative(
+                tokens,
+                extra_key="other",
+                normal_boundary=64,
+                full_boundary=160,
+                max_delta=32,
+            )
+        )
+        self.assertIsNone(
+            directory.find_tentative(
+                tokens,
+                extra_key="tenant",
+                normal_boundary=64,
+                full_boundary=160,
+                max_delta=0,
+            )
+        )
+
+    def test_snapshot_match_validates_target_and_falls_back_atomically(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+        tokens = array("q", range(256))
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        key = directory.make_key(tokens, 224, extra_key="tenant")
+        publication = directory.begin_publish(key, valid_rows=224)
+        handle = directory.commit_publish(publication)
+
+        def make_cache(prefix_length):
+            cache = RadixCache.create_simulated(page_size=32)
+            cache.register_dflash_snapshot_directory(directory)
+            cache.reprefill_tail_tokens = lambda: 64
+            cache.insert(
+                InsertParams(
+                    key=RadixKey(tokens[:prefix_length], extra_key="tenant"),
+                    value=torch.arange(prefix_length, dtype=torch.int64),
+                )
+            )
+            return cache
+
+        req = SimpleNamespace(extra_key="tenant", rid="hit")
+        cache = make_cache(224)
+        with (
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_MAX_DELTA.override(0),
+            patch(
+                "sglang.srt.speculative.dflash_draft_snapshot."
+                "build_dflash_snapshot_keys",
+                wraps=build_dflash_snapshot_keys,
+            ) as build_keys,
+        ):
+            match_prefix_with_dflash_snapshot(
+                tree_cache=cache,
+                req=req,
+                token_ids=array("q", tokens),
+                base_key_limit=224,
+                cow_mamba=False,
+                include_req=True,
+                acquire=False,
+            )
+            result = match_prefix_with_dflash_snapshot(
+                tree_cache=cache,
+                req=req,
+                token_ids=tokens,
+                base_key_limit=224,
+                cow_mamba=False,
+                include_req=True,
+                acquire=True,
+            )
+        self.assertEqual(build_keys.call_count, 1)
+        self.assertEqual(len(result.device_indices), 224)
+        self.assertEqual(req.dflash_snapshot_match_plan.status, "snapshot_selected")
+        self.assertEqual(req.dflash_snapshot_handle, handle)
+        self.assertIsNone(req._dflash_snapshot_key_cache)
+        self.assertTrue(directory.release_request(req.rid))
+
+        req = SimpleNamespace(extra_key="tenant", rid="target-miss")
+        with envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_MAX_DELTA.override(0):
+            result = match_prefix_with_dflash_snapshot(
+                tree_cache=make_cache(192),
+                req=req,
+                token_ids=tokens,
+                base_key_limit=224,
+                cow_mamba=False,
+                include_req=True,
+                acquire=True,
+            )
+        self.assertEqual(len(result.device_indices), 192)
+        self.assertEqual(
+            req.dflash_snapshot_match_plan.status, "target_validation_failed"
+        )
+        self.assertIsNone(req.dflash_snapshot_handle)
+        self.assertEqual(directory.stats()["request_refs"], 0)
+
+    def test_snapshot_match_accepts_page_aligned_delta_and_reports_it(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+        tokens = array("q", range(256))
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        key = directory.make_key(tokens, 224, extra_key="tenant")
+        publication = directory.begin_publish(key, valid_rows=224)
+        handle = directory.commit_publish(publication)
+        cache = RadixCache.create_simulated(page_size=32)
+        cache.register_dflash_snapshot_directory(directory)
+        cache.reprefill_tail_tokens = lambda: 64
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, extra_key="tenant"),
+                value=torch.arange(len(tokens), dtype=torch.int64),
+            )
+        )
+        req = SimpleNamespace(extra_key="tenant", rid="delta-hit")
+
+        with envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_MAX_DELTA.override(32):
+            result = match_prefix_with_dflash_snapshot(
+                tree_cache=cache,
+                req=req,
+                token_ids=tokens,
+                base_key_limit=256,
+                cow_mamba=False,
+                include_req=True,
+                acquire=True,
+            )
+
+        self.assertEqual(len(result.device_indices), 224)
+        self.assertEqual(req.dflash_snapshot_match_plan.status, "snapshot_selected")
+        self.assertEqual(req.dflash_snapshot_match_plan.selected_boundary, 224)
+        self.assertEqual(req.dflash_snapshot_match_plan.delta, 32)
+        self.assertEqual(req.dflash_snapshot_handle, handle)
+        self.assertTrue(directory.release_request(req.rid))
+
+    def test_tree_cache_release_clears_request_pin(self):
+        from sglang.srt.mem_cache.radix_cache import RadixCache
+
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        handle = self._publish(directory, 1)
+        cache = RadixCache.create_simulated(page_size=32)
+        cache.register_dflash_snapshot_directory(directory)
+        req = SimpleNamespace(rid="release", dflash_snapshot_handle=handle)
+        directory.acquire_for_request(handle, request_id=req.rid)
+
+        self.assertTrue(cache.release_dflash_snapshot_for_req(req))
+        self.assertIsNone(req.dflash_snapshot_handle)
+        self.assertEqual(directory.stats()["request_refs"], 0)
+
+    def test_cache_insert_boolean_preserves_disabled_cache_bookkeeping(self):
+        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+        calls = []
+        cache = SimpleNamespace(
+            disable=True,
+            cache_unfinished_req=lambda req, **kwargs: calls.append((req, kwargs)),
+        )
+        req = SimpleNamespace(skip_radix_cache_insert=False)
+        self.assertFalse(maybe_cache_unfinished_req(req, cache, chunked=True))
+        self.assertEqual(calls, [(req, {"chunked": True})])
+
+        req.skip_radix_cache_insert = True
+        self.assertFalse(maybe_cache_unfinished_req(req, cache))
+        self.assertEqual(len(calls), 1)
+
+    def test_cache_insert_boolean_requires_qualified_committed_boundary(self):
+        from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
+
+        directory = SimpleNamespace(
+            config=SimpleNamespace(ring=SimpleNamespace(page_size=32))
+        )
+
+        def cache_unfinished_req(req, **_):
+            req.cache_protected_len = req.inserted_len
+
+        cache = SimpleNamespace(
+            disable=False,
+            cache_unfinished_req=cache_unfinished_req,
+            dflash_snapshot_directory=lambda: directory,
+        )
+        req = SimpleNamespace(
+            skip_radix_cache_insert=False,
+            kv_committed_len=95,
+            inserted_len=64,
+            cache_protected_len=0,
+        )
+        self.assertTrue(maybe_cache_unfinished_req(req, cache))
+
+        req.inserted_len = 32
+        self.assertFalse(maybe_cache_unfinished_req(req, cache))
+
+        ordinary_cache = SimpleNamespace(
+            disable=False,
+            cache_unfinished_req=cache_unfinished_req,
+        )
+        req.inserted_len = 64
+        self.assertFalse(maybe_cache_unfinished_req(req, ordinary_cache))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "Triton kernel requires CUDA")
@@ -489,6 +1261,120 @@ class TestDFlashDraftRingPrepareKernel(unittest.TestCase):
                     ).all()
                 )
             )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "Triton kernel requires CUDA")
+class TestDFlashDraftSnapshotCopyKernel(unittest.TestCase):
+    def test_batched_snapshot_restore_matches_wrapped_ring_oracle(self):
+        ring = build_dflash_draft_ring_config(
+            window_size=2048,
+            page_size=32,
+            block_size=5,
+            alloc_reserve=10,
+            request_rows=9,
+        )
+        config = build_dflash_draft_snapshot_config(ring)
+
+        class FakePool:
+            size = config.pool_size
+            kv_cache_layout = "nhd"
+
+            def __init__(self):
+                self.k_buffer = [
+                    torch.zeros(
+                        (config.padded_tokens, 1, 128),
+                        dtype=torch.bfloat16,
+                        device="cuda",
+                    )
+                    for _ in range(6)
+                ]
+                self.v_buffer = [torch.zeros_like(self.k_buffer[0]) for _ in range(6)]
+
+        pool = FakePool()
+        store = DFlashDraftSnapshotStore(pool, config)
+        directory = DFlashDraftSnapshotDirectory(config, namespace="cuda-test")
+        items = []
+        expected = {}
+        ring_locations = []
+        for request_index in range(8):
+            boundary = 4096 + request_index * ring.page_size
+            tokens = array("q", range(boundary))
+            key = directory.make_key(tokens, boundary, extra_key="tenant")
+            publication = directory.begin_publish(key, valid_rows=config.snapshot_rows)
+            positions = torch.arange(
+                boundary - config.snapshot_rows,
+                boundary,
+                dtype=torch.int64,
+                device="cuda",
+            )
+            locations = draft_ring_cache_locs(
+                torch.tensor(request_index, dtype=torch.int64, device="cuda"),
+                positions,
+                ring,
+            )
+            ring_locations.append(locations)
+            for buffer_index, buffer in enumerate([*pool.k_buffer, *pool.v_buffer]):
+                value = float(buffer_index * 8 + request_index + 1)
+                buffer[locations] = value
+                expected[(buffer_index, request_index)] = value
+            store.publish(publication, request_pool_index=request_index)
+            handle = directory.commit_publish(publication)
+            items.append((handle, request_index, boundary))
+
+        torch.cuda.synchronize()
+        first_snapshot = pool.k_buffer[0][
+            config.slot_base(items[0][0].slot) : config.slot_base(items[0][0].slot)
+            + config.snapshot_rows
+        ]
+        self.assertTrue(
+            bool((first_snapshot == expected[(0, 0)]).all()),
+            msg=(
+                "snapshot publication mismatch: "
+                f"range={float(first_snapshot.min())}.."
+                f"{float(first_snapshot.max())}"
+            ),
+        )
+        for locations in ring_locations:
+            for buffer in [*pool.k_buffer, *pool.v_buffer]:
+                buffer[locations] = 0
+
+        store.restore(items[:1])
+        torch.cuda.synchronize()
+        first_locations = ring_locations[0]
+        for buffer_index, buffer in enumerate([*pool.k_buffer, *pool.v_buffer]):
+            self.assertTrue(
+                bool((buffer[first_locations] == expected[(buffer_index, 0)]).all())
+            )
+            buffer[first_locations] = 0
+
+        store.restore(items)
+        torch.cuda.synchronize()
+        for handle, request_index, boundary in items:
+            positions = torch.arange(
+                boundary - handle.valid_rows,
+                boundary,
+                dtype=torch.int64,
+                device="cuda",
+            )
+            locations = draft_ring_cache_locs(
+                torch.tensor(request_index, dtype=torch.int64, device="cuda"),
+                positions,
+                ring,
+            )
+            for buffer_index, buffer in enumerate([*pool.k_buffer, *pool.v_buffer]):
+                actual = buffer[locations]
+                wanted = torch.full_like(
+                    actual, expected[(buffer_index, request_index)]
+                )
+                self.assertTrue(
+                    torch.equal(actual, wanted),
+                    msg=(
+                        f"buffer={buffer_index}, request={request_index}, "
+                        f"boundary={boundary}, nonmatching="
+                        f"{int((actual != wanted).sum())}/{actual.numel()}, "
+                        f"range={float(actual.min())}..{float(actual.max())}"
+                    ),
+                )
 
 
 if __name__ == "__main__":

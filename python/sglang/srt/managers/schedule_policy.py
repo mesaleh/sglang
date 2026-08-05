@@ -100,22 +100,44 @@ def match_prefix_for_req(
     if token_ids is None:
         token_ids = req.origin_input_ids + req.output_ids
 
-    # Request-scoped rings are not content-stable across radix hits. Hold back
-    # the largest required tail so this request re-materializes its own ring.
-    reprefill_tail = tree_cache.reprefill_tail_tokens()
-    key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+    snapshot_directory = getattr(
+        tree_cache, "dflash_snapshot_directory", lambda: None
+    )()
+    if snapshot_directory is not None:
+        from sglang.srt.speculative.dflash_draft_snapshot import (
+            match_prefix_with_dflash_snapshot,
+        )
 
-    match_result = tree_cache.match_prefix(
-        MatchPrefixParams(
-            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key, limit=key_limit),
+        match_result = match_prefix_with_dflash_snapshot(
+            tree_cache=tree_cache,
+            req=req,
+            token_ids=token_ids,
+            base_key_limit=req._compute_max_prefix_len(len(token_ids)),
             cow_mamba=cow_mamba,
-            req=req if include_req else None,
+            include_req=include_req,
+            acquire=False,
         )
-    )
-    if envs.SGLANG_RADIX_FORCE_MISS.get():
-        match_result = zero_match_result(
-            tree_cache, match_result, extra_key=req.extra_key
+    else:
+        # Request-scoped rings are not content-stable across radix hits. Hold back
+        # the largest required tail so this request re-materializes its own ring.
+        reprefill_tail = tree_cache.reprefill_tail_tokens()
+        key_limit = max(0, len(token_ids) - reprefill_tail) if reprefill_tail else None
+
+        match_result = tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    token_ids=token_ids,
+                    extra_key=req.extra_key,
+                    limit=key_limit,
+                ),
+                cow_mamba=cow_mamba,
+                req=req if include_req else None,
+            )
         )
+        if envs.SGLANG_RADIX_FORCE_MISS.get():
+            match_result = zero_match_result(
+                tree_cache, match_result, extra_key=req.extra_key
+            )
     (
         req.prefix_indices,
         req.last_node,

@@ -848,6 +848,10 @@ class Req(ReqDllmMixin):
         # For req-level memory management
         self.kv_committed_len = 0
         self.kv: Optional[ReqKvInfo] = None
+        self.dflash_snapshot_match_plan = None
+        self.dflash_snapshot_handle = None
+        self.dflash_snapshot_match_duration_ns = None
+        self.dflash_snapshot_telemetry_emitted = False
 
         # for cross-encoder model
         self.token_type_ids = token_type_ids
@@ -1282,7 +1286,12 @@ class Req(ReqDllmMixin):
 
         # Request-scoped rings are not content-stable across radix hits. Hold
         # back the largest required tail so this request rewrites its own ring.
-        if tree_cache is not None:
+        snapshot_directory = (
+            getattr(tree_cache, "dflash_snapshot_directory", lambda: None)()
+            if tree_cache is not None
+            else None
+        )
+        if tree_cache is not None and snapshot_directory is None:
             reprefill_tail = tree_cache.reprefill_tail_tokens()
             if reprefill_tail:
                 capped = max(0, input_len - reprefill_tail)
@@ -1297,26 +1306,41 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
-            # Apply the same request-scoped ring holdback to the final match.
-            reprefill_tail = tree_cache.reprefill_tail_tokens()
-            if reprefill_tail:
-                capped = max(0, input_len - reprefill_tail)
-                key_limit = capped if key_limit is None else min(key_limit, capped)
-            match_result = tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(
-                        token_ids=token_ids_to_match,
-                        extra_key=self.extra_key,
-                        limit=key_limit,
-                    ),
+            if snapshot_directory is not None:
+                from sglang.srt.speculative.dflash_draft_snapshot import (
+                    match_prefix_with_dflash_snapshot,
+                )
+
+                match_result = match_prefix_with_dflash_snapshot(
+                    tree_cache=tree_cache,
                     req=self,
+                    token_ids=token_ids_to_match,
+                    base_key_limit=key_limit,
                     cow_mamba=cow_mamba,
+                    include_req=True,
+                    acquire=True,
                 )
-            )
-            if envs.SGLANG_RADIX_FORCE_MISS.get():
-                match_result = zero_match_result(
-                    tree_cache, match_result, extra_key=self.extra_key
+            else:
+                # Apply the same request-scoped ring holdback to the final match.
+                reprefill_tail = tree_cache.reprefill_tail_tokens()
+                if reprefill_tail:
+                    capped = max(0, input_len - reprefill_tail)
+                    key_limit = capped if key_limit is None else min(key_limit, capped)
+                match_result = tree_cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(
+                            token_ids=token_ids_to_match,
+                            extra_key=self.extra_key,
+                            limit=key_limit,
+                        ),
+                        req=self,
+                        cow_mamba=cow_mamba,
+                    )
                 )
+                if envs.SGLANG_RADIX_FORCE_MISS.get():
+                    match_result = zero_match_result(
+                        tree_cache, match_result, extra_key=self.extra_key
+                    )
             (
                 self.prefix_indices,
                 self.last_node,

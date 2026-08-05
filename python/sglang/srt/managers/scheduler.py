@@ -534,6 +534,12 @@ class Scheduler(
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
+        register_dflash_snapshot_cache = getattr(
+            self.draft_worker, "register_dflash_snapshot_cache", None
+        )
+        if callable(register_dflash_snapshot_cache):
+            register_dflash_snapshot_cache(self.tree_cache)
+
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
 
@@ -3250,6 +3256,7 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    self.tree_cache.release_dflash_snapshot_for_req(req)
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None

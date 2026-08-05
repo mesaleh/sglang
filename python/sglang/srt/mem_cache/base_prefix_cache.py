@@ -248,6 +248,29 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         )
         self.metrics_collector = radix_cache_cls(labels=labels)
 
+    def register_dflash_snapshot_directory(self, directory) -> None:
+        current = getattr(self, "_dflash_snapshot_directory", None)
+        if current is not None and current is not directory:
+            raise RuntimeError("DFlash snapshot directory was registered twice")
+        self._dflash_snapshot_directory = directory
+
+    def dflash_snapshot_directory(self):
+        return getattr(self, "_dflash_snapshot_directory", None)
+
+    def reset_dflash_snapshot_directory(self) -> None:
+        directory = self.dflash_snapshot_directory()
+        if directory is not None:
+            directory.reset()
+
+    def release_dflash_snapshot_for_req(self, req: Req) -> bool:
+        directory = self.dflash_snapshot_directory()
+        if directory is None:
+            return False
+        released = directory.release_request(req.rid)
+        if released:
+            req.dflash_snapshot_handle = None
+        return released
+
     def update_eviction_metrics(self, num_evicted: int, start_time: float):
         if self.metrics_collector is not None and num_evicted > 0:
             self.metrics_collector.observe_eviction_duration(

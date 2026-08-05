@@ -1,5 +1,7 @@
+import json
 import logging
 import math
+import time
 from dataclasses import replace
 from typing import List, Optional
 
@@ -43,6 +45,12 @@ from sglang.srt.speculative.dflash_draft_ring import (
     max_compact_draft_seq_len,
     select_dflash_ring_prefill_slices,
 )
+from sglang.srt.speculative.dflash_draft_snapshot import (
+    DFlashDraftSnapshotConfig,
+    DFlashDraftSnapshotDirectory,
+    DFlashDraftSnapshotStore,
+    build_dflash_draft_snapshot_config,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -76,6 +84,7 @@ _is_npu = is_npu()
 
 
 logger = logging.getLogger(__name__)
+_SNAPSHOT_TELEMETRY_PREFIX = "DFLASH_SNAPSHOT_TELEMETRY "
 
 _FusedKVMaterializeHelper = None
 
@@ -204,7 +213,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.use_physical_draft_ring = envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.get()
+        self.use_draft_snapshot = envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT.get()
         self._draft_ring_config: Optional[DFlashDraftRingConfig] = None
+        self._draft_snapshot_config: Optional[DFlashDraftSnapshotConfig] = None
+        self._draft_snapshot_store: Optional[DFlashDraftSnapshotStore] = None
+        self._draft_snapshot_directory: Optional[DFlashDraftSnapshotDirectory] = None
+        self._logged_first_draft_snapshot_publication = False
+        self._logged_first_draft_snapshot_restore = False
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -331,6 +346,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._new_seq_lens_bufs: List[torch.Tensor] = []
 
     def _validate_draft_ring_configuration(self) -> None:
+        use_draft_snapshot = bool(getattr(self, "use_draft_snapshot", False))
+        if use_draft_snapshot and not self.use_physical_draft_ring:
+            raise RuntimeError(
+                "SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT requires "
+                "SGLANG_OMNIVA_DFLASH_DRAFT_RING=1"
+            )
         if not self.use_physical_draft_ring:
             return
 
@@ -347,6 +368,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             unsupported.append(f"page_size={self.page_size} (requires 32)")
         if int(self.ps.tp_size) != 8:
             unsupported.append(f"tp_size={self.ps.tp_size} (requires 8)")
+        if (
+            getattr(self.server_args, "enable_dp_attention", False)
+            or int(getattr(self.ps, "attn_dp_size", 1)) != 1
+        ):
+            unsupported.append("DP attention")
         if int(self.server_args.pp_size) != 1:
             unsupported.append(f"pp_size={self.server_args.pp_size} (requires 1)")
         if int(self.server_args.dcp_size) != 1:
@@ -365,8 +391,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             unsupported.append("session radix cache")
         if getattr(self.server_args, "enable_unified_memory", False):
             unsupported.append("unified memory")
+        if envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
+            unsupported.append("UnifiedRadixTree")
         if getattr(self.draft_model_runner, "is_hybrid_swa", False):
             unsupported.append("hybrid-SWA draft pool")
+        if use_draft_snapshot:
+            if not is_cuda():
+                unsupported.append("non-CUDA platform")
+            elif torch.cuda.get_device_capability(self.device) < (10, 0):
+                unsupported.append(
+                    "pre-SM100 CUDA device "
+                    f"{torch.cuda.get_device_capability(self.device)}"
+                )
+            source_id = envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_SOURCE_ID.get()
+            if not source_id:
+                unsupported.append("missing snapshot source identity")
+            max_delta = envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_MAX_DELTA.get()
+            if max_delta < 0 or max_delta >= 2112:
+                unsupported.append(f"snapshot_max_delta={max_delta} (requires 0..2111)")
+            if max_delta % int(self.page_size):
+                unsupported.append(
+                    f"snapshot_max_delta={max_delta} (requires page alignment)"
+                )
         if unsupported:
             raise RuntimeError(
                 "SGLANG_OMNIVA_DFLASH_DRAFT_RING is unsupported with: "
@@ -412,6 +458,303 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.draft_model_runner.attn_backend,
         )
 
+    def register_dflash_snapshot_cache(self, tree_cache) -> None:
+        if not self.use_draft_snapshot:
+            return
+        if self._draft_snapshot_config is None or self._draft_snapshot_store is None:
+            raise RuntimeError("DFlash snapshot registration preceded pool allocation")
+        if tree_cache.__class__.__name__ != "RadixCache" or tree_cache.is_chunk_cache():
+            raise RuntimeError(
+                "DFlash draft snapshots require the qualified RadixCache"
+            )
+        source_id = envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_SOURCE_ID.get()
+        if not source_id:
+            raise RuntimeError("DFlash snapshot source identity is missing")
+        namespace = "|".join(
+            (
+                f"target={self.server_args.model_path}",
+                f"draft={self.server_args.speculative_draft_model_path}",
+                f"source={source_id}",
+                f"tp={self.ps.tp_size}",
+                f"window={self.draft_window_size}",
+                f"page={self.page_size}",
+                f"block={self.block_size}",
+                "draft_kv=bf16",
+            )
+        )
+        directory = DFlashDraftSnapshotDirectory(
+            self._draft_snapshot_config,
+            namespace=namespace,
+            emit_telemetry=self.ps.tp_rank == 0,
+        )
+        tree_cache.register_dflash_snapshot_directory(directory)
+        self._draft_snapshot_directory = directory
+
+    def _log_dflash_snapshot_telemetry(self, event: str, **fields) -> None:
+        if (
+            self.ps.tp_rank != 0
+            or not envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.get()
+        ):
+            return
+        logger.info(
+            "%s%s",
+            _SNAPSHOT_TELEMETRY_PREFIX,
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "event": event,
+                    "monotonic_ns": time.perf_counter_ns(),
+                    **fields,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    @staticmethod
+    def _snapshot_handle_telemetry(handle):
+        if handle is None:
+            return None
+        return {
+            "prefix_length": handle.key.prefix_length,
+            "digest": handle.key.digest.hex(),
+            "slot": handle.slot,
+            "slot_generation": handle.slot_generation,
+            "cache_generation": handle.cache_generation,
+            "valid_rows": handle.valid_rows,
+        }
+
+    def _require_snapshot_publication_batch_rank_agreement(
+        self, *, directory, candidates
+    ) -> None:
+        if int(self.ps.tp_size) <= 1:
+            return
+        signature = (
+            directory.rank_agreement_signature(),
+            tuple(
+                (
+                    str(req.rid),
+                    None if req.req_pool_idx is None else int(req.req_pool_idx),
+                    None if key is None else key.prefix_length,
+                    None if key is None else key.digest,
+                    valid_rows,
+                    error,
+                )
+                for req, key, valid_rows, error in candidates
+            ),
+        )
+        signatures = get_tp_group().all_gather_object(signature)
+        if any(value != signature for value in signatures):
+            raise RuntimeError(
+                "DFlash snapshot publication batch diverged across TP ranks: "
+                f"local={signature!r}, gathered={signatures!r}"
+            )
+
+    def maybe_publish_dflash_snapshots(self, *, reqs, tree_cache):
+        if not self.use_draft_snapshot:
+            return []
+        directory = tree_cache.dflash_snapshot_directory()
+        if directory is None or directory is not self._draft_snapshot_directory:
+            raise RuntimeError("DFlash snapshot directory registration drifted")
+        if self._draft_snapshot_store is None or self._draft_snapshot_config is None:
+            raise RuntimeError("DFlash snapshot store is unavailable")
+        candidates = []
+        for req in reqs:
+            boundary = (
+                int(req.kv_committed_len) // int(self.page_size) * int(self.page_size)
+            )
+            if boundary <= 0:
+                candidates.append((req, None, 0, None))
+                continue
+            error = None
+            if req.req_pool_idx is None:
+                error = "publication requires a request row"
+            if int(req.cache_protected_len) < boundary:
+                error = (
+                    "publication did not observe the aligned radix "
+                    f"insertion boundary: protected={req.cache_protected_len}, "
+                    f"boundary={boundary}"
+                )
+            token_ids = req.get_fill_ids()
+            if error is None and len(token_ids) < boundary:
+                error = (
+                    "token source is shorter than committed KV: "
+                    f"tokens={len(token_ids)}, boundary={boundary}"
+                )
+            key = (
+                directory.make_key(token_ids, boundary, extra_key=req.extra_key)
+                if error is None
+                else None
+            )
+            candidates.append(
+                (
+                    req,
+                    key,
+                    min(boundary, self._draft_snapshot_config.snapshot_rows),
+                    error,
+                )
+            )
+
+        # This collective executes exactly once per prefill-result batch,
+        # including batches with no eligible publications. Complete directory
+        # state plus ordered content/source candidates deterministically proves
+        # every later free-slot/LRU choice, including an independently observed
+        # zero refcount for each victim, without data-dependent collective arity.
+        self._require_snapshot_publication_batch_rank_agreement(
+            directory=directory, candidates=candidates
+        )
+        errors = [error for _, _, _, error in candidates if error is not None]
+        if errors:
+            raise RuntimeError(
+                "DFlash snapshot publication batch is invalid: " + errors[0]
+            )
+
+        telemetry_enabled = (
+            self.ps.tp_rank == 0
+            and envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.get()
+        )
+        publications = []
+        for req, key, valid_rows, _ in candidates:
+            if key is None:
+                continue
+            publication_started_ns = (
+                time.perf_counter_ns() if telemetry_enabled else None
+            )
+            publication = directory.begin_publish(key, valid_rows=valid_rows)
+            publications.append(publication)
+            handle = publication.handle
+            if publication.copy_required:
+                try:
+                    self._draft_snapshot_store.publish(
+                        publication, request_pool_index=int(req.req_pool_idx)
+                    )
+                    handle = directory.commit_publish(publication)
+                except Exception:
+                    directory.abort_publish(publication)
+                    raise
+                if (
+                    self.ps.tp_rank == 0
+                    and not self._logged_first_draft_snapshot_publication
+                ):
+                    logger.info(
+                        "DFLASH draft snapshot first publication: boundary=%d, "
+                        "valid_rows=%d, slot=%d.",
+                        handle.key.prefix_length,
+                        handle.valid_rows,
+                        handle.slot,
+                    )
+                    self._logged_first_draft_snapshot_publication = True
+            if telemetry_enabled:
+                self._log_dflash_snapshot_telemetry(
+                    "publication",
+                    request_id=str(req.rid),
+                    request_pool_index=int(req.req_pool_idx),
+                    boundary=key.prefix_length,
+                    action=publication.action,
+                    reason=publication.reason,
+                    handle=self._snapshot_handle_telemetry(handle),
+                    victim=self._snapshot_handle_telemetry(publication.victim),
+                    copied_rows=valid_rows if publication.copy_required else 0,
+                    copied_bytes=(
+                        valid_rows
+                        * self._draft_snapshot_store.row_elements
+                        * 2
+                        * len(self._draft_snapshot_store.kv_pool.k_buffer)
+                        * 2
+                        if publication.copy_required
+                        else 0
+                    ),
+                    enqueue_duration_ns=(
+                        time.perf_counter_ns() - publication_started_ns
+                    ),
+                    directory=directory.stats(),
+                )
+        return publications
+
+    def _restore_dflash_snapshots_for_prefill(self, batch: ScheduleBatch) -> None:
+        if not self.use_draft_snapshot:
+            return
+        if self._draft_snapshot_store is None:
+            raise RuntimeError("DFlash snapshot restore store is unavailable")
+        items = []
+        restored_reqs = []
+        telemetry_enabled = (
+            self.ps.tp_rank == 0
+            and envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY.get()
+        )
+        handles_by_request = {} if telemetry_enabled else None
+        for row, req in enumerate(batch.reqs):
+            handle = getattr(req, "dflash_snapshot_handle", None)
+            if handle is None:
+                continue
+            boundary = int(batch.prefix_lens[row])
+            if boundary != handle.key.prefix_length:
+                raise RuntimeError(
+                    "DFlash snapshot restore boundary diverged from the target "
+                    f"match: match={boundary}, snapshot={handle.key.prefix_length}"
+                )
+            items.append((handle, int(req.req_pool_idx), boundary))
+            restored_reqs.append(req)
+            if handles_by_request is not None:
+                handles_by_request[id(req)] = handle
+        restore_started_ns = time.perf_counter_ns() if telemetry_enabled else None
+        self._draft_snapshot_store.restore(items)
+        if telemetry_enabled:
+            restore_enqueue_duration_ns = time.perf_counter_ns() - restore_started_ns
+            directory = self._draft_snapshot_directory
+            for row, req in enumerate(batch.reqs):
+                if getattr(req, "dflash_snapshot_telemetry_emitted", False):
+                    continue
+                plan = getattr(req, "dflash_snapshot_match_plan", None)
+                handle = handles_by_request.get(id(req))
+                copied_rows = 0 if handle is None else handle.valid_rows
+                self._log_dflash_snapshot_telemetry(
+                    "restore_decision",
+                    request_id=str(req.rid),
+                    request_pool_index=int(req.req_pool_idx),
+                    batch_size=len(batch.reqs),
+                    prefix_length=int(batch.prefix_lens[row]),
+                    status=None if plan is None else plan.status,
+                    normal_boundary=None if plan is None else plan.normal_boundary,
+                    full_boundary=None if plan is None else plan.full_boundary,
+                    selected_boundary=(
+                        None if plan is None else plan.selected_boundary
+                    ),
+                    delta=None if plan is None else plan.delta,
+                    handle=self._snapshot_handle_telemetry(handle),
+                    copied_rows=copied_rows,
+                    copied_bytes=(
+                        copied_rows
+                        * self._draft_snapshot_store.row_elements
+                        * 2
+                        * len(self._draft_snapshot_store.kv_pool.k_buffer)
+                        * 2
+                    ),
+                    restore_batch_enqueue_duration_ns=restore_enqueue_duration_ns,
+                    match_duration_ns=getattr(
+                        req, "dflash_snapshot_match_duration_ns", None
+                    ),
+                    directory=None if directory is None else directory.stats(),
+                )
+                req.dflash_snapshot_telemetry_emitted = True
+        # The directory retains its request-id pin until release_kv_cache(),
+        # but the physical restore is a one-shot admission operation. Clearing
+        # only the request's consumable handle prevents a continuation chunk
+        # from restoring the same snapshot again at a later prefix boundary.
+        for req in restored_reqs:
+            req.dflash_snapshot_handle = None
+        if (
+            items
+            and self.ps.tp_rank == 0
+            and not self._logged_first_draft_snapshot_restore
+        ):
+            logger.info(
+                "DFLASH draft snapshot first restore: batch_size=%d, boundaries=%s.",
+                len(items),
+                [boundary for _, _, boundary in items],
+            )
+            self._logged_first_draft_snapshot_restore = True
+
     def alloc_memory_pool(
         self,
         memory_pool_config=None,
@@ -455,9 +798,19 @@ class DFlashWorkerV2(BaseSpecWorker):
             request_rows=request_rows,
         )
         self._draft_ring_config = config
+        use_draft_snapshot = bool(getattr(self, "use_draft_snapshot", False))
+        snapshot_config = (
+            build_dflash_draft_snapshot_config(config) if use_draft_snapshot else None
+        )
+        self._draft_snapshot_config = snapshot_config
+        draft_pool_size = (
+            snapshot_config.pool_size
+            if snapshot_config is not None
+            else config.physical_tokens
+        )
         draft_pool_config = replace(
             memory_pool_config,
-            max_total_num_tokens=config.physical_tokens,
+            max_total_num_tokens=draft_pool_size,
             max_running_requests=request_rows - 1,
             full_max_total_num_tokens=None,
             swa_max_total_num_tokens=None,
@@ -479,11 +832,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH draft-ring request rows drifted from the target pool: "
                 f"draft={draft_req_pool._alloc_size}, target={request_rows}."
             )
-        if int(draft_kv_pool.size) != config.physical_tokens:
+        if int(draft_kv_pool.size) != draft_pool_size:
             raise RuntimeError(
                 "DFLASH draft-ring KV allocation drifted from the proven bound: "
-                f"actual={draft_kv_pool.size}, expected={config.physical_tokens}."
+                f"actual={draft_kv_pool.size}, expected={draft_pool_size}."
             )
+        self._draft_snapshot_store = (
+            DFlashDraftSnapshotStore(draft_kv_pool, snapshot_config)
+            if snapshot_config is not None
+            else None
+        )
         kv_size_bytes = draft_kv_pool.get_kv_size_bytes()
         draft_kv_bytes = (
             sum(int(size) for size in kv_size_bytes)
@@ -494,12 +852,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             logger.info(
                 "DFLASH physical draft ring allocated: request_rows=%d, "
                 "ring_pages=%d, row_stride=%d, physical_tokens=%d, "
-                "padded_tokens=%d, kv_bytes=%d.",
+                "padded_tokens=%d, snapshot_tokens=%d, kv_bytes=%d.",
                 config.request_rows,
                 config.ring_pages,
                 config.row_stride,
-                config.physical_tokens,
-                config.padded_tokens,
+                draft_pool_size,
+                (
+                    snapshot_config.padded_tokens
+                    if snapshot_config is not None
+                    else config.padded_tokens
+                ),
+                (
+                    snapshot_config.physical_slots * snapshot_config.snapshot_rows
+                    if snapshot_config is not None
+                    else 0
+                ),
                 draft_kv_bytes,
             )
 
@@ -727,7 +1094,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         # sliding-window path, the draft req->token view is rebuilt from committed
         # target state before each draft forward, so there is nothing persistent
         # to flush here.
-        pass
+        if self._draft_snapshot_store is not None:
+            self._draft_snapshot_store.reset()
 
     def _gather_req_to_token_masked(
         self,
@@ -1017,6 +1385,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         config = self._draft_ring_config
         if config is None:
             raise RuntimeError("DFLASH draft ring was not allocated.")
+        self._restore_dflash_snapshots_for_prefill(batch)
         slices = select_dflash_ring_prefill_slices(
             prefix_lens=batch.prefix_lens,
             extend_lens=batch.extend_lens,
@@ -1670,7 +2039,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
-    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
+    def _next_accept_bonus_buffers(
+        self, bs: int
+    ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,

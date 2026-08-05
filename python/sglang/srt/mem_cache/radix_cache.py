@@ -327,6 +327,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     ##### Public API #####
 
     def reset(self):
+        self.reset_dflash_snapshot_directory()
         # Initialize root with minimum priority so any real priority overrides it
         self.root_node = TreeNode(priority=-sys.maxsize)
         self.root_node.key = RadixKey(token_ids=array("q"), extra_key=None)

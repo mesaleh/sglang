@@ -934,6 +934,15 @@ class Envs:
     # Research gate: use a physically bounded, request-scoped DFlash draft-KV
     # ring instead of target-global slot IDs. Default off until S8 qualifies.
     SGLANG_OMNIVA_DFLASH_DRAFT_RING = EnvBool(False)
+    # Research gate layered on the physical ring: persist a bounded set of
+    # page-aligned draft suffixes so radix hits can restore instead of replay.
+    SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT = EnvBool(False)
+    SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_MAX_DELTA = EnvInt(0)
+    SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_SOURCE_ID = EnvStr(None)
+    # Prefill-only structured lifecycle evidence for the S9 qualification
+    # harness. Kept separate from the functional gate so normal serving pays
+    # no JSON/logging cost.
+    SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT_TELEMETRY = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_GREEDY_VERIFY_ARGMAX = EnvBool(False)
 

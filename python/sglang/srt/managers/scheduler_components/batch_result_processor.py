@@ -93,6 +93,14 @@ class SchedulerBatchResultProcessor:
     output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
+    def _cache_unfinished_req(self, req) -> bool:
+        return maybe_cache_unfinished_req(req, self.tree_cache)
+
+    def _publish_dflash_snapshot_batch(self, reqs) -> None:
+        publish = getattr(self.draft_worker, "maybe_publish_dflash_snapshots", None)
+        if callable(publish):
+            publish(reqs=reqs, tree_cache=self.tree_cache)
+
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         use_free_group = get_disagg().disaggregation_decode_enable_radix_cache
@@ -195,6 +203,7 @@ class SchedulerBatchResultProcessor:
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         skip_stream_req = None
+        snapshot_reqs = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -275,7 +284,8 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        if self._cache_unfinished_req(req):
+                            snapshot_reqs.append(req)
                         if get_memory().enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
@@ -354,11 +364,17 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     else:
-                        maybe_cache_unfinished_req(req, self.tree_cache)
+                        self._cache_unfinished_req(req)
                 else:
                     # being chunked reqs' prefill is not finished
                     req.inflight_middle_chunks -= 1
                     req.time_stats.set_last_chunked_prefill_finish_time()
+
+        if self.is_generation:
+            # The snapshot worker must see one ordered batch call even when no
+            # request was eligible. Its TP agreement collective therefore has
+            # fixed arity per prefill result instead of per-request arity.
+            self._publish_dflash_snapshot_batch(snapshot_reqs)
 
         self.output_streamer.stream_output(
             batch.reqs, batch.return_logprob, skip_stream_req

@@ -97,9 +97,27 @@ def free_swa_out_of_window_slots(
 
 def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
     if getattr(req, "skip_radix_cache_insert", False):
-        return
+        return False
 
     tree_cache.cache_unfinished_req(req, **kwargs)
+    # Disabled Mamba/Unified caches still perform request-local bookkeeping in
+    # cache_unfinished_req(). Preserve that default path while reporting that
+    # no persistent radix insertion is eligible for snapshot publication.
+    if getattr(tree_cache, "disable", False):
+        return False
+
+    directory_getter = getattr(tree_cache, "dflash_snapshot_directory", None)
+    directory = directory_getter() if callable(directory_getter) else None
+    if directory is None:
+        return False
+
+    page_size = int(directory.config.ring.page_size)
+    committed_boundary = int(getattr(req, "kv_committed_len", 0)) // page_size * page_size
+    # cache_protected_len is set from a post-insertion rematch. It may extend
+    # beyond committed_boundary because the result processor has already
+    # appended one sampled token, but covering the exact aligned committed
+    # boundary proves that boundary is present in the current radix path.
+    return committed_boundary > 0 and int(req.cache_protected_len) >= committed_boundary
 
 
 def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
@@ -130,6 +148,9 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int):
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
+    release_snapshot = getattr(tree_cache, "release_dflash_snapshot_for_req", None)
+    if callable(release_snapshot):
+        release_snapshot(req)
     # the two resources currently have the same lifecycle, thus simplify logic below
     assert (req.req_pool_idx is None) == (req.kv is None)
     # MambaRadixCache may alloc mamba state before alloc KV cache
