@@ -15,6 +15,7 @@ from sglang.kernels.ops.speculative.dflash import (
 )
 from sglang.kernels.ops.speculative.dflash_prepare_block import (
     _prepare_dflash_compact_draft_block_unchecked,
+    _prepare_dflash_ring_draft_block_unchecked,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
@@ -23,6 +24,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -34,6 +36,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftRingConfig,
+    build_dflash_draft_ring_config,
+    draft_ring_cache_locs,
+    max_compact_draft_seq_len,
+    select_dflash_ring_prefill_slices,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -72,7 +81,7 @@ _FusedKVMaterializeHelper = None
 
 
 def _max_compact_draft_seq_len(window_size: int, page_size: int) -> int:
-    return int(window_size) + max(int(page_size) - 1, 0)
+    return max_compact_draft_seq_len(window_size, page_size)
 
 
 def _get_fused_kv_materialize_helper():
@@ -194,6 +203,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
+        self.use_physical_draft_ring = envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.get()
+        self._draft_ring_config: Optional[DFlashDraftRingConfig] = None
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -207,8 +218,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 pp_rank=0,
                 pp_size=(
                     1
-                    if server_args.pp_size > 1
-                    and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
+                    if server_args.pp_size > 1 and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
                     else ps.pp_size
                 ),
             ),
@@ -241,6 +251,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+        self._validate_draft_ring_configuration()
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -277,6 +288,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        self._draft_ring_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
+            None  # [cap_bs, block_size]
+        )
+        self._draft_ring_live_pages_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_block_end_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_prefix_lens_buf: Optional[torch.Tensor] = None  # [cap_bs]
         self._draft_seq_lens_cpu_buf: Optional[torch.Tensor] = None  # [cap_bs] on CPU
@@ -300,6 +315,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         supports_gpu_triton = is_cuda() or is_hip()
         self._use_triton_prepare_block = supports_gpu_triton
+        self._use_triton_ring_prepare = supports_gpu_triton
+        self._draft_ring_capacity_assert_pending = self.use_physical_draft_ring
         self._use_triton_accept_bonus = supports_gpu_triton
         # The legacy compact-rebuild path host-syncs twice per step (masked
         # gather's implicit nonzero D2H + lengths.max().item()); keep it only
@@ -312,6 +329,50 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+
+    def _validate_draft_ring_configuration(self) -> None:
+        if not self.use_physical_draft_ring:
+            return
+
+        unsupported = []
+        if not self.use_compact_draft_cache:
+            unsupported.append("missing --speculative-draft-window-size")
+        elif int(self.draft_window_size) != 2048:
+            unsupported.append(
+                f"draft_window_size={self.draft_window_size} (requires 2048)"
+            )
+        if int(self.block_size) != 5:
+            unsupported.append(f"block_size={self.block_size} (requires 5)")
+        if int(self.page_size) != 32:
+            unsupported.append(f"page_size={self.page_size} (requires 32)")
+        if int(self.ps.tp_size) != 8:
+            unsupported.append(f"tp_size={self.ps.tp_size} (requires 8)")
+        if int(self.server_args.pp_size) != 1:
+            unsupported.append(f"pp_size={self.server_args.pp_size} (requires 1)")
+        if int(self.server_args.dcp_size) != 1:
+            unsupported.append(f"dcp_size={self.server_args.dcp_size} (requires 1)")
+        if self.server_args.disaggregation_mode != "null":
+            unsupported.append(
+                f"disaggregation_mode={self.server_args.disaggregation_mode!r}"
+            )
+        if self.server_args.enable_hierarchical_cache:
+            unsupported.append("hierarchical cache")
+        if self.server_args.enable_lmcache:
+            unsupported.append("LMCache")
+        if self.server_args.enable_streaming_session:
+            unsupported.append("streaming sessions")
+        if self.server_args.enable_session_radix_cache:
+            unsupported.append("session radix cache")
+        if getattr(self.server_args, "enable_unified_memory", False):
+            unsupported.append("unified memory")
+        if getattr(self.draft_model_runner, "is_hybrid_swa", False):
+            unsupported.append("hybrid-SWA draft pool")
+        if unsupported:
+            raise RuntimeError(
+                "SGLANG_OMNIVA_DFLASH_DRAFT_RING is unsupported with: "
+                + ", ".join(unsupported)
+                + ". Disable the research gate or use its qualified topology."
+            )
 
     def _validate_pp_target_components(self) -> None:
         if self.server_args.pp_size <= 1 or not envs.SGLANG_OMNIVA_DFLASH_PP2.get():
@@ -362,13 +423,85 @@ class DFlashWorkerV2(BaseSpecWorker):
         # enabled, the draft worker keeps a private compact req->token table
         # over the same global KV index space, so radix-cache/prefix-hit KV
         # remains reusable while draft attention sees only the recent window.
-        self._draft_worker.alloc_memory_pool(
-            memory_pool_config=memory_pool_config,
-            req_to_token_pool=(
-                None if self.use_compact_draft_cache else req_to_token_pool
-            ),
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        if not self.use_physical_draft_ring:
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=memory_pool_config,
+                req_to_token_pool=(
+                    None if self.use_compact_draft_cache else req_to_token_pool
+                ),
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+            return
+
+        if memory_pool_config is None or req_to_token_pool is None:
+            raise RuntimeError(
+                "DFLASH draft ring allocation requires the resolved target "
+                "memory-pool config and request pool."
+            )
+        assert self.draft_window_size is not None
+        request_rows = int(req_to_token_pool._alloc_size)
+        alloc_reserve = get_alloc_reserve_per_decode(self.server_args)
+        if request_rows != 9 or alloc_reserve != 10:
+            raise RuntimeError(
+                "SGLANG_OMNIVA_DFLASH_DRAFT_RING has only been qualified for "
+                "eight live request rows and a ten-token overlap reserve: "
+                f"request_rows={request_rows}, alloc_reserve={alloc_reserve}."
+            )
+        config = build_dflash_draft_ring_config(
+            window_size=int(self.draft_window_size),
+            page_size=int(self.page_size),
+            block_size=int(self.block_size),
+            alloc_reserve=alloc_reserve,
+            request_rows=request_rows,
         )
+        self._draft_ring_config = config
+        draft_pool_config = replace(
+            memory_pool_config,
+            max_total_num_tokens=config.physical_tokens,
+            max_running_requests=request_rows - 1,
+            full_max_total_num_tokens=None,
+            swa_max_total_num_tokens=None,
+            c4_max_total_num_tokens=0,
+            c128_max_total_num_tokens=0,
+            c4_state_pool_size=0,
+            c128_state_pool_size=0,
+        )
+        self._draft_worker.alloc_memory_pool(
+            memory_pool_config=draft_pool_config,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+        )
+
+        draft_req_pool = self.draft_model_runner.req_to_token_pool
+        draft_kv_pool = self.draft_model_runner.token_to_kv_pool
+        if int(draft_req_pool._alloc_size) != request_rows:
+            raise RuntimeError(
+                "DFLASH draft-ring request rows drifted from the target pool: "
+                f"draft={draft_req_pool._alloc_size}, target={request_rows}."
+            )
+        if int(draft_kv_pool.size) != config.physical_tokens:
+            raise RuntimeError(
+                "DFLASH draft-ring KV allocation drifted from the proven bound: "
+                f"actual={draft_kv_pool.size}, expected={config.physical_tokens}."
+            )
+        kv_size_bytes = draft_kv_pool.get_kv_size_bytes()
+        draft_kv_bytes = (
+            sum(int(size) for size in kv_size_bytes)
+            if isinstance(kv_size_bytes, tuple)
+            else int(kv_size_bytes)
+        )
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH physical draft ring allocated: request_rows=%d, "
+                "ring_pages=%d, row_stride=%d, physical_tokens=%d, "
+                "padded_tokens=%d, kv_bytes=%d.",
+                config.request_rows,
+                config.ring_pages,
+                config.row_stride,
+                config.physical_tokens,
+                config.padded_tokens,
+                draft_kv_bytes,
+            )
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
@@ -564,6 +697,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
+        if self.use_physical_draft_ring:
+            self._draft_ring_verify_out_cache_loc_buf = torch.empty(
+                (new_cap, block_size), dtype=torch.int64, device=device
+            )
+            self._draft_ring_live_pages_buf = torch.empty(
+                (new_cap,), dtype=torch.int32, device=device
+            )
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
@@ -764,6 +904,166 @@ class DFlashWorkerV2(BaseSpecWorker):
                 block_end,
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
+            )
+
+    def _rebuild_draft_ring_cache(
+        self,
+        *,
+        req_pool_indices: torch.Tensor,
+        prefix_lens: torch.Tensor,
+        draft_prefix_lens: torch.Tensor,
+        draft_verify_out_cache_loc_2d: torch.Tensor,
+        bs: int,
+        block_size: int,
+    ) -> None:
+        """Eager fallback for the fused draft-ring prepare kernel."""
+        config = self._draft_ring_config
+        if config is None:
+            raise RuntimeError("DFLASH draft ring was not allocated.")
+
+        draft_prefix_lens_i64 = draft_prefix_lens.to(torch.int64)
+        max_len = int(draft_prefix_lens_i64.max().item()) if bs else 0
+        if bs:
+            first_live_page = (
+                prefix_lens.to(torch.int64) - draft_prefix_lens_i64
+            ) // config.page_size
+            last_live_page = (
+                prefix_lens.to(torch.int64) + block_size - 1
+            ) // config.page_size
+            observed_live_pages = int(
+                (last_live_page - first_live_page + 1).max().item()
+            )
+            if observed_live_pages > config.max_live_pages:
+                raise RuntimeError(
+                    "DFLASH eager draft ring exceeded its live-page bound: "
+                    f"observed={observed_live_pages}, max={config.max_live_pages}."
+                )
+        if max_len:
+            offsets = torch.arange(
+                max_len, dtype=torch.int64, device=self.device
+            ).unsqueeze(0)
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens_i64
+            absolute_positions = suffix_start.unsqueeze(1) + offsets
+            prefix_mask = offsets < draft_prefix_lens_i64.unsqueeze(1)
+            prefix_cache_locs = draft_ring_cache_locs(
+                req_pool_indices.to(torch.int64).unsqueeze(1),
+                absolute_positions,
+                config,
+            )[prefix_mask]
+            assign_req_to_token_pool_func(
+                req_pool_indices,
+                self.draft_model_runner.req_to_token_pool.req_to_token,
+                torch.zeros_like(draft_prefix_lens),
+                draft_prefix_lens,
+                prefix_cache_locs,
+                bs,
+            )
+
+        assert self._draft_block_end_buf is not None
+        block_end = self._draft_block_end_buf[:bs]
+        torch.add(draft_prefix_lens, block_size, out=block_end)
+        assign_req_to_token_pool_func(
+            req_pool_indices,
+            self.draft_model_runner.req_to_token_pool.req_to_token,
+            draft_prefix_lens,
+            block_end,
+            draft_verify_out_cache_loc_2d.reshape(-1),
+            bs,
+        )
+
+    def _append_prefill_target_hidden_to_draft_cache(
+        self,
+        *,
+        batch: ScheduleBatch,
+        target_hidden: torch.Tensor,
+    ) -> None:
+        if batch.extend_lens is None or batch.prefix_lens is None:
+            raise RuntimeError(
+                "DFLASH expected extend_lens / prefix_lens in extend mode."
+            )
+        if batch.out_cache_loc is None:
+            raise RuntimeError("DFLASH prefill expected out_cache_loc.")
+        expected_hidden_rows = int(sum(batch.extend_lens))
+        if (
+            target_hidden.ndim != 2
+            or int(target_hidden.shape[0]) != expected_hidden_rows
+        ):
+            raise RuntimeError(
+                "DFLASH prefill hidden rows do not match the flattened extend "
+                f"contract: hidden_shape={tuple(target_hidden.shape)}, "
+                f"extend_rows={expected_hidden_rows}."
+            )
+
+        if not self.use_physical_draft_ring:
+            ctx_lens = torch.tensor(
+                batch.extend_lens, dtype=torch.int32, device=self.device
+            )
+            draft_seq_lens = torch.tensor(
+                batch.prefix_lens, dtype=torch.int32, device=self.device
+            )
+            positions, _ = compute_position(
+                self.model_runner.server_args.attention_backend,
+                draft_seq_lens,
+                ctx_lens,
+                int(sum(batch.extend_lens)),
+            )
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=target_hidden,
+                cache_loc=batch.out_cache_loc,
+                positions=positions,
+            )
+            return
+
+        config = self._draft_ring_config
+        if config is None:
+            raise RuntimeError("DFLASH draft ring was not allocated.")
+        slices = select_dflash_ring_prefill_slices(
+            prefix_lens=batch.prefix_lens,
+            extend_lens=batch.extend_lens,
+            window_size=config.window_size,
+            page_size=config.page_size,
+        )
+        selected_hidden = []
+        selected_positions = []
+        selected_req_indices = []
+        for row, selected in enumerate(slices):
+            if selected.length == 0:
+                continue
+            selected_hidden.append(
+                target_hidden[selected.flat_start : selected.flat_end]
+            )
+            selected_positions.append(
+                torch.arange(
+                    selected.absolute_start,
+                    selected.absolute_end,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+            )
+            selected_req_indices.append(
+                batch.req_pool_indices[row].to(torch.int64).expand(selected.length)
+            )
+        if not selected_hidden:
+            return
+
+        hidden = torch.cat(selected_hidden, dim=0)
+        positions = torch.cat(selected_positions, dim=0)
+        req_pool_indices = torch.cat(selected_req_indices, dim=0)
+        cache_loc = draft_ring_cache_locs(req_pool_indices, positions, config)
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=hidden,
+            cache_loc=cache_loc,
+            positions=positions,
+        )
+
+    def _reject_unsupported_draft_ring_requests(self, batch: ScheduleBatch) -> None:
+        if not self.use_physical_draft_ring:
+            return
+        session_reqs = [req.rid for req in batch.reqs if req.session is not None]
+        if session_reqs:
+            raise RuntimeError(
+                "SGLANG_OMNIVA_DFLASH_DRAFT_RING does not yet support session "
+                f"requests; rejected rids={session_reqs}."
             )
 
     def _resolve_mask_token_id(
@@ -1432,11 +1732,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise ValueError(
                 "DFLASH speculative decoding does not support return_logprob yet."
             )
+        self._reject_unsupported_draft_ring_requests(batch)
         self._validate_phase1_sampling_support(batch)
-        pp_mode = (
-            self.server_args.pp_size > 1
-            and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
-        )
+        pp_mode = self.server_args.pp_size > 1 and envs.SGLANG_OMNIVA_DFLASH_PP2.get()
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             # Target prefill: capture DFlash aux hidden states for prompt tokens.
@@ -1447,9 +1745,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             if pp_mode:
                 batch._omniva_dflash_pp_phase = "prefill"
-                batch._omniva_dflash_pp_ready_event = (
-                    torch.get_device_module(self.device).Event()
-                )
+                batch._omniva_dflash_pp_ready_event = torch.get_device_module(
+                    self.device
+                ).Event()
                 batch._omniva_dflash_pp_ready_event.record(
                     torch.get_device_module(self.device).current_stream()
                 )
@@ -1469,34 +1767,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     "Make sure the target model has DFlash layers-to-capture configured."
                 )
 
-            if batch.extend_lens is None or batch.prefix_lens is None:
-                raise RuntimeError(
-                    "DFLASH expected extend_lens / prefix_lens to be populated in extend mode, "
-                    "but got None."
-                )
-
             # Materialize prompt tokens into the draft KV cache immediately. This is required
             # for radix cache safety (the scheduler may update radix after prefill returns).
-            device = next_token_ids.device
-            ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-            draft_seq_lens = torch.tensor(
-                batch.prefix_lens, dtype=torch.int32, device=device
-            )
-
-            if batch.out_cache_loc is None:
-                raise RuntimeError(
-                    "DFLASH prefill expected out_cache_loc, but got None."
-                )
-            positions, _ = compute_position(
-                self.model_runner.server_args.attention_backend,
-                draft_seq_lens,
-                ctx_lens,
-                int(sum(batch.extend_lens)),
-            )
-            self._append_target_hidden_to_draft_kv_by_loc(
+            self._append_prefill_target_hidden_to_draft_cache(
+                batch=batch,
                 target_hidden=logits_output.hidden_states,
-                cache_loc=batch.out_cache_loc,
-                positions=positions,
             )
 
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
@@ -1563,6 +1838,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._draft_block_positions_buf is not None
         assert self._draft_block_tokens_buf is not None
         assert self._draft_verify_out_cache_loc_buf is not None
+        if self.use_physical_draft_ring:
+            assert self._draft_ring_verify_out_cache_loc_buf is not None
+            assert self._draft_ring_live_pages_buf is not None
+            assert self._draft_ring_config is not None
         assert self._draft_block_end_buf is not None
         assert self._draft_prefix_lens_buf is not None
         assert self._draft_seq_lens_cpu_buf is not None
@@ -1570,10 +1849,66 @@ class DFlashWorkerV2(BaseSpecWorker):
         block_ids = self._draft_block_ids_buf[:bs]
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
-        verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        target_verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        draft_verify_out_cache_loc_2d = (
+            self._draft_ring_verify_out_cache_loc_buf[:bs]
+            if self.use_physical_draft_ring
+            else target_verify_out_cache_loc_2d
+        )
         block_prepared = False
         compact_block_prepared = False
-        if self._use_triton_prepare_block and self.use_compact_draft_cache:
+        ring_block_prepared = False
+        if self._use_triton_ring_prepare and self.use_physical_draft_ring:
+            try:
+                config = self._draft_ring_config
+                assert config is not None
+                live_pages = self._draft_ring_live_pages_buf[:bs]
+                _prepare_dflash_ring_draft_block_unchecked(
+                    verified_id=draft_input.bonus_tokens.view(-1),
+                    prefix_lens=prefix_lens.view(-1),
+                    req_pool_indices=batch.req_pool_indices.view(-1),
+                    target_req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                    draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
+                    block_ids_out=block_ids,
+                    positions_out=positions_2d,
+                    target_cache_loc_out=target_verify_out_cache_loc_2d,
+                    draft_cache_loc_out=draft_verify_out_cache_loc_2d,
+                    draft_seq_lens_out=self._draft_prefix_lens_buf[:bs],
+                    block_end_out=self._draft_block_end_buf[:bs],
+                    live_pages_out=live_pages,
+                    request_rows=config.request_rows,
+                    window_size=config.window_size,
+                    page_size=config.page_size,
+                    max_compact_len=config.max_compact_len,
+                    max_live_pages=config.max_live_pages,
+                    ring_pages=config.ring_pages,
+                    row_stride=config.row_stride,
+                    mask_token_id=int(self._mask_token_id),
+                )
+            except Exception as e:
+                self._use_triton_ring_prepare = False
+                logger.warning(
+                    "DFLASH Triton draft-ring prepare failed; falling back to "
+                    "the eager ring path: %s",
+                    e,
+                )
+            else:
+                if self._draft_ring_capacity_assert_pending:
+                    # Attest the running kernel once without charging every
+                    # decode step for an extra reduction/assert launch. A
+                    # violation remains fatal and cannot enter the fallback.
+                    torch._assert_async(
+                        torch.all(live_pages <= config.max_live_pages),
+                        "DFLASH draft ring exceeded its live-page bound.",
+                    )
+                    self._draft_ring_capacity_assert_pending = False
+                block_prepared = compact_block_prepared = ring_block_prepared = True
+
+        if (
+            self._use_triton_prepare_block
+            and self.use_compact_draft_cache
+            and not self.use_physical_draft_ring
+        ):
             try:
                 assert self.draft_window_size is not None
                 _prepare_dflash_compact_draft_block_unchecked(
@@ -1584,7 +1919,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
                     block_ids_out=block_ids,
                     positions_out=positions_2d,
-                    cache_loc_out=verify_out_cache_loc_2d,
+                    cache_loc_out=target_verify_out_cache_loc_2d,
                     draft_seq_lens_out=self._draft_prefix_lens_buf[:bs],
                     block_end_out=self._draft_block_end_buf[:bs],
                     window_size=int(self.draft_window_size),
@@ -1611,7 +1946,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                     block_ids_out=block_ids,
                     positions_out=positions_2d,
-                    cache_loc_out=verify_out_cache_loc_2d,
+                    cache_loc_out=target_verify_out_cache_loc_2d,
                     mask_token_id=int(self._mask_token_id),
                 )
                 block_prepared = True
@@ -1630,7 +1965,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 out=positions_2d,
             )
             end_offset = prefix_lens + block_size
-            verify_out_cache_loc = assign_extend_cache_locs_func(
+            target_verify_out_cache_loc = assign_extend_cache_locs_func(
                 req_pool_indices=batch.req_pool_indices,
                 req_to_token=self.model_runner.req_to_token_pool.req_to_token,
                 start_offset=prefix_lens,
@@ -1639,13 +1974,27 @@ class DFlashWorkerV2(BaseSpecWorker):
                 draft_token_num=block_size,
                 device=device,
             )
-            verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
+            target_verify_out_cache_loc_2d.copy_(
+                target_verify_out_cache_loc.view(bs, block_size)
+            )
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
-        verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
+        target_verify_out_cache_loc = target_verify_out_cache_loc_2d.reshape(-1)
+
+        if self.use_physical_draft_ring and not ring_block_prepared:
+            config = self._draft_ring_config
+            assert config is not None
+            draft_verify_out_cache_loc_2d.copy_(
+                draft_ring_cache_locs(
+                    batch.req_pool_indices.to(torch.int64).unsqueeze(1),
+                    positions_2d,
+                    config,
+                )
+            )
+        draft_verify_out_cache_loc = draft_verify_out_cache_loc_2d.reshape(-1)
 
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
@@ -1663,14 +2012,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
             if not compact_block_prepared:
-                self._rebuild_compact_draft_cache(
-                    req_pool_indices=batch.req_pool_indices,
-                    prefix_lens=prefix_lens,
-                    draft_prefix_lens=draft_prefix_lens,
-                    verify_out_cache_loc_2d=verify_out_cache_loc_2d,
-                    bs=bs,
-                    block_size=block_size,
-                )
+                if self.use_physical_draft_ring:
+                    self._rebuild_draft_ring_cache(
+                        req_pool_indices=batch.req_pool_indices,
+                        prefix_lens=prefix_lens,
+                        draft_prefix_lens=draft_prefix_lens,
+                        draft_verify_out_cache_loc_2d=draft_verify_out_cache_loc_2d,
+                        bs=bs,
+                        block_size=block_size,
+                    )
+                else:
+                    self._rebuild_compact_draft_cache(
+                        req_pool_indices=batch.req_pool_indices,
+                        prefix_lens=prefix_lens,
+                        draft_prefix_lens=draft_prefix_lens,
+                        verify_out_cache_loc_2d=target_verify_out_cache_loc_2d,
+                        bs=bs,
+                        block_size=block_size,
+                    )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
         else:
@@ -1697,7 +2056,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             input_ids=block_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
-            out_cache_loc=verify_out_cache_loc,
+            out_cache_loc=draft_verify_out_cache_loc,
             seq_lens_sum=draft_seq_lens_sum,
             seq_lens_cpu=seq_lens_cpu,
             positions=positions,
@@ -1749,7 +2108,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.FULL,
         )
 
-        batch.out_cache_loc = verify_out_cache_loc
+        batch.out_cache_loc = target_verify_out_cache_loc
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
@@ -1790,16 +2149,16 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # PP result processing is delayed by the ring. Preserve buffer-backed
                 # tensors before the next microbatch reuses the worker scratch space.
                 "positions": positions.clone(),
-                "verify_out_cache_loc": verify_out_cache_loc.clone(),
-                "verify_out_cache_loc_2d": verify_out_cache_loc_2d.clone(),
+                "verify_out_cache_loc": draft_verify_out_cache_loc.clone(),
+                "verify_out_cache_loc_2d": draft_verify_out_cache_loc_2d.clone(),
                 "draft_tokens": draft_tokens.clone(),
                 "sampling_info": sampling_info,
                 "need_mamba_verify_commit": self._need_mamba_verify_commit,
                 "seq_lens_pre_verify": seq_lens_pre_verify,
             }
-            batch._omniva_dflash_pp_ready_event = (
-                torch.get_device_module(self.device).Event()
-            )
+            batch._omniva_dflash_pp_ready_event = torch.get_device_module(
+                self.device
+            ).Event()
             batch._omniva_dflash_pp_ready_event.record(
                 torch.get_device_module(self.device).current_stream()
             )
@@ -1979,8 +2338,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
+            cache_loc=draft_verify_out_cache_loc,
+            cache_loc_2d=draft_verify_out_cache_loc_2d,
             positions=positions,
             commit_lens=commit_lens,
         )
@@ -2050,28 +2409,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             raise RuntimeError(
                 "PP DFLASH requires target aux hidden capture for prefill."
             )
-        if batch.extend_lens is None or batch.prefix_lens is None:
-            raise RuntimeError(
-                "PP DFLASH expected extend_lens and prefix_lens in prefill."
-            )
-        if batch.out_cache_loc is None:
-            raise RuntimeError("PP DFLASH prefill expected out_cache_loc.")
-
-        device = next_token_ids.device
-        ctx_lens = torch.tensor(batch.extend_lens, dtype=torch.int32, device=device)
-        draft_seq_lens = torch.tensor(
-            batch.prefix_lens, dtype=torch.int32, device=device
-        )
-        positions, _ = compute_position(
-            self.model_runner.server_args.attention_backend,
-            draft_seq_lens,
-            ctx_lens,
-            int(sum(batch.extend_lens)),
-        )
-        self._append_target_hidden_to_draft_kv_by_loc(
+        self._append_prefill_target_hidden_to_draft_cache(
+            batch=batch,
             target_hidden=logits_output.hidden_states,
-            cache_loc=batch.out_cache_loc,
-            positions=positions,
         )
         logits_output.hidden_states = None
         result.next_draft_input = self._make_next_draft_input_prefill(
@@ -2088,7 +2428,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._wait_pp_local_forward(batch)
         context = getattr(batch, "_omniva_dflash_pp_context", None)
         if context is None:
-            raise RuntimeError("PP DFLASH verify result is missing local draft context.")
+            raise RuntimeError(
+                "PP DFLASH verify result is missing local draft context."
+            )
         logits_output = result.logits_output
         if logits_output is None or logits_output.next_token_logits is None:
             raise RuntimeError(
@@ -2134,9 +2476,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 uniform_top_k_value=draft_input.uniform_top_k_value,
             )
             commit_lens = accept_len.to(torch.int32) + 1
-            out_tokens = torch.empty(
-                (bs, block_size), dtype=torch.int64, device=device
-            )
+            out_tokens = torch.empty((bs, block_size), dtype=torch.int64, device=device)
             if block_size > 1:
                 out_tokens[:, : block_size - 1].copy_(candidates[:, 1:])
             out_tokens[:, block_size - 1].fill_(0)

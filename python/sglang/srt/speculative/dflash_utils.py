@@ -13,6 +13,7 @@ import triton.language as tl
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
 from sglang.srt.utils import is_cuda, is_hip, is_musa
@@ -629,7 +630,9 @@ def _dflash_greedy_accept_output_kernel(
     valid_match = offsets < (draft_token_num - 1)
     cand_next = tl.load(candidates + base + offsets + 1, mask=valid_match, other=-1)
     pred = tl.load(target_predict + base + offsets, mask=valid_match, other=-2)
-    mismatch_pos = tl.where(valid_match & (cand_next != pred), offsets, draft_token_num - 1)
+    mismatch_pos = tl.where(
+        valid_match & (cand_next != pred), offsets, draft_token_num - 1
+    )
     correct_len = tl.min(mismatch_pos, axis=0)
 
     bonus_token = tl.load(target_predict + base + correct_len)
@@ -964,6 +967,9 @@ def build_dflash_verify_target_probs(
 def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
     if req.return_logprob:
         return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.get() and req.session is not None:
+        return "SGLANG_OMNIVA_DFLASH_DRAFT_RING does not yet support session requests."
 
     if enable_overlap and req.return_hidden_states:
         return "DFLASH speculative decoding does not support return_hidden_states yet."

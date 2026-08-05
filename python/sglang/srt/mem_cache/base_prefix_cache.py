@@ -383,6 +383,24 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # content-stable and overrides this where relevant.
         return 0
 
+    def reprefill_tail_tokens(self) -> int:
+        """Tail that must be recomputed for any request-scoped cache layout."""
+        from sglang.srt.environ import envs
+
+        tail = self.swa_reprefill_tail_tokens()
+        if not envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.get():
+            return tail
+
+        from sglang.srt.runtime_context import get_server_args
+        from sglang.srt.speculative.dflash_draft_ring import (
+            configured_dflash_draft_ring_reprefill_tail_tokens,
+        )
+
+        return max(
+            tail,
+            configured_dflash_draft_ring_reprefill_tail_tokens(get_server_args()),
+        )
+
     def supports_mamba(self) -> bool:
         return False
 

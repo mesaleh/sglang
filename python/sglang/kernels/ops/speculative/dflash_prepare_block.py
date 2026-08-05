@@ -238,9 +238,13 @@ def _prepare_dflash_compact_draft_block_unchecked(
         return
 
     if target_req_to_token.ndim != 2 or target_req_to_token.stride(1) != 1:
-        raise ValueError("DFLASH compact prepare requires row-major target req_to_token.")
+        raise ValueError(
+            "DFLASH compact prepare requires row-major target req_to_token."
+        )
     if draft_req_to_token.ndim != 2 or draft_req_to_token.stride(1) != 1:
-        raise ValueError("DFLASH compact prepare requires row-major draft req_to_token.")
+        raise ValueError(
+            "DFLASH compact prepare requires row-major draft req_to_token."
+        )
     if not _is_row_major_contiguous_2d(block_ids_out):
         raise ValueError("DFLASH compact prepare requires contiguous block_ids_out.")
     if not _is_row_major_contiguous_2d(positions_out):
@@ -284,6 +288,230 @@ def _prepare_dflash_compact_draft_block_unchecked(
         int(page_size),
         block_size,
         int(max_compact_len),
+        int(mask_token_id),
+        BLOCK_COPY=block_copy,
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _prepare_dflash_ring_draft_block_kernel(
+    verified_id_ptr,
+    prefix_lens_ptr,
+    req_pool_indices_ptr,
+    target_req_to_token_ptr,
+    draft_req_to_token_ptr,
+    block_ids_out_ptr,
+    positions_out_ptr,
+    target_cache_loc_out_ptr,
+    draft_cache_loc_out_ptr,
+    draft_seq_lens_out_ptr,
+    block_end_out_ptr,
+    live_pages_out_ptr,
+    verified_id_stride,
+    prefix_lens_stride,
+    req_pool_indices_stride,
+    target_req_to_token_row_stride,
+    draft_req_to_token_row_stride,
+    block_ids_row_stride,
+    positions_row_stride,
+    target_cache_loc_row_stride,
+    draft_cache_loc_row_stride,
+    target_req_to_token_width: tl.constexpr,
+    draft_req_to_token_width: tl.constexpr,
+    request_rows: tl.constexpr,
+    window_size: tl.constexpr,
+    page_size: tl.constexpr,
+    block_size: tl.constexpr,
+    max_compact_len: tl.constexpr,
+    max_live_pages: tl.constexpr,
+    ring_pages: tl.constexpr,
+    row_stride: tl.constexpr,
+    mask_token_id: tl.constexpr,
+    BLOCK_COPY: tl.constexpr,
+):
+    """Prepare DFlash with separate target-global and draft-ring locations."""
+    row = tl.program_id(0)
+    copy_block = tl.program_id(1)
+    offsets = copy_block * BLOCK_COPY + tl.arange(0, BLOCK_COPY)
+
+    prefix_len = tl.load(prefix_lens_ptr + row * prefix_lens_stride).to(tl.int64)
+    req_idx = tl.load(req_pool_indices_ptr + row * req_pool_indices_stride).to(tl.int64)
+    verified_id = tl.load(verified_id_ptr + row * verified_id_stride)
+
+    visible_len = tl.minimum(prefix_len, window_size)
+    visible_start = prefix_len - visible_len
+    aligned_start = visible_start - (visible_start % page_size)
+    draft_len = prefix_len - aligned_start
+    block_end = draft_len + block_size
+
+    draft_row = draft_req_to_token_ptr + req_idx * draft_req_to_token_row_stride
+    in_draft_prefix = offsets < draft_len
+    absolute_pos = tl.where(
+        in_draft_prefix,
+        aligned_start + offsets,
+        prefix_len + (offsets - draft_len),
+    )
+    ring_page = (absolute_pos // page_size) % ring_pages
+    ring_loc = (
+        page_size
+        + req_idx * row_stride
+        + ring_page * page_size
+        + absolute_pos % page_size
+    )
+    copy_mask = (
+        (offsets < block_end)
+        & (offsets < (max_compact_len + block_size))
+        & (offsets < draft_req_to_token_width)
+        & (absolute_pos >= 0)
+        & (req_idx >= 0)
+        & (req_idx < request_rows)
+    )
+    tl.store(draft_row + offsets, ring_loc.to(tl.int32), mask=copy_mask)
+
+    meta_mask = copy_block == 0
+    first_live_page = aligned_start // page_size
+    last_live_page = (prefix_len + block_size - 1) // page_size
+    live_pages = last_live_page - first_live_page + 1
+    tl.device_assert(
+        (~meta_mask) | (live_pages <= max_live_pages),
+        "DFLASH draft ring live span exceeds the guard-page bound",
+    )
+    tl.store(draft_seq_lens_out_ptr + row, draft_len.to(tl.int32), mask=meta_mask)
+    tl.store(block_end_out_ptr + row, block_end.to(tl.int32), mask=meta_mask)
+    tl.store(live_pages_out_ptr + row, live_pages.to(tl.int32), mask=meta_mask)
+
+    block_mask = meta_mask & (offsets < block_size)
+    block_pos = prefix_len + offsets
+    target_row = target_req_to_token_ptr + req_idx * target_req_to_token_row_stride
+    target_slot_ids = tl.load(
+        target_row + block_pos,
+        mask=block_mask
+        & (req_idx >= 0)
+        & (req_idx < request_rows)
+        & (block_pos < target_req_to_token_width),
+        other=0,
+    )
+    draft_block_page = (block_pos // page_size) % ring_pages
+    draft_slot_ids = (
+        page_size
+        + req_idx * row_stride
+        + draft_block_page * page_size
+        + block_pos % page_size
+    )
+    block_ids = tl.full((BLOCK_COPY,), mask_token_id, tl.int64)
+    block_ids = tl.where(offsets == 0, verified_id.to(tl.int64), block_ids)
+    tl.store(
+        block_ids_out_ptr + row * block_ids_row_stride + offsets,
+        block_ids,
+        mask=block_mask,
+    )
+    tl.store(
+        positions_out_ptr + row * positions_row_stride + offsets,
+        block_pos,
+        mask=block_mask,
+    )
+    tl.store(
+        target_cache_loc_out_ptr + row * target_cache_loc_row_stride + offsets,
+        target_slot_ids.to(tl.int64),
+        mask=block_mask,
+    )
+    tl.store(
+        draft_cache_loc_out_ptr + row * draft_cache_loc_row_stride + offsets,
+        draft_slot_ids.to(tl.int64),
+        mask=block_mask,
+    )
+
+
+def _prepare_dflash_ring_draft_block_unchecked(
+    *,
+    verified_id: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    target_req_to_token: torch.Tensor,
+    draft_req_to_token: torch.Tensor,
+    block_ids_out: torch.Tensor,
+    positions_out: torch.Tensor,
+    target_cache_loc_out: torch.Tensor,
+    draft_cache_loc_out: torch.Tensor,
+    draft_seq_lens_out: torch.Tensor,
+    block_end_out: torch.Tensor,
+    live_pages_out: torch.Tensor,
+    request_rows: int,
+    window_size: int,
+    page_size: int,
+    max_compact_len: int,
+    max_live_pages: int,
+    ring_pages: int,
+    row_stride: int,
+    mask_token_id: int,
+) -> None:
+    batch_size = int(verified_id.numel())
+    if batch_size == 0:
+        return
+
+    if target_req_to_token.ndim != 2 or target_req_to_token.stride(1) != 1:
+        raise ValueError("DFLASH ring prepare requires row-major target req_to_token.")
+    if draft_req_to_token.ndim != 2 or draft_req_to_token.stride(1) != 1:
+        raise ValueError("DFLASH ring prepare requires row-major draft req_to_token.")
+    for name, out in (
+        ("block_ids_out", block_ids_out),
+        ("positions_out", positions_out),
+        ("target_cache_loc_out", target_cache_loc_out),
+        ("draft_cache_loc_out", draft_cache_loc_out),
+    ):
+        if not _is_row_major_contiguous_2d(out):
+            raise ValueError(f"DFLASH ring prepare requires contiguous {name}.")
+    if int(request_rows) <= 0:
+        raise ValueError(f"request_rows must be positive, got {request_rows}.")
+    if int(ring_pages) != int(max_live_pages) + 1:
+        raise ValueError(
+            "DFLASH ring requires exactly one guard page: "
+            f"ring_pages={ring_pages}, max_live_pages={max_live_pages}."
+        )
+    if int(row_stride) != int(ring_pages) * int(page_size):
+        raise ValueError(
+            "DFLASH ring row stride must be page aligned: "
+            f"row_stride={row_stride}, ring_pages={ring_pages}, page_size={page_size}."
+        )
+
+    block_size = int(block_ids_out.shape[1])
+    block_copy = 256
+    copy_len = int(max_compact_len) + block_size
+    _prepare_dflash_ring_draft_block_kernel[
+        (batch_size, triton.cdiv(copy_len, block_copy))
+    ](
+        verified_id,
+        prefix_lens,
+        req_pool_indices,
+        target_req_to_token,
+        draft_req_to_token,
+        block_ids_out,
+        positions_out,
+        target_cache_loc_out,
+        draft_cache_loc_out,
+        draft_seq_lens_out,
+        block_end_out,
+        live_pages_out,
+        verified_id.stride(0),
+        prefix_lens.stride(0),
+        req_pool_indices.stride(0),
+        target_req_to_token.stride(0),
+        draft_req_to_token.stride(0),
+        block_ids_out.stride(0),
+        positions_out.stride(0),
+        target_cache_loc_out.stride(0),
+        draft_cache_loc_out.stride(0),
+        int(target_req_to_token.shape[1]),
+        int(draft_req_to_token.shape[1]),
+        int(request_rows),
+        int(window_size),
+        int(page_size),
+        block_size,
+        int(max_compact_len),
+        int(max_live_pages),
+        int(ring_pages),
+        int(row_stride),
         int(mask_token_id),
         BLOCK_COPY=block_copy,
         num_warps=4,
