@@ -785,6 +785,9 @@ class Envs:
 
     # Overlap Spec V2
     SGLANG_OMNIVA_DFLASH_PP2 = EnvBool(False)
+    # Research gate: use a physically bounded, request-scoped DFlash draft-KV
+    # ring instead of target-global slot IDs. Default off until S8 qualifies.
+    SGLANG_OMNIVA_DFLASH_DRAFT_RING = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     SGLANG_DFLASH_GREEDY_VERIFY_ARGMAX = EnvBool(False)
 
