@@ -703,32 +703,101 @@ class TestDFlashDraftRing(unittest.TestCase):
 
         memory_pool_config = object()
         target_req_pool = object()
-        target_allocator = object()
-        for compact, expected_req_pool in (
-            (False, target_req_pool),
-            (True, None),
-        ):
+        target_kv_pool = object()
+        target_allocator = SimpleNamespace(get_kvcache=lambda: target_kv_pool)
+        for compact in (False, True):
             with self.subTest(compact=compact):
                 captured = {}
+                draft_runner = SimpleNamespace()
+                current_target_req_pool = (
+                    SimpleNamespace(_alloc_size=9) if compact else target_req_pool
+                )
+                expected_req_pool = None if compact else current_target_req_pool
 
                 class FakeDraftWorker:
                     def alloc_memory_pool(self, **kwargs):
                         captured.update(kwargs)
+                        if compact:
+                            draft_runner.req_to_token_pool = SimpleNamespace(
+                                _alloc_size=9
+                            )
+                            draft_runner.token_to_kv_pool_allocator = target_allocator
+                            draft_runner.token_to_kv_pool = SimpleNamespace(size=262144)
 
                 fake_worker = SimpleNamespace(
                     use_physical_draft_ring=False,
                     use_compact_draft_cache=compact,
                     _draft_worker=FakeDraftWorker(),
+                    draft_model_runner=draft_runner,
+                    ps=SimpleNamespace(tp_rank=1),
+                )
+                fake_worker._attest_dense_draft_pool_allocation = lambda **kwargs: (
+                    DFlashWorkerV2._attest_dense_draft_pool_allocation(
+                        fake_worker, **kwargs
+                    )
                 )
                 DFlashWorkerV2.alloc_memory_pool(
                     fake_worker,
                     memory_pool_config=memory_pool_config,
-                    req_to_token_pool=target_req_pool,
+                    req_to_token_pool=current_target_req_pool,
                     token_to_kv_pool_allocator=target_allocator,
                 )
                 self.assertIs(captured["memory_pool_config"], memory_pool_config)
                 self.assertIs(captured["req_to_token_pool"], expected_req_pool)
                 self.assertIs(captured["token_to_kv_pool_allocator"], target_allocator)
+
+    def test_dense_compact_allocation_attestation_fails_closed(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        target_kv_pool = object()
+        target_allocator = SimpleNamespace(get_kvcache=lambda: target_kv_pool)
+        target_req_pool = SimpleNamespace(_alloc_size=9)
+        draft_req_pool = SimpleNamespace(_alloc_size=9)
+        draft_kv_pool = SimpleNamespace(size=262144)
+        worker = SimpleNamespace(
+            use_compact_draft_cache=True,
+            draft_model_runner=SimpleNamespace(
+                req_to_token_pool=draft_req_pool,
+                token_to_kv_pool_allocator=target_allocator,
+                token_to_kv_pool=draft_kv_pool,
+            ),
+            ps=SimpleNamespace(tp_rank=0),
+        )
+        with patch("sglang.srt.speculative.dflash_worker_v2.logger.info") as info:
+            DFlashWorkerV2._attest_dense_draft_pool_allocation(
+                worker,
+                target_req_to_token_pool=target_req_pool,
+                target_token_allocator=target_allocator,
+            )
+        info.assert_called_once()
+        self.assertIn("allocator_shared=True", info.call_args.args[0])
+
+        worker.draft_model_runner.token_to_kv_pool_allocator = object()
+        with self.assertRaisesRegex(RuntimeError, "not co-located"):
+            DFlashWorkerV2._attest_dense_draft_pool_allocation(
+                worker,
+                target_req_to_token_pool=target_req_pool,
+                target_token_allocator=target_allocator,
+            )
+
+    def test_prepare_path_latch_logs_once_on_tp0(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        worker = SimpleNamespace(
+            _logged_first_prepare_path=False,
+            ps=SimpleNamespace(tp_rank=0),
+        )
+        with patch("sglang.srt.speculative.dflash_worker_v2.logger.info") as info:
+            DFlashWorkerV2._latch_first_prepare_path(
+                worker, "triton_dense_compact", 7
+            )
+            DFlashWorkerV2._latch_first_prepare_path(worker, "triton_ring", 1)
+        info.assert_called_once_with(
+            "DFLASH prepare path latched: path=%s, batch_size=%d.",
+            "triton_dense_compact",
+            7,
+        )
+        self.assertTrue(worker._logged_first_prepare_path)
 
     def test_prefill_rejects_hidden_row_contract_drift(self):
         from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2

@@ -220,6 +220,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_snapshot_directory: Optional[DFlashDraftSnapshotDirectory] = None
         self._logged_first_draft_snapshot_publication = False
         self._logged_first_draft_snapshot_restore = False
+        self._logged_first_prepare_path = False
         self.device = target_worker.device
 
         self._warned_sampling_fallback = False
@@ -776,6 +777,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+            self._attest_dense_draft_pool_allocation(
+                target_req_to_token_pool=req_to_token_pool,
+                target_token_allocator=token_to_kv_pool_allocator,
+            )
             return
 
         if memory_pool_config is None or req_to_token_pool is None:
@@ -871,6 +876,67 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 draft_kv_bytes,
             )
+
+    def _attest_dense_draft_pool_allocation(
+        self,
+        *,
+        target_req_to_token_pool,
+        target_token_allocator,
+    ) -> None:
+        """Fail closed on the index/storage topology used by dense DFLASH."""
+
+        if not self.use_compact_draft_cache:
+            return
+        if target_req_to_token_pool is None or target_token_allocator is None:
+            raise RuntimeError(
+                "DFLASH dense compact allocation requires the resolved target "
+                "request pool and token allocator."
+            )
+
+        draft_req_pool = self.draft_model_runner.req_to_token_pool
+        draft_allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        draft_kv_pool = self.draft_model_runner.token_to_kv_pool
+        target_kv_pool = target_token_allocator.get_kvcache()
+        target_rows = int(target_req_to_token_pool._alloc_size)
+        draft_rows = int(draft_req_pool._alloc_size)
+        if draft_allocator is not target_token_allocator:
+            raise RuntimeError(
+                "DFLASH dense compact draft indices are not co-located with "
+                "the target allocator."
+            )
+        if draft_req_pool is target_req_to_token_pool:
+            raise RuntimeError(
+                "DFLASH dense compact draft request mapping must remain private."
+            )
+        if draft_kv_pool is target_kv_pool:
+            raise RuntimeError(
+                "DFLASH dense compact draft KV storage must remain separate "
+                "from target KV storage."
+            )
+        if target_rows != draft_rows:
+            raise RuntimeError(
+                "DFLASH dense compact request rows drifted from the target pool: "
+                f"draft={draft_rows}, target={target_rows}."
+            )
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH dense compact allocation attested: request_rows=%d, "
+                "draft_tokens=%d, allocator_shared=True, "
+                "request_pool_private=True, kv_storage_private=True.",
+                draft_rows,
+                int(draft_kv_pool.size),
+            )
+
+    def _latch_first_prepare_path(self, path: str, batch_size: int) -> None:
+        if self._logged_first_prepare_path:
+            return
+        if self.ps.tp_rank == 0:
+            logger.info(
+                "DFLASH prepare path latched: path=%s, batch_size=%d.",
+                path,
+                batch_size,
+            )
+        self._logged_first_prepare_path = True
 
     def init_attention_backends(self):
         self._draft_worker.init_attention_backends()
@@ -2276,6 +2342,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
                     self._draft_ring_capacity_assert_pending = False
                 block_prepared = compact_block_prepared = ring_block_prepared = True
+                self._latch_first_prepare_path("triton_ring", bs)
 
         if (
             self._use_triton_prepare_block
@@ -2303,6 +2370,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     mask_token_id=int(self._mask_token_id),
                 )
                 block_prepared = compact_block_prepared = True
+                self._latch_first_prepare_path("triton_dense_compact", bs)
             except Exception as e:
                 logger.warning(
                     "DFLASH Triton compact prepare_block failed; "
