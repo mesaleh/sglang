@@ -20,12 +20,14 @@ from sglang.srt.speculative.dflash_draft_ring import DFlashDraftRingConfig
 
 _HASH_DOMAIN = b"sglang-dflash-draft-snapshot-v1\0"
 _TELEMETRY_PREFIX = "DFLASH_SNAPSHOT_TELEMETRY "
+_DEFAULT_MIN_PREFIX_LENGTH = 10_208
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class DFlashDraftSnapshotConfig:
     ring: DFlashDraftRingConfig
+    min_prefix_length: int
     snapshot_rows: int
     physical_slots: int
     service_slots: int
@@ -45,11 +47,18 @@ class DFlashDraftSnapshotConfig:
 def build_dflash_draft_snapshot_config(
     ring: DFlashDraftRingConfig,
     *,
+    min_prefix_length: int = _DEFAULT_MIN_PREFIX_LENGTH,
     physical_slots: int = 21,
     service_slots: int = 20,
 ) -> DFlashDraftSnapshotConfig:
+    min_prefix_length = int(min_prefix_length)
     physical_slots = int(physical_slots)
     service_slots = int(service_slots)
+    if min_prefix_length <= 0 or min_prefix_length % int(ring.page_size):
+        raise ValueError(
+            "min_prefix_length must be positive and page aligned: "
+            f"prefix={min_prefix_length}, page={ring.page_size}"
+        )
     if physical_slots <= 0:
         raise ValueError("physical_slots must be positive")
     if service_slots <= 0 or service_slots >= physical_slots:
@@ -69,6 +78,7 @@ def build_dflash_draft_snapshot_config(
     pool_size = padded_tokens - int(ring.page_size)
     return DFlashDraftSnapshotConfig(
         ring=ring,
+        min_prefix_length=min_prefix_length,
         snapshot_rows=snapshot_rows,
         physical_slots=physical_slots,
         service_slots=service_slots,
@@ -272,13 +282,18 @@ class DFlashDraftSnapshotDirectory:
         normal_boundary = int(normal_boundary)
         full_boundary = int(full_boundary)
         max_delta = int(max_delta)
-        if full_boundary <= normal_boundary or max_delta < 0:
+        if (
+            full_boundary <= normal_boundary
+            or full_boundary < self.config.min_prefix_length
+            or max_delta < 0
+        ):
             return None
 
         boundaries = {
             key.prefix_length
             for key in self._resident
-            if normal_boundary < key.prefix_length <= full_boundary
+            if self.config.min_prefix_length <= key.prefix_length <= full_boundary
+            and normal_boundary < key.prefix_length
             and full_boundary - key.prefix_length <= max_delta
         }
         keys = {
@@ -302,6 +317,12 @@ class DFlashDraftSnapshotDirectory:
         self, key: DFlashSnapshotKey, *, valid_rows: int
     ) -> DFlashSnapshotPublication:
         valid_rows = int(valid_rows)
+        if key.prefix_length < self.config.min_prefix_length:
+            raise ValueError(
+                "snapshot publication boundary is below min_prefix_length: "
+                f"boundary={key.prefix_length}, "
+                f"minimum={self.config.min_prefix_length}"
+            )
         if key.prefix_length % self.config.ring.page_size:
             raise ValueError("snapshot publication boundary must be page aligned")
         if valid_rows != min(key.prefix_length, self.config.snapshot_rows):

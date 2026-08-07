@@ -563,7 +563,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             boundary = (
                 int(req.kv_committed_len) // int(self.page_size) * int(self.page_size)
             )
-            if boundary <= 0:
+            if boundary < self._draft_snapshot_config.min_prefix_length:
+                # Preserve fixed collective arity with an explicit no-key
+                # sentinel, but do not hash, reserve, or copy short prefixes.
                 candidates.append((req, None, 0, None))
                 continue
             error = None
