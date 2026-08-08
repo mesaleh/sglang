@@ -26,9 +26,14 @@ from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import FP4
 
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.common import is_sm120_supported
+
+if is_sm120_supported():
+    # use the regular gather/scatter implementation for unsupported devices.
+    update_opt_flags_constraints({"is_persistent": False})
 
 if is_cuda():
-    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
 else:
     from sgl_kernel import gelu_and_mul, silu_and_mul
 

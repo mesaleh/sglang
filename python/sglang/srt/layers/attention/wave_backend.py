@@ -14,7 +14,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.triton_backend import pick_num_kv_splits_ceiling
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import get_bool_env_var, get_device_core_count
 
 if TYPE_CHECKING:
@@ -93,7 +93,7 @@ class WaveAttnBackend(AttentionBackend):
                 (max_bs + 1,), dtype=torch.int64, device=model_runner.device
             )
 
-        self.num_draft_tokens = model_runner.server_args.speculative_num_draft_tokens
+        self.num_draft_tokens = get_spec().speculative_num_draft_tokens
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size

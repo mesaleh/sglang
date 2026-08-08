@@ -139,7 +139,7 @@ def batched_quantize(
             ||centroids[indices]||, used for norm correction in rotspace dequant.
     """
 
-    from sglang.jit_kernel.hadamard import hadamard_transform
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     tokens, heads, dim = x.shape
 
@@ -206,7 +206,7 @@ def batched_dequantize(
     Returns:
         x_hat: (tokens, heads, dim) bfloat16 — in original domain.
     """
-    from sglang.jit_kernel.hadamard import hadamard_transform
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform
 
     tokens, heads, packed_dim = packed.shape
 
@@ -371,7 +371,7 @@ class TurboQuantConfig:
         Returns:
             q_rot: same shape and dtype as q, in WHT-rotated domain.
         """
-        from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+        from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
         wht_scale = 1.0 / math.sqrt(self.head_dim)
         return hadamard_transform_with_signs(q, self.signs1, self.signs2, scale=wht_scale)
 
@@ -384,7 +384,7 @@ class TurboQuantConfig:
         Returns:
             o_orig: same shape and dtype as o, in original domain.
         """
-        from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+        from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
         wht_scale = 1.0 / math.sqrt(self.head_dim)
         return hadamard_transform_with_signs(o, self.signs2, self.signs1, scale=wht_scale)
 
@@ -401,7 +401,7 @@ class TurboQuantConfig:
         Returns:
             Transformed weight with inverse rotation baked in.
         """
-        from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+        from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
         dtype = o_proj_weight.dtype
         dim = self.head_dim
         hidden = o_proj_weight.shape[1]

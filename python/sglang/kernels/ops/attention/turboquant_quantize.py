@@ -528,7 +528,7 @@ def fused_turboquant_quantize_and_store(
     Eliminates temp tensors and scatter store kernels.
     """
     import torch
-    from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
 
     tokens, heads, dim = x.shape
     use_workspace = (
@@ -657,7 +657,7 @@ def fused_turboquant_quantize_and_store_kv(
     3. Batched pack+store for K and V (1 Triton kernel)
     """
     import torch
-    from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
 
     tokens, heads, dim = cache_k.shape
     BLOCK_DIM = triton.next_power_of_2(dim)
@@ -808,7 +808,7 @@ def fused_turboquant_quantize(x, signs1, signs2, centroids, boundaries, bit_widt
     tokens, heads, dim = x.shape
 
     # --- PyTorch ops (norm + normalize + WHT) ---
-    from sglang.jit_kernel.hadamard import hadamard_transform_with_signs
+    from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
 
     # Fused norm + normalize: 1 Triton kernel instead of 3 PyTorch ops
     BLOCK_DIM = triton.next_power_of_2(dim)
