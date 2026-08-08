@@ -387,7 +387,7 @@ class TestTurboQuantGPU(unittest.TestCase):
 
     def test_wht_self_inverse(self):
         """Normalized WHT applied twice should return the original."""
-        from sglang.jit_kernel.hadamard import hadamard_transform
+        from sglang.kernels.ops.quantization.hadamard import hadamard_transform
         import math
         torch.manual_seed(0)
         x = torch.randn(8, 4, 128, device=self.device, dtype=torch.float32)

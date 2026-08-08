@@ -4,7 +4,7 @@ import sys
 import pytest
 from cutlass._mlir.dialects import nvvm
 
-from sglang.jit_kernel.flash_attn.cute.utils import (
+from sglang.kernels.ops.attention.flash_attn.cute.utils import (
     _NVVM_FMAX_REQUIRES_EXPLICIT_RESULT_TYPE,
     _nvvm_fmax_requires_explicit_result_type,
 )
