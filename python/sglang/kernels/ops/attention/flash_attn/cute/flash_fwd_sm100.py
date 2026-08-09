@@ -2761,8 +2761,8 @@ class FlashAttentionForwardSm100:
                     staggered_bias_loads = (
                         dummy_first_bias_load or (bias_max_idx0 > bias_max_idx1)
                     ) and const_expr(self.q_stage == 2)
+                n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
-                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
                         if const_expr(mPageTable is not None and self.use_tma_KV)
