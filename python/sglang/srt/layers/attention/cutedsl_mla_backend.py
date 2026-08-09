@@ -148,7 +148,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        if not get_parallel().dcp_enabled:
+        if not get_parallel().dcp_enabled or getattr(
+            self, "_use_global_block_kv_indices", False
+        ):
             return super()._create_block_kv_indices(
                 batch_size,
                 max_blocks,
@@ -220,6 +222,14 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 forward_mode,
                 spec_info=spec_info,
             )
+        if forward_mode.is_draft_extend_v2():
+            return super()._apply_cuda_graph_metadata(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                forward_mode,
+                spec_info=spec_info,
+            )
         if self._is_draft_frontier_spec(forward_mode, spec_info, bs):
             raise RuntimeError(
                 "cutedsl_mla DCP CUDA graph metadata does not support "
@@ -236,15 +246,6 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             metadata.seq_lens_k.copy_(
                 self._get_dcp_local_seq_lens(metadata.global_seq_lens_k)
             )
-            local_seq_lens = metadata.seq_lens_k
-        elif forward_mode.is_draft_extend_v2():
-            num_tokens_per_req = self.num_draft_tokens
-            metadata.max_seq_len_q = num_tokens_per_req
-            metadata.sum_seq_lens_q = num_tokens_per_req * bs
-            seq_lens = seq_lens[:bs]
-            metadata.seq_lens_k.copy_(seq_lens)
-            # Draft-extend still uses the non-DCP decode kernel in the TRTLLM
-            # MLA forward path, so keep the page table global.
             local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
@@ -263,7 +264,18 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        super().init_forward_metadata(forward_batch)
+        use_global_block_kv = (
+            get_parallel().dcp_enabled and forward_batch.forward_mode.is_draft_extend_v2()
+        )
+        old_use_global_block_kv = getattr(
+            self, "_use_global_block_kv_indices", False
+        )
+        if use_global_block_kv:
+            self._use_global_block_kv_indices = True
+        try:
+            super().init_forward_metadata(forward_batch)
+        finally:
+            self._use_global_block_kv_indices = old_use_global_block_kv
         if (
             get_parallel().dcp_enabled
             and self.forward_decode_metadata is not None

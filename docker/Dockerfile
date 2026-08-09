@@ -257,15 +257,26 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            set -e; \
            cu13_wheels="$(mktemp)" && \
            pip list --format=freeze > "${cu13_wheels}" && \
-           awk -F'==' '/-cu13(==|$)/ {print $1}' "${cu13_wheels}" \
-               | xargs -r python3 -m pip uninstall -y && \
-           rm -f "${cu13_wheels}" && \
+           cu13_names="$(mktemp)" && \
+           awk -F'==' '/-cu13(==|$)/ {print $1}' "${cu13_wheels}" > "${cu13_names}" && \
+           test -s "${cu13_names}" && \
+           xargs -r python3 -m pip uninstall -y < "${cu13_names}" && \
+           rm -f "${cu13_wheels}" "${cu13_names}" && \
            cutlass_dsl_version="$(python3 -c 'import pathlib, re, sys; text = pathlib.Path("pyproject.toml").read_text(); m = re.search(r"\"nvidia-cutlass-dsl(?:\[cu13\])?==([^\"]+)\"", text); sys.exit("missing nvidia-cutlass-dsl pin") if m is None else print(m.group(1))')" && \
            python3 -m pip install --force-reinstall --no-deps \
                "nvidia-cutlass-dsl-libs-base==${cutlass_dsl_version}" && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" "numpy<2.4" --force-reinstall && \
-           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
+           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall --no-deps && \
+           post_cu13_wheels="$(mktemp)" && \
+           pip list --format=freeze > "${post_cu13_wheels}" && \
+           if awk -F'==' '/-cu13(==|$)/ {found=1; print} END {exit found ? 0 : 1}' "${post_cu13_wheels}"; then \
+               echo "CUDA 13 wheels remain in CUDA 12 image after repair" >&2; \
+               rm -f "${post_cu13_wheels}"; \
+               exit 1; \
+           fi && \
+           rm -f "${post_cu13_wheels}" && \
+           python3 -m pip check; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
