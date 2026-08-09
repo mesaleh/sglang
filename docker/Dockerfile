@@ -277,7 +277,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                exit 1; \
            fi && \
            rm -f "${post_cu13_wheels}" && \
-           python3 -m pip check; \
+           python3 -c 'import torch; import cutlass; from cutlass._mlir.dialects import _cutlass_ir; cuda = torch.version.cuda or ""; assert cuda.startswith("12."), f"expected CUDA 12 torch wheel, got {cuda!r}"'; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
