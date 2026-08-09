@@ -263,9 +263,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                xargs -r python3 -m pip uninstall -y < "${cu13_names}"; \
            fi && \
            rm -f "${cu13_wheels}" "${cu13_names}" && \
-           cutlass_dsl_version="$(python3 -c 'import pathlib, re, sys; text = pathlib.Path("pyproject.toml").read_text(); m = re.search(r"\"nvidia-cutlass-dsl(?:\[cu13\])?==([^\"]+)\"", text); sys.exit("missing nvidia-cutlass-dsl pin") if m is None else print(m.group(1))')" && \
+           cutlass_dsl_version="$(python3 -c 'import pathlib, re, sys; text = pathlib.Path("pyproject.toml").read_text(); m = re.search(r"\"nvidia-cutlass-dsl(?:\[cu(?:12|13)\])?==([^\"]+)\"", text); sys.exit("missing nvidia-cutlass-dsl pin") if m is None else print(m.group(1))')" && \
            python3 -m pip install --force-reinstall --no-deps \
-               "nvidia-cutlass-dsl-libs-base==${cutlass_dsl_version}" && \
+               "nvidia-cutlass-dsl==${cutlass_dsl_version}" \
+               "nvidia-cutlass-dsl-libs-core==${cutlass_dsl_version}" \
+               "nvidia-cutlass-dsl-libs-base==${cutlass_dsl_version}" \
+               "nvidia-cutlass-dsl-libs-cu12==${cutlass_dsl_version}" && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" "numpy<2.4" --force-reinstall && \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall --no-deps && \
@@ -277,7 +280,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                exit 1; \
            fi && \
            rm -f "${post_cu13_wheels}" && \
-           python3 -c 'import torch; import cutlass; from cutlass._mlir.dialects import _cutlass_ir; cuda = torch.version.cuda or ""; assert cuda.startswith("12."), f"expected CUDA 12 torch wheel, got {cuda!r}"'; \
+           python3 -c 'import torch; import cutlass.cute as cute; from cutlass.cute import Float32; from cutlass._mlir._mlir_libs import _cutlass_ir; cuda = torch.version.cuda or ""; assert cuda.startswith("12."), f"expected CUDA 12 torch wheel, got {cuda!r}"'; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -830,7 +833,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         "cuda-pathfinder>=1.4.2,<2" \
         "setuptools>=80,<82" \
     && cp -a /usr/lib/$(uname -m)-linux-gnu/libgdrapi.so* /usr/lib/ \
-    && python3 -c "import cutlass; import sglang.srt.models.kimi_k25"
+    && python3 -c "import cutlass.cute as cute; from cutlass.cute import Float32; import sglang.srt.models.kimi_k25; from sglang.srt.models.inkling_common.attn import cute as inkling_cute; assert inkling_cute is not None" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           python3 -c "from cutlass._mlir._mlir_libs import _cutlass_ir"; \
+       fi
 
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
@@ -992,6 +998,12 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 
 # Fix DeepEP IBGDA symlink in runtime
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
+
+# Validate imports in the shipped runtime stage after the framework-stage copy.
+RUN python3 -c "import cutlass.cute as cute; from cutlass.cute import Float32; import sglang.srt.models.kimi_k25; from sglang.srt.models.inkling_common.attn import cute as inkling_cute; assert inkling_cute is not None" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           python3 -c "from cutlass._mlir._mlir_libs import _cutlass_ir"; \
+       fi
 
 WORKDIR /sgl-workspace/sglang
 
