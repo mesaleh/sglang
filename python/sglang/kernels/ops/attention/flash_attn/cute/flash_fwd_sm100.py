@@ -4048,6 +4048,7 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
                 n_block_min_causal_local_mask = n_block_min
+                n_block_min_before_local_mask = n_block_min
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
                     if const_expr(self.has_bias) and (
                         const_expr(not self.is_split_kv) or num_bias_loads > 0
