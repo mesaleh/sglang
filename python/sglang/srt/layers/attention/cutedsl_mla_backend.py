@@ -185,8 +185,10 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             req_pool_indices=req_pool_indices,
             spec_info=spec_info,
         )
-        if get_parallel().dcp_enabled and not getattr(
-            self.forward_decode_metadata, "is_draft_frontier", False
+        if (
+            get_parallel().dcp_enabled
+            and not getattr(self.forward_decode_metadata, "is_draft_frontier", False)
+            and not forward_mode.is_draft_extend_v2()
         ):
             metadata = self.forward_decode_metadata
             if metadata.global_seq_lens_k is None:
@@ -241,7 +243,9 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            # Draft-extend still uses the non-DCP decode kernel in the TRTLLM
+            # MLA forward path, so keep the page table global.
+            local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
             # Hoist: refresh the int32 global + rank-local lens once per step
@@ -266,7 +270,6 @@ class CuteDslMLABackend(TRTLLMMLABackend):
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
             metadata = self.forward_decode_metadata
@@ -307,6 +310,8 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         max_seq_len: int,
         layer: RadixAttention,
+        custom_mask: Optional[torch.Tensor] = None,
+        custom_mask_offsets: Optional[torch.Tensor] = None,
         *,
         causal_seqs: Optional[torch.Tensor] = None,
         cp_world: int = 1,
@@ -322,7 +327,18 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         """
         if cp_world <= 1:
             return super()._run_decode_kernel(
-                query, kv_cache, block_tables, seq_lens, max_seq_len, layer
+                query,
+                kv_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                layer,
+                custom_mask=custom_mask,
+                custom_mask_offsets=custom_mask_offsets,
+            )
+        if custom_mask is not None or custom_mask_offsets is not None:
+            raise RuntimeError(
+                "cutedsl_mla DCP decode does not support custom-mask tree replay."
             )
         if causal_seqs is None:
             raise ValueError(

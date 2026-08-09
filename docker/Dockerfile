@@ -255,8 +255,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            set -e; \
-           pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
+           cu13_wheels="$(mktemp)" && \
+           pip list --format=freeze > "${cu13_wheels}" && \
+           awk -F'==' '/-cu13(==|$)/ {print $1}' "${cu13_wheels}" \
                | xargs -r python3 -m pip uninstall -y && \
+           rm -f "${cu13_wheels}" && \
            cutlass_dsl_version="$(python3 -c 'import pathlib, re, sys; text = pathlib.Path("pyproject.toml").read_text(); m = re.search(r"\"nvidia-cutlass-dsl(?:\[cu13\])?==([^\"]+)\"", text); sys.exit("missing nvidia-cutlass-dsl pin") if m is None else print(m.group(1))')" && \
            python3 -m pip install --force-reinstall --no-deps \
                "nvidia-cutlass-dsl-libs-base==${cutlass_dsl_version}" && \

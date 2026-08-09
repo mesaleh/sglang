@@ -85,6 +85,9 @@ def test_mla_cuda_graph_metadata_overrides_match_trtllm_signature(backend_cls):
     assert _signature_contract(backend_cls._apply_cuda_graph_metadata) == (
         _signature_contract(TRTLLMMLABackend._apply_cuda_graph_metadata)
     )
+    assert _signature_contract(backend_cls._run_decode_kernel) == (
+        _signature_contract(TRTLLMMLABackend._run_decode_kernel)
+    )
 
 
 def test_tokenspeed_cuda_graph_metadata_forwards_upstream_kwargs(monkeypatch):

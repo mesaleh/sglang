@@ -446,8 +446,10 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             req_pool_indices=req_pool_indices,
             spec_info=spec_info,
         )
-        if get_parallel().dcp_enabled and not getattr(
-            self.forward_decode_metadata, "is_draft_frontier", False
+        if (
+            get_parallel().dcp_enabled
+            and not getattr(self.forward_decode_metadata, "is_draft_frontier", False)
+            and not forward_mode.is_draft_extend_v2()
         ):
             self.forward_decode_metadata.max_seq_len_k = (
                 self._get_dcp_local_max_seq_len(
@@ -495,7 +497,9 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             metadata.sum_seq_lens_q = num_tokens_per_req * bs
             seq_lens = seq_lens[:bs]
             metadata.seq_lens_k.copy_(seq_lens)
-            local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            # Draft-extend still uses the non-DCP decode kernel in the TRTLLM
+            # MLA forward path, so keep the page table global.
+            local_seq_lens = metadata.seq_lens_k
         else:
             seq_lens = seq_lens[:bs]
             local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
@@ -516,7 +520,6 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
             metadata = self.forward_decode_metadata
