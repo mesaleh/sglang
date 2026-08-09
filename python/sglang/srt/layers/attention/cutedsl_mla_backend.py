@@ -269,8 +269,13 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
+            metadata = self.forward_decode_metadata
+            if getattr(metadata, "is_draft_frontier", False):
+                raise RuntimeError(
+                    "cutedsl_mla DCP metadata does not support "
+                    "EAGLE topk>1 draft frontier replay."
+                )
             if forward_batch.forward_mode.is_target_verify():
-                metadata = self.forward_decode_metadata
                 metadata.global_seq_lens_k = metadata.seq_lens_k
                 metadata.seq_lens_k = self._get_dcp_local_seq_lens(
                     metadata.global_seq_lens_k
@@ -283,15 +288,12 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 # lens in seq_lens_k; keep it as global_seq_lens_k and derive
                 # the rank-local view once per step (forward_decode consumes
                 # both every MLA layer).
-                metadata = self.forward_decode_metadata
                 metadata.global_seq_lens_k = metadata.seq_lens_k
                 metadata.seq_lens_k = self._get_dcp_local_seq_lens(
                     metadata.global_seq_lens_k
                 )
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.forward_decode_metadata.max_seq_len_k
-                )
+            metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
+                metadata.max_seq_len_k
             )
 
     # ------------------------------------------------------------------

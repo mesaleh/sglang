@@ -499,6 +499,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         else:
             seq_lens = seq_lens[:bs]
             local_seq_lens = self._get_dcp_local_seq_lens(seq_lens)
+            metadata.seq_lens_k.copy_(local_seq_lens)
+            local_seq_lens = metadata.seq_lens_k
 
         self._fill_dcp_block_kv_indices(
             metadata.block_kv_indices,
@@ -517,16 +519,19 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 or forward_batch.forward_mode.is_draft_extend_v2()
             )
         ):
+            metadata = self.forward_decode_metadata
+            if getattr(metadata, "is_draft_frontier", False):
+                raise RuntimeError(
+                    "tokenspeed_mla DCP metadata does not support "
+                    "EAGLE topk>1 draft frontier replay."
+                )
             if forward_batch.forward_mode.is_target_verify():
-                metadata = self.forward_decode_metadata
                 metadata.global_seq_lens_k = metadata.seq_lens_k
                 metadata.seq_lens_k = self._get_dcp_local_seq_lens(
                     metadata.global_seq_lens_k
                 )
-            self.forward_decode_metadata.max_seq_len_k = (
-                self._get_dcp_local_max_seq_len(
-                    self.forward_decode_metadata.max_seq_len_k
-                )
+            metadata.max_seq_len_k = self._get_dcp_local_max_seq_len(
+                metadata.max_seq_len_k
             )
 
     def _run_decode_kernel(

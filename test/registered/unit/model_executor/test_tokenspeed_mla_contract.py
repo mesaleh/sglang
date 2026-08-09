@@ -1,3 +1,4 @@
+from inspect import Parameter, signature
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +68,23 @@ def test_target_verify_max_seq_len_does_not_add_draft_width_twice():
 
     with pytest.raises(RuntimeError, match="missing max_seq_len_k"):
         _target_verify_max_seq_len(TRTLLMMLADecodeMetadata())
+
+
+def _signature_contract(fn):
+    return [
+        (param.name, param.kind, param.default is not Parameter.empty)
+        for param in signature(fn).parameters.values()
+    ]
+
+
+@pytest.mark.parametrize("backend_cls", [TokenspeedMLABackend, CuteDslMLABackend])
+def test_mla_cuda_graph_metadata_overrides_match_trtllm_signature(backend_cls):
+    assert _signature_contract(backend_cls._init_cuda_graph_metadata) == (
+        _signature_contract(TRTLLMMLABackend._init_cuda_graph_metadata)
+    )
+    assert _signature_contract(backend_cls._apply_cuda_graph_metadata) == (
+        _signature_contract(TRTLLMMLABackend._apply_cuda_graph_metadata)
+    )
 
 
 def test_tokenspeed_cuda_graph_metadata_forwards_upstream_kwargs(monkeypatch):
@@ -160,6 +178,41 @@ def test_mla_dcp_cuda_graph_metadata_fails_closed_for_draft_frontier(
             forward_mode=forward_mode,
             spec_info=spec_info,
         )
+
+
+@pytest.mark.parametrize(
+    ("backend_cls", "module"),
+    [
+        (TokenspeedMLABackend, backend_module),
+        (CuteDslMLABackend, cutedsl_module),
+    ],
+)
+def test_mla_dcp_eager_metadata_fails_closed_for_draft_frontier(
+    monkeypatch, backend_cls, module
+):
+    backend = object.__new__(backend_cls)
+    forward_mode = SimpleNamespace(
+        is_decode_or_idle=lambda: True,
+        is_target_verify=lambda: False,
+        is_draft_extend_v2=lambda: False,
+    )
+    forward_batch = SimpleNamespace(forward_mode=forward_mode)
+
+    def fake_init_forward_metadata(self, forward_batch):
+        self.forward_decode_metadata = SimpleNamespace(
+            is_draft_frontier=True,
+            max_seq_len_k=1,
+        )
+
+    monkeypatch.setattr(
+        TRTLLMMLABackend, "init_forward_metadata", fake_init_forward_metadata
+    )
+    monkeypatch.setattr(
+        module, "get_parallel", lambda: SimpleNamespace(dcp_enabled=True)
+    )
+
+    with pytest.raises(RuntimeError, match="DCP metadata"):
+        backend.init_forward_metadata(forward_batch)
 
 
 def test_cutedsl_cuda_graph_metadata_forwards_upstream_kwargs(monkeypatch):
