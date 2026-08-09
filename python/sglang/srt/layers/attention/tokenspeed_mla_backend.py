@@ -408,9 +408,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         seq_lens: torch.Tensor,
         device: torch.device,
     ) -> torch.Tensor:
-        if not get_parallel().dcp_enabled or getattr(
-            self, "_use_global_block_kv_indices", False
-        ):
+        if not get_parallel().dcp_enabled:
             return super()._create_block_kv_indices(
                 batch_size,
                 max_blocks,
@@ -429,6 +427,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
         return block_kv_indices
 
+    def _raise_dcp_draft_extend_unsupported(self):
+        raise RuntimeError(
+            "tokenspeed_mla DCP does not support draft-extend speculative "
+            "decoding: the draft KV pool needs DCP-aware index translation."
+        )
+
     def _init_cuda_graph_metadata(
         self,
         bs: int,
@@ -439,6 +443,8 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         req_pool_indices: Optional[torch.Tensor] = None,
         spec_info=None,
     ):
+        if get_parallel().dcp_enabled and forward_mode.is_draft_extend_v2():
+            self._raise_dcp_draft_extend_unsupported()
         super()._init_cuda_graph_metadata(
             bs,
             num_tokens,
@@ -477,13 +483,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                 spec_info=spec_info,
             )
         if forward_mode.is_draft_extend_v2():
-            return super()._apply_cuda_graph_metadata(
-                bs,
-                req_pool_indices,
-                seq_lens,
-                forward_mode,
-                spec_info=spec_info,
-            )
+            self._raise_dcp_draft_extend_unsupported()
         if self._is_draft_frontier_spec(forward_mode, spec_info, bs):
             raise RuntimeError(
                 "tokenspeed_mla DCP CUDA graph metadata does not support "
@@ -514,18 +514,12 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
-        use_global_block_kv = (
-            get_parallel().dcp_enabled and forward_batch.forward_mode.is_draft_extend_v2()
-        )
-        old_use_global_block_kv = getattr(
-            self, "_use_global_block_kv_indices", False
-        )
-        if use_global_block_kv:
-            self._use_global_block_kv_indices = True
-        try:
-            super().init_forward_metadata(forward_batch)
-        finally:
-            self._use_global_block_kv_indices = old_use_global_block_kv
+        if (
+            get_parallel().dcp_enabled
+            and forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            self._raise_dcp_draft_extend_unsupported()
+        super().init_forward_metadata(forward_batch)
         if (
             get_parallel().dcp_enabled
             and self.forward_decode_metadata is not None

@@ -167,7 +167,11 @@ def test_mla_dcp_cuda_graph_metadata_fails_closed_for_draft_frontier(
     monkeypatch, backend_cls, module
 ):
     backend = object.__new__(backend_cls)
-    forward_mode = SimpleNamespace(is_decode_or_idle=lambda: True)
+    forward_mode = SimpleNamespace(
+        is_decode_or_idle=lambda: True,
+        is_target_verify=lambda: False,
+        is_draft_extend_v2=lambda: False,
+    )
     spec_info = SimpleNamespace(
         kv_indptr=SimpleNamespace(shape=(4,)),
         kv_indices=object(),
@@ -229,30 +233,16 @@ def test_mla_dcp_eager_metadata_fails_closed_for_draft_frontier(
         (CuteDslMLABackend, cutedsl_module),
     ],
 )
-def test_mla_dcp_draft_extend_cuda_graph_metadata_uses_parent_global_metadata(
+def test_mla_dcp_draft_extend_cuda_graph_metadata_fails_closed(
     monkeypatch, backend_cls, module
 ):
     backend = object.__new__(backend_cls)
     forward_mode = SimpleNamespace(is_draft_extend_v2=lambda: True)
-    calls = []
-
-    def fake_apply(
-        self,
-        bs,
-        req_pool_indices,
-        seq_lens,
-        forward_mode,
-        spec_info=None,
-    ):
-        calls.append((bs, req_pool_indices, seq_lens, forward_mode, spec_info))
-        return "global-parent-metadata"
-
-    monkeypatch.setattr(TRTLLMMLABackend, "_apply_cuda_graph_metadata", fake_apply)
     monkeypatch.setattr(
         module, "get_parallel", lambda: SimpleNamespace(dcp_enabled=True)
     )
 
-    assert (
+    with pytest.raises(RuntimeError, match="draft-extend speculative decoding"):
         backend._apply_cuda_graph_metadata(
             bs=2,
             req_pool_indices="req",
@@ -260,9 +250,6 @@ def test_mla_dcp_draft_extend_cuda_graph_metadata_uses_parent_global_metadata(
             forward_mode=forward_mode,
             spec_info="spec",
         )
-        == "global-parent-metadata"
-    )
-    assert calls == [(2, "req", "seq", forward_mode, "spec")]
 
 
 @pytest.mark.parametrize(
@@ -272,7 +259,7 @@ def test_mla_dcp_draft_extend_cuda_graph_metadata_uses_parent_global_metadata(
         (CuteDslMLABackend, cutedsl_module),
     ],
 )
-def test_mla_dcp_draft_extend_eager_metadata_uses_parent_global_block_table(
+def test_mla_dcp_draft_extend_init_metadata_fails_closed(
     monkeypatch, backend_cls, module
 ):
     backend = object.__new__(backend_cls)
@@ -282,61 +269,68 @@ def test_mla_dcp_draft_extend_eager_metadata_uses_parent_global_block_table(
         is_target_verify=lambda: False,
     )
     forward_batch = SimpleNamespace(forward_mode=forward_mode)
-    calls = []
-
-    def fake_create_block_kv_indices(
-        self,
-        batch_size,
-        max_blocks,
-        req_pool_indices,
-        seq_lens,
-        device,
-    ):
-        calls.append(
-            (
-                "parent-create",
-                batch_size,
-                max_blocks,
-                req_pool_indices,
-                seq_lens,
-                device,
-                getattr(self, "_use_global_block_kv_indices", False),
-            )
-        )
-        return "global-block-table"
-
-    def fake_init_forward_metadata(self, forward_batch):
-        calls.append(
-            (
-                "parent-init",
-                getattr(self, "_use_global_block_kv_indices", False),
-            )
-        )
-        calls.append(
-            self._create_block_kv_indices(2, 4, "req", "seq", "cuda")
-        )
-        self.forward_decode_metadata = None
-
     monkeypatch.setattr(
-        TRTLLMMLABackend,
-        "_create_block_kv_indices",
-        fake_create_block_kv_indices,
+        module, "get_parallel", lambda: SimpleNamespace(dcp_enabled=True)
     )
-    monkeypatch.setattr(
-        TRTLLMMLABackend, "init_forward_metadata", fake_init_forward_metadata
+
+    with pytest.raises(RuntimeError, match="draft-extend speculative decoding"):
+        backend.init_forward_metadata(forward_batch)
+
+
+@pytest.mark.parametrize(
+    ("backend_cls", "module"),
+    [
+        (TokenspeedMLABackend, backend_module),
+        (CuteDslMLABackend, cutedsl_module),
+    ],
+)
+def test_mla_dcp_decode_cuda_graph_metadata_uses_rank_local_page_table(
+    monkeypatch, backend_cls, module
+):
+    class CopySink:
+        def __init__(self):
+            self.copied = None
+
+        def copy_(self, value):
+            self.copied = value
+
+    backend = object.__new__(backend_cls)
+    sink = CopySink()
+    global_sink = CopySink()
+    metadata = SimpleNamespace(
+        block_kv_indices="blocks",
+        seq_lens_k=sink,
+        global_seq_lens_k=global_sink,
+    )
+    backend.decode_cuda_graph_metadata = {2: metadata}
+    backend._is_draft_frontier_spec = lambda forward_mode, spec_info, bs: False
+    backend._get_dcp_local_seq_lens = lambda seq_lens: ("local", tuple(seq_lens))
+    calls = []
+    backend._fill_dcp_block_kv_indices = lambda blocks, req, local: calls.append(
+        (blocks, req, local)
+    )
+    forward_mode = SimpleNamespace(
+        is_target_verify=lambda: False,
+        is_draft_extend_v2=lambda: False,
     )
     monkeypatch.setattr(
         module, "get_parallel", lambda: SimpleNamespace(dcp_enabled=True)
     )
 
-    backend.init_forward_metadata(forward_batch)
+    backend._apply_cuda_graph_metadata(
+        bs=2,
+        req_pool_indices=["r0", "r1", "pad"],
+        seq_lens=[11, 12, 13],
+        forward_mode=forward_mode,
+        spec_info=None,
+    )
 
-    assert calls == [
-        ("parent-init", True),
-        ("parent-create", 2, 4, "req", "seq", "cuda", True),
-        "global-block-table",
-    ]
-    assert getattr(backend, "_use_global_block_kv_indices", False) is False
+    assert sink.copied == ("local", (11, 12))
+    if backend_cls is CuteDslMLABackend:
+        assert global_sink.copied == [11, 12]
+    else:
+        assert global_sink.copied is None
+    assert calls == [("blocks", ["r0", "r1"], sink)]
 
 
 def test_cutedsl_decode_forwards_custom_mask_on_non_dcp_path(monkeypatch):

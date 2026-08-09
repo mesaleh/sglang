@@ -259,8 +259,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze > "${cu13_wheels}" && \
            cu13_names="$(mktemp)" && \
            awk -F'==' '/-cu13(==|$)/ {print $1}' "${cu13_wheels}" > "${cu13_names}" && \
-           test -s "${cu13_names}" && \
-           xargs -r python3 -m pip uninstall -y < "${cu13_names}" && \
+           if [ -s "${cu13_names}" ]; then \
+               xargs -r python3 -m pip uninstall -y < "${cu13_names}"; \
+           fi && \
            rm -f "${cu13_wheels}" "${cu13_names}" && \
            cutlass_dsl_version="$(python3 -c 'import pathlib, re, sys; text = pathlib.Path("pyproject.toml").read_text(); m = re.search(r"\"nvidia-cutlass-dsl(?:\[cu13\])?==([^\"]+)\"", text); sys.exit("missing nvidia-cutlass-dsl pin") if m is None else print(m.group(1))')" && \
            python3 -m pip install --force-reinstall --no-deps \
