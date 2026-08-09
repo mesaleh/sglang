@@ -4047,6 +4047,7 @@ class FlashAttentionForwardSm100:
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
+                n_block_min_causal_local_mask = n_block_min
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
                     if const_expr(self.has_bias) and (
                         const_expr(not self.is_split_kv) or num_bias_loads > 0
@@ -4084,7 +4085,6 @@ class FlashAttentionForwardSm100:
                     # Next couple of iterations with causal masking. With bias, the sheared bias
                     # encodes the causal/window mask (-inf padding), so mask_fn is None there and
                     # the masked band is exactly the num_bias_loads blocks.
-                    n_block_min_causal_local_mask = n_block_min
                     if const_expr(self.is_causal or self.is_local or self.has_bias):
                         if const_expr(self.has_bias):
                             n_block_min_causal_local_mask = max(
