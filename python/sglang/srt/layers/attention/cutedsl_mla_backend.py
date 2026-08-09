@@ -173,11 +173,21 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         forward_mode,
         seq_lens: torch.Tensor,
         device: torch.device,
+        req_pool_indices: Optional[torch.Tensor] = None,
+        spec_info=None,
     ):
         super()._init_cuda_graph_metadata(
-            bs, num_tokens, forward_mode, seq_lens, device
+            bs,
+            num_tokens,
+            forward_mode,
+            seq_lens,
+            device,
+            req_pool_indices=req_pool_indices,
+            spec_info=spec_info,
         )
-        if get_parallel().dcp_enabled:
+        if get_parallel().dcp_enabled and not getattr(
+            self.forward_decode_metadata, "is_draft_frontier", False
+        ):
             metadata = self.forward_decode_metadata
             if metadata.global_seq_lens_k is None:
                 # Plain decode under DCP also keeps the int32 GLOBAL lens in a
@@ -198,6 +208,7 @@ class CuteDslMLABackend(TRTLLMMLABackend):
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         forward_mode,
+        spec_info=None,
     ):
         if not get_parallel().dcp_enabled:
             return super()._apply_cuda_graph_metadata(
@@ -205,6 +216,12 @@ class CuteDslMLABackend(TRTLLMMLABackend):
                 req_pool_indices,
                 seq_lens,
                 forward_mode,
+                spec_info=spec_info,
+            )
+        if self._is_draft_frontier_spec(forward_mode, spec_info, bs):
+            raise RuntimeError(
+                "cutedsl_mla DCP CUDA graph metadata does not support "
+                "EAGLE topk>1 draft frontier replay."
             )
 
         metadata = self.decode_cuda_graph_metadata[bs]
