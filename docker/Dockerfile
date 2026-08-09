@@ -254,12 +254,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
        fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           set -e; \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
+           cutlass_dsl_version="$(python3 -c 'import pathlib, re, sys; text = pathlib.Path("pyproject.toml").read_text(); m = re.search(r"\"nvidia-cutlass-dsl(?:\[cu13\])?==([^\"]+)\"", text); sys.exit("missing nvidia-cutlass-dsl pin") if m is None else print(m.group(1))')" && \
            python3 -m pip install --force-reinstall --no-deps \
-               "nvidia-cutlass-dsl-libs-base==4.6.0" && \
+               "nvidia-cutlass-dsl-libs-base==${cutlass_dsl_version}" && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
-               "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" "numpy<2.4" --force-reinstall; \
+               "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" "numpy<2.4" --force-reinstall && \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
