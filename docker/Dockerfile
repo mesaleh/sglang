@@ -257,7 +257,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --force-reinstall --no-deps \
-               "nvidia-cutlass-dsl-libs-base==4.5.2" && \
+               "nvidia-cutlass-dsl-libs-base==4.6.0" && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                "torch==2.11.0" "torchvision==0.26.0" "torchaudio==2.11.0" "numpy<2.4" --force-reinstall; \
            python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
