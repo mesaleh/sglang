@@ -1235,6 +1235,43 @@ class TestDFlashDraftSnapshot(unittest.TestCase):
         self.assertEqual(req.dflash_snapshot_handle, handle)
         self.assertTrue(directory.release_request(req.rid))
 
+    def test_snapshot_force_miss_keeps_the_request_namespace_root(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+        from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+
+        tokens = array("q", range(128))
+        directory = DFlashDraftSnapshotDirectory(self.config, namespace="test")
+        cache = RadixCache.create_simulated(page_size=32)
+        cache.register_dflash_snapshot_directory(directory)
+        cache.reprefill_tail_tokens = lambda: 64
+        cache.insert(
+            InsertParams(
+                key=RadixKey(tokens, extra_key="tenant"),
+                value=torch.arange(len(tokens), dtype=torch.int64),
+            )
+        )
+        req = SimpleNamespace(extra_key="tenant", rid="forced-miss")
+
+        with envs.SGLANG_RADIX_FORCE_MISS.override(True):
+            result = match_prefix_with_dflash_snapshot(
+                tree_cache=cache,
+                req=req,
+                token_ids=tokens,
+                base_key_limit=len(tokens),
+                cow_mamba=False,
+                include_req=True,
+                acquire=True,
+            )
+
+        self.assertEqual(len(result.device_indices), 0)
+        self.assertIs(
+            result.last_device_node,
+            cache.root_node_handle(extra_key="tenant"),
+        )
+        self.assertEqual(req.dflash_snapshot_match_plan.status, "ordinary_replay")
+        self.assertIsNone(req.dflash_snapshot_handle)
+
     def test_tree_cache_release_clears_request_pin(self):
         from sglang.srt.mem_cache.radix_cache import RadixCache
 

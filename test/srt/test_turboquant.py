@@ -185,6 +185,18 @@ class TestTurboQuantCLI(unittest.TestCase):
         self.assertFalse(hasattr(draft, "turboquant_k_bits"))
         self.assertFalse(hasattr(draft, "turboquant_v_bits"))
 
+    def test_pool_sizing_uses_runner_owned_kv_representation(self):
+        from sglang.srt.model_executor.pool_configurator import _get_turboquant_bits
+
+        target = SimpleNamespace(kv_cache_dtype_str="turboquant_k4v2")
+        draft = SimpleNamespace(
+            kv_cache_dtype_str="bf16",
+            server_args=SimpleNamespace(kv_cache_dtype="turboquant_k4v2"),
+        )
+
+        self.assertEqual(_get_turboquant_bits(target), (4, 2))
+        self.assertIsNone(_get_turboquant_bits(draft))
+
     def test_output_rotation_fusion_is_all_or_nothing(self):
         from sglang.srt.model_executor.model_runner_components.turboquant_rotation import (
             fuse_turboquant_output_rotation_weights,
