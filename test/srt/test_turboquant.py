@@ -562,6 +562,235 @@ class TestTurboQuantGPU(unittest.TestCase):
                 bit_width=bits, head_dim=128, device=cls.device
             )
 
+    def test_native_e2m1_fused_writer_matches_independent_oracle(self):
+        from sglang.kernels.ops.attention.turboquant_quantize import (
+            fused_native_e2m1_mla_quantize_and_store,
+        )
+        from sglang.kernels.ops.quantization.hadamard import (
+            hadamard_transform_with_signs,
+        )
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NativeE2M1MLAConfig,
+        )
+
+        torch.manual_seed(20260814)
+        cfg = NativeE2M1MLAConfig(device=self.device)
+        tokens = 19
+        pool_size = 80
+        workspace_tokens = 7
+
+        # Slice only the token axis so the source has non-contiguous token
+        # stride while preserving the writer's contiguous-feature contract.
+        x_backing = torch.randn(
+            tokens * 2,
+            1,
+            512,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        rope_backing = torch.randn(
+            tokens * 2,
+            1,
+            64,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        x = x_backing[::2]
+        rope = rope_backing[::2]
+        x[0].zero_()
+        x[1].zero_()
+        x[1, 0, 0] = torch.finfo(torch.bfloat16).tiny
+        self.assertFalse(x.is_contiguous())
+        self.assertEqual(x.stride(-1), 1)
+
+        loc = torch.tensor(
+            [
+                31,
+                1,
+                32,
+                0,
+                63,
+                2,
+                47,
+                16,
+                64,
+                7,
+                48,
+                15,
+                33,
+                3,
+                62,
+                8,
+                49,
+                17,
+                65,
+            ],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        packed = torch.full(
+            (pool_size, 1, 256),
+            0xA5,
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        scale = torch.full(
+            (pool_size, 1),
+            -2.0,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        rope_out = torch.full(
+            (pool_size, 1, 64),
+            3.0,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        pre_unit = torch.empty(
+            workspace_tokens, 1, 512, dtype=torch.float32, device=self.device
+        )
+        pre_norms = torch.empty(
+            workspace_tokens, 1, dtype=torch.float32, device=self.device
+        )
+        pre_y = torch.empty_like(pre_unit)
+
+        fused_native_e2m1_mla_quantize_and_store(
+            x,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.boundaries,
+            cfg.levels,
+            cfg.codes,
+            cfg.grid,
+            packed,
+            scale,
+            loc,
+            rope,
+            rope_out,
+            pre_unit=pre_unit,
+            pre_norms=pre_norms,
+            pre_y=pre_y,
+        )
+
+        # Independent Torch construction of the frozen N8 operation order.
+        x_fp32 = x.float()
+        norms = torch.linalg.vector_norm(x_fp32, dim=-1, dtype=torch.float32)
+        safe_norms = torch.where(norms > 0, norms, torch.ones_like(norms))
+        unit = x_fp32 / safe_norms.unsqueeze(-1)
+        rotated = hadamard_transform_with_signs(
+            unit,
+            cfg.signs1,
+            cfg.signs2,
+            scale=1.0 / math.sqrt(512),
+        )
+        indices = torch.searchsorted(cfg.boundaries, rotated / cfg.grid)
+        raw = cfg.levels[indices]
+        expected_codes = cfg.codes[indices]
+        zero = norms <= 0
+        expected_codes = torch.where(zero.unsqueeze(-1), 0, expected_codes)
+        pairs = expected_codes.reshape(tokens, 1, 256, 2)
+        expected_packed = pairs[..., 0] | (pairs[..., 1] << 4)
+        quant_norms = torch.linalg.vector_norm(
+            raw * cfg.grid, dim=-1, dtype=torch.float32
+        )
+        safe_quant_norms = torch.where(
+            quant_norms > 0, quant_norms, torch.ones_like(quant_norms)
+        )
+        expected_scale = ((norms / safe_quant_norms) * cfg.grid).to(
+            torch.bfloat16
+        )
+        expected_scale = torch.where(zero, 0, expected_scale)
+        expected_rope = rope.to(torch.float8_e4m3fn)
+
+        torch.testing.assert_close(packed[loc], expected_packed, rtol=0, atol=0)
+        torch.testing.assert_close(scale[loc], expected_scale, rtol=0, atol=0)
+        torch.testing.assert_close(
+            rope_out[loc].view(torch.uint8),
+            expected_rope.view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+        self.assertEqual(torch.count_nonzero(packed[loc[0]]).item(), 0)
+        self.assertEqual(scale[loc[0]].item(), 0.0)
+        self.assertEqual(torch.count_nonzero(packed[loc[1]]).item(), 0)
+        self.assertEqual(scale[loc[1]].item(), 0.0)
+
+        untouched = torch.ones(pool_size, dtype=torch.bool, device=self.device)
+        untouched[loc] = False
+        self.assertTrue(torch.all(packed[untouched] == 0xA5).item())
+        self.assertTrue(torch.all(scale[untouched] == -2.0).item())
+        self.assertTrue(
+            torch.all(
+                rope_out[untouched] == torch.tensor(3.0, device=self.device)
+            ).item()
+        )
+
+    def test_native_e2m1_fused_writer_identical_duplicate_is_stable(self):
+        from sglang.kernels.ops.attention.turboquant_quantize import (
+            fused_native_e2m1_mla_quantize_and_store,
+        )
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NativeE2M1MLAConfig,
+        )
+
+        cfg = NativeE2M1MLAConfig(device=self.device)
+        x = torch.randn(1, 1, 512, dtype=torch.bfloat16, device=self.device).expand(
+            2, -1, -1
+        )
+        rope = torch.randn(
+            1, 1, 64, dtype=torch.bfloat16, device=self.device
+        ).expand(2, -1, -1)
+        loc = torch.tensor([5, 5], dtype=torch.int64, device=self.device)
+        packed = torch.zeros(8, 1, 256, dtype=torch.uint8, device=self.device)
+        scale = torch.zeros(8, 1, dtype=torch.bfloat16, device=self.device)
+        rope_out = torch.zeros(
+            8, 1, 64, dtype=torch.float8_e4m3fn, device=self.device
+        )
+        pre_unit = torch.empty(2, 1, 512, dtype=torch.float32, device=self.device)
+        pre_norms = torch.empty(2, 1, dtype=torch.float32, device=self.device)
+        pre_y = torch.empty_like(pre_unit)
+
+        fused_native_e2m1_mla_quantize_and_store(
+            x,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.boundaries,
+            cfg.levels,
+            cfg.codes,
+            cfg.grid,
+            packed,
+            scale,
+            loc,
+            rope,
+            rope_out,
+            pre_unit=pre_unit,
+            pre_norms=pre_norms,
+            pre_y=pre_y,
+        )
+        first = (packed[5].clone(), scale[5].clone(), rope_out[5].clone())
+        fused_native_e2m1_mla_quantize_and_store(
+            x,
+            cfg.signs1,
+            cfg.signs2,
+            cfg.boundaries,
+            cfg.levels,
+            cfg.codes,
+            cfg.grid,
+            packed,
+            scale,
+            loc,
+            rope,
+            rope_out,
+            pre_unit=pre_unit,
+            pre_norms=pre_norms,
+            pre_y=pre_y,
+        )
+        torch.testing.assert_close(packed[5], first[0], rtol=0, atol=0)
+        torch.testing.assert_close(scale[5], first[1], rtol=0, atol=0)
+        torch.testing.assert_close(
+            rope_out[5].view(torch.uint8), first[2].view(torch.uint8), rtol=0, atol=0
+        )
+
     def _roundtrip(self, bits, tokens=64, heads=4):
         from sglang.srt.layers.quantization.kv_turboquant import (
             batched_dequantize, batched_quantize,

@@ -321,6 +321,112 @@ def _fused_pack_store_4bit_kernel(
 
 
 @triton.jit
+def _fused_pack_store_native_e2m1_mla_kernel(
+    Y,              # (tokens, 1, 512) float32 — WHT-rotated unit vectors
+    Norms,          # (tokens, 1) float32 — pre-rotation L2 norms
+    Loc,            # (tokens,) int32/int64 — pool slot indices
+    PackedBuffer,   # (pool_size, 1, 256) uint8 — hardware E2M1 nibbles
+    DScaleBuffer,   # (pool_size, 1) bf16 — accepted N8 token scale
+    RopeSrc,        # (tokens, 1, 64) bf16/fp16/fp32
+    RopeBuffer,     # (pool_size, 1, 64) fp8_e4m3fn
+    Boundaries,     # (14,) float32 — midpoint boundaries in raw-level units
+    Levels,         # (15,) float32 — sorted E2M1 reconstruction values
+    Codes,          # (15,) uint8 — sorted-index to hardware-code map
+    stride_y_t,
+    stride_y_h,
+    stride_p_s,
+    stride_p_h,
+    stride_ds_s,
+    stride_rope_src_t,
+    stride_rope_src_h,
+    stride_rope_dst_s,
+    stride_rope_dst_h,
+    stride_n_t,
+    GRID: tl.constexpr,
+    BLOCK_PACKED: tl.constexpr,
+    LORA_HALF: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+):
+    """Select native E2M1 codes, pack them, and scatter the complete MLA row."""
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    # Widen before multiplying by row strides: the production pool can exceed
+    # 2**31 / 256 rows, so int32 pointer arithmetic would wrap even though the
+    # slot index itself still fits in int32.
+    pool_slot = tl.load(Loc + pid_t).to(tl.int64)
+
+    offs_pair = tl.arange(0, BLOCK_PACKED)
+    pair_mask = offs_pair < LORA_HALF
+    y_base = Y + pid_t * stride_y_t + pid_h * stride_y_h
+    y_even = tl.load(y_base + offs_pair * 2, mask=pair_mask, other=0.0)
+    y_odd = tl.load(y_base + offs_pair * 2 + 1, mask=pair_mask, other=0.0)
+
+    # The accepted oracle divides by the frozen grid before bucketization.
+    # Keep that operation order instead of folding the grid into boundaries.
+    scaled_even = y_even / GRID
+    scaled_odd = y_odd / GRID
+    idx_even = tl.zeros([BLOCK_PACKED], dtype=tl.int32)
+    idx_odd = tl.zeros([BLOCK_PACKED], dtype=tl.int32)
+    for b in tl.static_range(14):
+        boundary = tl.load(Boundaries + b)
+        idx_even += tl.where(scaled_even > boundary, 1, 0).to(tl.int32)
+        idx_odd += tl.where(scaled_odd > boundary, 1, 0).to(tl.int32)
+
+    raw_even = tl.load(Levels + idx_even, mask=pair_mask, other=0.0)
+    raw_odd = tl.load(Levels + idx_odd, mask=pair_mask, other=0.0)
+    code_even = tl.load(Codes + idx_even, mask=pair_mask, other=0).to(tl.int32)
+    code_odd = tl.load(Codes + idx_odd, mask=pair_mask, other=0).to(tl.int32)
+
+    norm = tl.load(Norms + pid_t * stride_n_t + pid_h)
+    is_zero = norm <= 0.0
+    raw_even = tl.where(is_zero, 0.0, raw_even)
+    raw_odd = tl.where(is_zero, 0.0, raw_odd)
+    code_even = tl.where(is_zero, 0, code_even)
+    code_odd = tl.where(is_zero, 0, code_odd)
+
+    # Freeze the N8 scale operation order: norm(raw * grid), then
+    # (input_norm / quant_norm) * grid, and finally BF16 rounding.
+    quant_even = raw_even * GRID
+    quant_odd = raw_odd * GRID
+    quant_norm_sq = tl.sum(quant_even * quant_even, axis=0) + tl.sum(
+        quant_odd * quant_odd, axis=0
+    )
+    quant_norm = tl.sqrt(quant_norm_sq)
+    safe_quant_norm = tl.where(quant_norm > 0.0, quant_norm, 1.0)
+    dscale = tl.where(is_zero, 0.0, (norm / safe_quant_norm) * GRID)
+
+    packed = ((code_odd & 0xF) << 4) | (code_even & 0xF)
+    packed_ptr = (
+        PackedBuffer
+        + pool_slot * stride_p_s
+        + pid_h * stride_p_h
+        + offs_pair
+    )
+    tl.store(packed_ptr, packed.to(tl.uint8), mask=pair_mask)
+    tl.store(
+        DScaleBuffer + pool_slot * stride_ds_s + pid_h,
+        dscale.to(tl.bfloat16),
+    )
+
+    rope_mask = offs_pair < ROPE_DIM
+    rope = tl.load(
+        RopeSrc
+        + pid_t * stride_rope_src_t
+        + pid_h * stride_rope_src_h
+        + offs_pair,
+        mask=rope_mask,
+        other=0.0,
+    )
+    rope_ptr = (
+        RopeBuffer
+        + pool_slot * stride_rope_dst_s
+        + pid_h * stride_rope_dst_h
+        + offs_pair
+    )
+    tl.store(rope_ptr, rope, mask=rope_mask)
+
+
+@triton.jit
 def _fused_pack_store_2bit_kernel(
     Y, Norms, Loc,
     KBuffer, DScaleBuffer,
@@ -637,6 +743,238 @@ def fused_turboquant_quantize_and_store(
         )
     else:
         raise ValueError(f'Unsupported bit_width: {bit_width}')
+
+
+def fused_native_e2m1_mla_quantize_and_store(
+    x,
+    signs1,
+    signs2,
+    boundaries,
+    levels,
+    codes,
+    grid,
+    packed_buffer,
+    dscale_buffer,
+    loc,
+    rope_src,
+    rope_buffer,
+    *,
+    pre_unit,
+    pre_norms,
+    pre_y,
+):
+    """Write the complete native-E2M1 MLA row with bounded scratch storage.
+
+    The persistent representation is deliberately different from stock
+    ``turboquant_4bit``: nibbles are hardware E2M1 codes, the scale follows
+    the accepted N8 operation order, and RoPE is stored as E4M3 FP8.  Scratch
+    capacity is fixed by ``pre_*``; larger writes are processed in chunks and
+    never allocate capacity- or batch-sized temporaries.
+
+    ``loc`` is expected to contain one physical destination per source row.
+    Unsorted locations are supported.  As with SGLang's other scatter writers,
+    concurrent duplicate destinations must carry identical rows; conflicting
+    duplicate writes have no ordering contract.
+    """
+    import torch
+    from sglang.kernels.ops.quantization.hadamard import (
+        hadamard_transform_with_signs,
+    )
+
+    expected_dim = 512
+    expected_rope_dim = 64
+    if x.dim() != 3 or x.shape[1:] != (1, expected_dim):
+        raise ValueError(
+            "Native E2M1 MLA writer expects x shaped (tokens, 1, 512), "
+            f"got {tuple(x.shape)}."
+        )
+    if rope_src.dim() != 3 or rope_src.shape != (
+        x.shape[0],
+        1,
+        expected_rope_dim,
+    ):
+        raise ValueError(
+            "Native E2M1 MLA writer expects rope_src shaped (tokens, 1, 64), "
+            f"got {tuple(rope_src.shape)}."
+        )
+    if loc.dim() != 1 or loc.numel() != x.shape[0]:
+        raise ValueError(
+            "Native E2M1 MLA writer requires one flat location per token, "
+            f"got loc={tuple(loc.shape)} for {x.shape[0]} tokens."
+        )
+    if loc.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"Native E2M1 MLA locations must be int32 or int64, got {loc.dtype}."
+        )
+    if x.dtype != torch.bfloat16 or rope_src.dtype != torch.bfloat16:
+        raise TypeError(
+            "Native E2M1 MLA writer requires BF16 latent and RoPE inputs, "
+            f"got x={x.dtype}, rope={rope_src.dtype}."
+        )
+    if x.stride(-1) != 1 or rope_src.stride(-1) != 1:
+        raise ValueError(
+            "Native E2M1 MLA writer requires contiguous feature dimensions."
+        )
+    if loc.stride(0) != 1:
+        raise ValueError("Native E2M1 MLA locations must be contiguous.")
+
+    device = x.device
+    named_tensors = {
+        "signs1": signs1,
+        "signs2": signs2,
+        "boundaries": boundaries,
+        "levels": levels,
+        "codes": codes,
+        "packed_buffer": packed_buffer,
+        "dscale_buffer": dscale_buffer,
+        "loc": loc,
+        "rope_src": rope_src,
+        "rope_buffer": rope_buffer,
+        "pre_unit": pre_unit,
+        "pre_norms": pre_norms,
+        "pre_y": pre_y,
+    }
+    for name, tensor in named_tensors.items():
+        if tensor.device != device:
+            raise ValueError(
+                f"Native E2M1 MLA {name} is on {tensor.device}, expected {device}."
+            )
+
+    if signs1.shape != (expected_dim,) or signs2.shape != (expected_dim,):
+        raise ValueError("Native E2M1 MLA signs must each have shape (512,).")
+    if boundaries.shape != (14,) or levels.shape != (15,) or codes.shape != (15,):
+        raise ValueError(
+            "Native E2M1 MLA requires 14 boundaries, 15 levels, and 15 codes."
+        )
+    for name, tensor in (
+        ("signs1", signs1),
+        ("signs2", signs2),
+        ("boundaries", boundaries),
+        ("levels", levels),
+    ):
+        if tensor.dtype != torch.float32 or not tensor.is_contiguous():
+            raise TypeError(
+                f"Native E2M1 MLA {name} must be contiguous float32, "
+                f"got dtype={tensor.dtype}, contiguous={tensor.is_contiguous()}."
+            )
+    if codes.dtype != torch.uint8:
+        raise TypeError(f"Native E2M1 MLA codes must be uint8, got {codes.dtype}.")
+    if not codes.is_contiguous():
+        raise ValueError("Native E2M1 MLA codes must be contiguous.")
+    if packed_buffer.dim() != 3 or packed_buffer.shape[1:] != (1, 256):
+        raise ValueError(
+            "Native E2M1 MLA packed_buffer must have shape (pool, 1, 256)."
+        )
+    if packed_buffer.dtype != torch.uint8:
+        raise TypeError(
+            f"Native E2M1 MLA packed_buffer must be uint8, got {packed_buffer.dtype}."
+        )
+    if packed_buffer.stride(-1) != 1:
+        raise ValueError(
+            "Native E2M1 MLA packed_buffer requires a contiguous feature dimension."
+        )
+    if dscale_buffer.shape != packed_buffer.shape[:2]:
+        raise ValueError(
+            "Native E2M1 MLA dscale_buffer must have shape (pool, 1)."
+        )
+    if dscale_buffer.dtype != torch.bfloat16:
+        raise TypeError(
+            f"Native E2M1 MLA dscale_buffer must be BF16, got {dscale_buffer.dtype}."
+        )
+    if rope_buffer.shape != (
+        packed_buffer.shape[0],
+        1,
+        expected_rope_dim,
+    ):
+        raise ValueError(
+            "Native E2M1 MLA rope_buffer must have shape (pool, 1, 64)."
+        )
+    if rope_buffer.dtype != torch.float8_e4m3fn:
+        raise TypeError(
+            "Native E2M1 MLA rope_buffer must be float8_e4m3fn, "
+            f"got {rope_buffer.dtype}."
+        )
+    if rope_buffer.stride(-1) != 1:
+        raise ValueError(
+            "Native E2M1 MLA rope_buffer requires a contiguous feature dimension."
+        )
+
+    if pre_unit.dim() != 3 or pre_unit.shape[1:] != (1, expected_dim):
+        raise ValueError("pre_unit must have shape (workspace_tokens, 1, 512).")
+    if pre_y.shape != pre_unit.shape:
+        raise ValueError("pre_y must have the same shape as pre_unit.")
+    if pre_norms.shape != pre_unit.shape[:2]:
+        raise ValueError("pre_norms must have shape (workspace_tokens, 1).")
+    if any(t.dtype != torch.float32 for t in (pre_unit, pre_norms, pre_y)):
+        raise TypeError("Native E2M1 MLA writer workspaces must be float32.")
+    if not all(t.is_contiguous() for t in (pre_unit, pre_norms, pre_y)):
+        raise ValueError("Native E2M1 MLA writer workspaces must be contiguous.")
+    workspace_tokens = pre_unit.shape[0]
+    if workspace_tokens <= 0:
+        raise ValueError(
+            "Native E2M1 MLA writer workspace must hold at least one token."
+        )
+
+    tokens = x.shape[0]
+    if tokens == 0:
+        return
+
+    block_dim = triton.next_power_of_2(expected_dim)
+    block_packed = triton.next_power_of_2(expected_dim // 2)
+    wht_scale = 1.0 / (expected_dim**0.5)
+    for begin in range(0, tokens, workspace_tokens):
+        end = min(begin + workspace_tokens, tokens)
+        chunk_tokens = end - begin
+        x_chunk = x[begin:end]
+        rope_chunk = rope_src[begin:end]
+        loc_chunk = loc[begin:end]
+        x_unit = pre_unit[:chunk_tokens]
+        norms = pre_norms[:chunk_tokens]
+        y_out = pre_y[:chunk_tokens]
+
+        _fused_norm_normalize_kernel[(chunk_tokens, 1)](
+            x_chunk,
+            x_unit,
+            norms,
+            x_chunk.stride(0),
+            x_chunk.stride(1),
+            x_unit.stride(0),
+            x_unit.stride(1),
+            norms.stride(0),
+            BLOCK_DIM=block_dim,
+            Lk=expected_dim,
+            num_warps=4,
+        )
+        rotated = hadamard_transform_with_signs(
+            x_unit, signs1, signs2, scale=wht_scale, out=y_out
+        )
+        _fused_pack_store_native_e2m1_mla_kernel[(chunk_tokens, 1)](
+            rotated,
+            norms,
+            loc_chunk,
+            packed_buffer,
+            dscale_buffer,
+            rope_chunk,
+            rope_buffer,
+            boundaries,
+            levels,
+            codes,
+            rotated.stride(0),
+            rotated.stride(1),
+            packed_buffer.stride(0),
+            packed_buffer.stride(1),
+            dscale_buffer.stride(0),
+            rope_chunk.stride(0),
+            rope_chunk.stride(1),
+            rope_buffer.stride(0),
+            rope_buffer.stride(1),
+            norms.stride(0),
+            GRID=float(grid),
+            BLOCK_PACKED=block_packed,
+            LORA_HALF=expected_dim // 2,
+            ROPE_DIM=expected_rope_dim,
+            num_warps=4,
+        )
 
 
 def fused_turboquant_quantize_and_store_kv(
