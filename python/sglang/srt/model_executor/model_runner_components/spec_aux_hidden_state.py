@@ -20,6 +20,10 @@ class SpecAuxHiddenStateConfig(msgspec.Struct, kw_only=True):
     eagle_aux_hidden_state_layer_ids: Any = None
     dflash_use_aux_hidden_state: bool = False
     dflash_draft_num_layers: Optional[int] = None
+    dflash_draft_total_num_kv_heads: Optional[int] = None
+    dflash_draft_head_dim: Optional[int] = None
+    dflash_draft_v_head_dim: Optional[int] = None
+    dflash_draft_kv_dtype: Optional[str] = None
     dflash_target_layer_ids: Any = None
 
 
@@ -162,4 +166,12 @@ def _resolve_dflash_aux_hidden_state(
 
         config.dflash_use_aux_hidden_state = True
         config.dflash_draft_num_layers = int(draft_num_layers)
+        config.dflash_draft_total_num_kv_heads = int(
+            draft_model_config.get_total_num_kv_heads()
+        )
+        config.dflash_draft_head_dim = int(draft_model_config.head_dim)
+        config.dflash_draft_v_head_dim = int(draft_model_config.v_head_dim)
+        config.dflash_draft_kv_dtype = str(draft_model_config.dtype).removeprefix(
+            "torch."
+        )
         config.dflash_target_layer_ids = target_layer_ids

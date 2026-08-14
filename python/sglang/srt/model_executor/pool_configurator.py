@@ -31,9 +31,15 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.kv_turboquant import (
+    NATIVE_E2M1_CODES,
+    NATIVE_E2M1_LEVELS,
+    is_native_e2m1_mla_kv_cache_dtype,
     parse_turboquant_kv_cache_dtype,
 )
-from sglang.srt.mem_cache.allocation_sizing import get_alloc_len_per_decode
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_alloc_reserve_per_decode,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import get_compress_state_ring_size
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
@@ -74,6 +80,159 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
 logger = logging.getLogger(__name__)
+
+_NATIVE_E2M1_RUNTIME_RESERVE_BYTES = 32 << 20
+
+
+def _native_e2m1_target_fixed_bytes(
+    *, target_cell_size_per_token: int, page_size: int
+) -> int:
+    """Fixed bytes allocated by ``MLATokenToKVPoolNativeE2M1``.
+
+    The target coefficient prices logical cache tokens. The concrete pool also
+    owns one padding page and capacity-independent writer/config/runtime state.
+    A 32 MiB reserve covers the measured first-use Triton/runtime allocation on
+    the qualified GB200 image; if an operator enlarges writer scratch beyond
+    that envelope, its exact tensor bytes become the reserve instead.
+    """
+
+    workspace_tokens = max(1, envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.get())
+    # Two [tokens, 512] fp32 buffers plus one [tokens] fp32 norm buffer.
+    writer_workspace_bytes = int(workspace_tokens) * (2 * 512 + 1) * 4
+    # signs1/signs2 fp32, levels/boundaries fp32, and hardware codes uint8.
+    selector_config_bytes = (
+        2 * 512 * 4
+        + len(NATIVE_E2M1_LEVELS) * 4
+        + (len(NATIVE_E2M1_LEVELS) - 1) * 4
+        + len(NATIVE_E2M1_CODES)
+    )
+    target_padding_bytes = int(page_size) * int(target_cell_size_per_token)
+    runtime_reserve_bytes = max(
+        _NATIVE_E2M1_RUNTIME_RESERVE_BYTES,
+        writer_workspace_bytes + selector_config_bytes,
+    )
+    return target_padding_bytes + runtime_reserve_bytes
+
+
+def _dflash_draft_ring_fixed_bytes(kvc: KVCacheConfigurator) -> int:
+    """Return the exact private BF16 DFlash ring/snapshot allocation.
+
+    The physical draft ring is request bounded and does not grow with target KV
+    capacity. Its storage must therefore be a fixed bias, not a target-layer
+    multiplier. This resolver deliberately shares the ring/snapshot builders
+    used by ``DFlashWorkerV2.alloc_memory_pool``.
+    """
+
+    sa = kvc.server_args
+    aux = kvc.spec_aux_config
+    if not kvc.spec_algorithm.is_dflash():
+        raise ValueError(
+            "The qualified physical DFlash draft ring is only valid for DFLASH."
+        )
+    required_aux = {
+        "dflash_draft_num_layers": getattr(aux, "dflash_draft_num_layers", None),
+        "dflash_draft_total_num_kv_heads": getattr(
+            aux, "dflash_draft_total_num_kv_heads", None
+        ),
+        "dflash_draft_head_dim": getattr(aux, "dflash_draft_head_dim", None),
+        "dflash_draft_v_head_dim": getattr(aux, "dflash_draft_v_head_dim", None),
+        "dflash_draft_kv_dtype": getattr(aux, "dflash_draft_kv_dtype", None),
+    }
+    missing = [name for name, value in required_aux.items() if value is None]
+    if missing:
+        raise ValueError(
+            "Exact DFlash draft-ring sizing requires resolved draft KV geometry; "
+            f"missing {', '.join(missing)}."
+        )
+    if required_aux["dflash_draft_kv_dtype"] != "bfloat16":
+        raise ValueError(
+            "Native target + DFlash draft-ring sizing requires an ordinary BF16 "
+            "draft KV pool, got "
+            f"{required_aux['dflash_draft_kv_dtype']!r}."
+        )
+
+    max_running_requests = getattr(sa, "max_running_requests", None)
+    if max_running_requests is None:
+        raise ValueError(
+            "Exact DFlash draft-ring sizing requires --max-running-requests."
+        )
+    attn_dp_size = int(getattr(kvc.ps, "attn_dp_size", 1))
+    if int(max_running_requests) % attn_dp_size:
+        raise ValueError(
+            "max_running_requests must divide evenly across attention-DP ranks: "
+            f"requests={max_running_requests}, attn_dp_size={attn_dp_size}."
+        )
+    request_rows = int(max_running_requests) // attn_dp_size + 1
+
+    window_size = getattr(sa, "speculative_draft_window_size", None)
+    block_size = getattr(sa, "speculative_num_draft_tokens", None)
+    if window_size is None or block_size is None:
+        raise ValueError(
+            "Exact DFlash draft-ring sizing requires explicit draft window and "
+            "draft-token block size."
+        )
+    page_size = int(sa.page_size)
+    alloc_reserve = get_alloc_reserve_per_decode(sa)
+
+    # Match the currently qualified envelope enforced by DFlashWorkerV2. Doing
+    # this before target allocation prevents sizing a pool for a worker that
+    # would later reject its topology.
+    qualified = {
+        "window_size": (int(window_size), 2048),
+        "page_size": (page_size, 32),
+        "block_size": (int(block_size), 5),
+        "alloc_reserve": (int(alloc_reserve), 10),
+        "request_rows": (request_rows, 9),
+        "tp_size": (int(kvc.ps.tp_size), 8),
+        "attn_dp_size": (attn_dp_size, 1),
+        "pp_size": (int(sa.pp_size), 1),
+        "dcp_size": (int(sa.dcp_size), 1),
+    }
+    drift = [
+        f"{name}={actual} (requires {expected})"
+        for name, (actual, expected) in qualified.items()
+        if actual != expected
+    ]
+    if drift:
+        raise ValueError(
+            "Exact DFlash draft-ring sizing only supports the qualified envelope: "
+            + ", ".join(drift)
+        )
+
+    from sglang.srt.speculative.dflash_draft_ring import (
+        build_dflash_draft_ring_config,
+    )
+
+    ring = build_dflash_draft_ring_config(
+        window_size=int(window_size),
+        page_size=page_size,
+        block_size=int(block_size),
+        alloc_reserve=int(alloc_reserve),
+        request_rows=request_rows,
+    )
+    if envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT.get():
+        from sglang.srt.speculative.dflash_draft_snapshot import (
+            build_dflash_draft_snapshot_config,
+        )
+
+        padded_tokens = build_dflash_draft_snapshot_config(ring).padded_tokens
+    else:
+        padded_tokens = ring.padded_tokens
+
+    total_kv_heads = int(required_aux["dflash_draft_total_num_kv_heads"])
+    local_kv_heads = max(1, total_kv_heads // int(get_parallel().attn_tp_size))
+    per_layer_per_token = (
+        local_kv_heads
+        * (
+            int(required_aux["dflash_draft_head_dim"])
+            + int(required_aux["dflash_draft_v_head_dim"])
+        )
+        * 2
+    )
+    draft_cell_size_per_token = per_layer_per_token * int(
+        required_aux["dflash_draft_num_layers"]
+    )
+    return int(padded_tokens) * draft_cell_size_per_token
 
 
 def _get_turboquant_bits(kvc: KVCacheConfigurator) -> Optional[tuple[int, int]]:
@@ -131,6 +290,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
+        self._target_fixed_bytes = 0
+        self._draft_fixed_bytes = 0
         # Determine effective number of layers for KV cache
         if mambaish := mambaish_config(kvc.model_config):
             effective_layer_ids = [
@@ -143,6 +304,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
+        if is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str):
+            self._target_fixed_bytes = _native_e2m1_target_fixed_bytes(
+                target_cell_size_per_token=self._cell_size,
+                page_size=int(kvc.server_args.page_size),
+            )
         has_kv_on_another_pp_stage = (
             self._cell_size == 0
             and mambaish is not None
@@ -175,21 +341,33 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: scale cell_size to account for draft model KV cache
         if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
-            from sglang.srt.speculative.dflash_utils import (
-                scale_kv_cell_size_per_token_for_dflash,
-            )
-
             draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
+            use_physical_draft_ring = envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.get()
             if (
+                is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str)
+                and not use_physical_draft_ring
+            ):
+                raise ValueError(
+                    "Native E2M1 target + DFlash requires the qualified physical "
+                    "BF16 draft ring for exact role-aware sizing."
+                )
+            if use_physical_draft_ring:
+                self._draft_fixed_bytes = _dflash_draft_ring_fixed_bytes(kvc)
+            elif (
                 draft_num_layers is not None
                 and int(draft_num_layers) > 0
                 and int(num_layers) > 0
             ):
+                from sglang.srt.speculative.dflash_utils import (
+                    scale_kv_cell_size_per_token_for_dflash,
+                )
+
                 self._cell_size = scale_kv_cell_size_per_token_for_dflash(
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers) * kvc.server_args.dcp_size,
                 )
+        self._fixed_bytes = self._target_fixed_bytes + self._draft_fixed_bytes
 
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes. Subclasses can override."""
@@ -208,8 +386,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_parallel().attn_tp_size
 
         turboquant_bits = _get_turboquant_bits(kvc)
+        if (
+            is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str)
+            and not kvc.use_mla_backend
+        ):
+            raise ValueError("Native E2M1 KV cache sizing only supports MLA.")
         if kvc.use_mla_backend:
-            if turboquant_bits is not None:
+            if is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str):
+                if (
+                    model_config.kv_lora_rank != 512
+                    or model_config.qk_rope_head_dim != 64
+                ):
+                    raise ValueError(
+                        "Native E2M1 MLA sizing requires kv_lora_rank=512 and "
+                        "qk_rope_head_dim=64, got "
+                        f"{model_config.kv_lora_rank} and "
+                        f"{model_config.qk_rope_head_dim}."
+                    )
+                # Exact MLATokenToKVPoolNativeE2M1 row: packed latent uint8,
+                # one BF16 scale, and FP8 RoPE.
+                per_layer_per_token = 512 // 2 + 2 + 64
+                cell_size = per_layer_per_token * effective_num_layers
+            elif turboquant_bits is not None:
                 # MLA + TurboQuant: nope half is packed k-bit + per-token scale,
                 # rope half stays uncompressed bf16. Matches storage layout in
                 # MLATokenToKVPoolTurboQuant.
@@ -379,8 +577,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        available_bytes_for_tokens = max(int(available_bytes) - self._fixed_bytes, 0)
         max_total_num_tokens = (
-            available_bytes // self._cell_size
+            available_bytes_for_tokens // self._cell_size
             if self._cell_size
             else self._zero_kv_max_tokens
         )
