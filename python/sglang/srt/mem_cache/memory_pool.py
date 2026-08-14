@@ -4735,6 +4735,9 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
             device=device,
             head_dim=kv_lora_rank,
         )
+        self._native_e2m1_use_sm100_writer = (
+            envs.SGLANG_TQ_MLA_NATIVE_SM100_WRITER.get()
+        )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -4797,6 +4800,12 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
             device=self.device,
         )
         self._tq_mla_kv_write_y = torch.empty_like(self._tq_mla_kv_write_unit)
+        # One process-lifetime sticky fault word is shared by every layer and
+        # graph replay.  The SM100 writer sets bit zero before returning from
+        # an invalid location; it never allocates status per layer or request.
+        self._native_e2m1_fault_status = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
 
         # MLATokenToKVPool.__init__ creates legacy pointer bookkeeping from
         # kv_buffer after this hook.  Keep the alias only for that internal
@@ -4829,6 +4838,8 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
         del self._tq_mla_kv_write_unit
         del self._tq_mla_kv_write_norms
         del self._tq_mla_kv_write_y
+        del self._native_e2m1_fault_status
+        del self._native_e2m1_use_sm100_writer
         del self._native_e2m1_buffer_sets
 
     def _layer_index(self, layer_id: int) -> int:
@@ -4845,6 +4856,10 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         layer_id_rel = self._layer_index(layer_id)
         return self._native_e2m1_buffer_sets[layer_id_rel]
+
+    def get_native_e2m1_fault_status(self) -> torch.Tensor:
+        """Return the process-lifetime sticky SM100 writer status word."""
+        return self._native_e2m1_fault_status
 
     def get_native_e2m1_contiguous_buf_infos(self):
         """Return explicit packed/scale/RoPE spans for format-aware audits."""
@@ -4936,29 +4951,50 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
                 f"got {cache_k_nope.dtype} and {cache_k_rope.dtype}."
             )
 
-        from sglang.kernels.ops.attention.turboquant_quantize import (
-            fused_native_e2m1_mla_quantize_and_store,
-        )
-
         layer_id_rel = self._layer_index(layer.layer_id)
         cfg = self.tq_config
-        fused_native_e2m1_mla_quantize_and_store(
-            cache_k_nope,
-            cfg.signs1,
-            cfg.signs2,
-            cfg.boundaries,
-            cfg.levels,
-            cfg.codes,
-            cfg.grid,
-            self.kv_nope_packed_buffer[layer_id_rel],
-            self.kv_nope_scale_buffer[layer_id_rel],
-            loc,
-            cache_k_rope,
-            self.kv_rope_buffer[layer_id_rel],
-            pre_unit=self._tq_mla_kv_write_unit,
-            pre_norms=self._tq_mla_kv_write_norms,
-            pre_y=self._tq_mla_kv_write_y,
-        )
+        if self._native_e2m1_use_sm100_writer:
+            from sglang.kernels.jit.tq_mla_frontend import (
+                tq_mla_cache_writer_out,
+            )
+
+            tq_mla_cache_writer_out(
+                cache_k_nope,
+                cache_k_rope,
+                loc,
+                cfg.signs1,
+                cfg.signs2,
+                cfg.boundaries,
+                cfg.levels,
+                cfg.codes,
+                self.kv_nope_packed_buffer[layer_id_rel],
+                self.kv_nope_scale_buffer[layer_id_rel],
+                self.kv_rope_buffer[layer_id_rel],
+                self._native_e2m1_fault_status,
+                grid=cfg.grid,
+            )
+        else:
+            from sglang.kernels.ops.attention.turboquant_quantize import (
+                fused_native_e2m1_mla_quantize_and_store,
+            )
+
+            fused_native_e2m1_mla_quantize_and_store(
+                cache_k_nope,
+                cfg.signs1,
+                cfg.signs2,
+                cfg.boundaries,
+                cfg.levels,
+                cfg.codes,
+                cfg.grid,
+                self.kv_nope_packed_buffer[layer_id_rel],
+                self.kv_nope_scale_buffer[layer_id_rel],
+                loc,
+                cache_k_rope,
+                self.kv_rope_buffer[layer_id_rel],
+                pre_unit=self._tq_mla_kv_write_unit,
+                pre_norms=self._tq_mla_kv_write_norms,
+                pre_y=self._tq_mla_kv_write_y,
+            )
 
     def _warmup_native_e2m1_write(self):
         if self.layer_num <= 0:
@@ -4977,6 +5013,10 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
             cache_k_rope,
         )
         torch.cuda.synchronize()
+        if self._native_e2m1_fault_status.item() != 0:
+            raise RuntimeError(
+                "Native E2M1 SM100 writer reported an invalid warmup location."
+            )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         size_limit = self.size + self.page_size
