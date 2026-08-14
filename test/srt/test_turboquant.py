@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import math
 import os
 import unittest
@@ -35,6 +36,7 @@ class TestTurboQuantCLI(unittest.TestCase):
         for dtype in (
             "turboquant_2bit",
             "turboquant_4bit",
+            "turboquant_4bit_e2m1",
             "turboquant_4bit_uniform",
             "turboquant_k4v2",
         ):
@@ -56,9 +58,40 @@ class TestTurboQuantCLI(unittest.TestCase):
             (4, 4, True),
         )
         self.assertEqual(
+            parse_turboquant_kv_cache_dtype("turboquant_4bit_e2m1"),
+            (4, 4, False),
+        )
+        self.assertEqual(
             parse_turboquant_kv_cache_dtype("turboquant_k4v2"), (4, 2, False)
         )
         self.assertIsNone(parse_turboquant_kv_cache_dtype("bf16"))
+
+    def test_native_e2m1_dtype_identity_is_explicit(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            is_native_e2m1_mla_kv_cache_dtype,
+        )
+
+        self.assertTrue(
+            is_native_e2m1_mla_kv_cache_dtype("turboquant_4bit_e2m1")
+        )
+        self.assertFalse(is_native_e2m1_mla_kv_cache_dtype("turboquant_4bit"))
+        self.assertFalse(is_native_e2m1_mla_kv_cache_dtype(None))
+
+    def test_native_e2m1_format_fails_closed_until_pool_is_wired(self):
+        from sglang.srt.model_executor.model_runner_components.turboquant_compat import (
+            validate_turboquant_transfer_compatibility,
+        )
+
+        with self.assertRaisesRegex(ValueError, "matched native-E2M1 MLA writer"):
+            validate_turboquant_transfer_compatibility(
+                kv_cache_dtype="turboquant_4bit_e2m1",
+                disaggregation_mode="null",
+                enable_hierarchical_cache=False,
+                use_mla_backend=True,
+                prefill_attention_backend="tokenspeed_mla",
+                decode_attention_backend="tokenspeed_mla",
+                mla_fused_decode_enabled=True,
+            )
 
     def test_model_runner_configures_mha_backend_through_override(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
@@ -361,6 +394,107 @@ class TestCodebook(unittest.TestCase):
         from sglang.srt.layers.quantization.kv_turboquant import build_codebook
         centroids, boundaries = build_codebook(4, head_dim=128)
         self.assertEqual(len(centroids), 16)
+
+
+class TestNativeE2M1Contract(unittest.TestCase):
+
+    def test_frozen_levels_map_to_exact_hardware_codes(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NATIVE_E2M1_CODES,
+            NATIVE_E2M1_LEVELS,
+            NativeE2M1MLAConfig,
+            select_native_e2m1_codes,
+        )
+
+        cfg = NativeE2M1MLAConfig(device="cpu")
+        rotated = torch.tensor(NATIVE_E2M1_LEVELS, dtype=torch.float32)
+        rotated = rotated[:, None].expand(-1, cfg.head_dim) * cfg.grid
+        codes, raw_levels = select_native_e2m1_codes(rotated, cfg)
+
+        expected_codes = torch.tensor(NATIVE_E2M1_CODES, dtype=torch.uint8)
+        expected_codes = expected_codes[:, None].expand_as(codes)
+        expected_levels = torch.tensor(NATIVE_E2M1_LEVELS, dtype=torch.float32)
+        expected_levels = expected_levels[:, None].expand_as(raw_levels)
+        torch.testing.assert_close(codes, expected_codes, rtol=0, atol=0)
+        torch.testing.assert_close(raw_levels, expected_levels, rtol=0, atol=0)
+        self.assertNotIn(8, codes.unique().tolist())
+
+    def test_every_code_packs_in_both_nibble_positions(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NATIVE_E2M1_CODES,
+            pack_native_e2m1_codes,
+        )
+
+        codes = torch.tensor(NATIVE_E2M1_CODES, dtype=torch.uint8)
+        low = torch.stack((codes, torch.zeros_like(codes)), dim=-1)
+        high = torch.stack((torch.zeros_like(codes), codes), dim=-1)
+        torch.testing.assert_close(
+            pack_native_e2m1_codes(low).squeeze(-1), codes, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            pack_native_e2m1_codes(high).squeeze(-1), codes << 4, rtol=0, atol=0
+        )
+
+    def test_scale_operation_order_and_zero_rule_are_frozen(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NATIVE_E2M1_LEVELS,
+            NativeE2M1MLAConfig,
+            quantize_native_e2m1_rotated,
+        )
+
+        cfg = NativeE2M1MLAConfig(device="cpu")
+        levels = torch.tensor(NATIVE_E2M1_LEVELS, dtype=torch.float32)
+        raw = levels.repeat((cfg.head_dim + len(levels) - 1) // len(levels))
+        raw = raw[: cfg.head_dim]
+        rotated = torch.stack((raw * cfg.grid, torch.ones_like(raw)))
+        norms = torch.tensor([3.25, 0.0], dtype=torch.float32)
+
+        packed, scales = quantize_native_e2m1_rotated(rotated, norms, cfg)
+        expected_scale = (
+            (norms[0] / torch.linalg.vector_norm(raw * cfg.grid)) * cfg.grid
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(scales[0], expected_scale, rtol=0, atol=0)
+        self.assertEqual(scales[1].item(), 0.0)
+        self.assertEqual(torch.count_nonzero(packed[1]).item(), 0)
+
+    def test_native_signs_match_stock_seed_42_identity(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NativeE2M1MLAConfig,
+            TurboQuantConfig,
+        )
+
+        native = NativeE2M1MLAConfig(device="cpu")
+        stock = TurboQuantConfig(bit_width=4, head_dim=512, device="cpu")
+        torch.testing.assert_close(native.signs1, stock.signs1, rtol=0, atol=0)
+        torch.testing.assert_close(native.signs2, stock.signs2, rtol=0, atol=0)
+        self.assertEqual(
+            hashlib.sha256(native.signs1.numpy().tobytes()).hexdigest(),
+            "1b6c7d653224e6f3cedfa54cc12346fc1b92911743620e6108e594e5ba49bdcc",
+        )
+        self.assertEqual(
+            hashlib.sha256(native.signs2.numpy().tobytes()).hexdigest(),
+            "7df6518ccbd93f08e23a6fe647819f1109abb753cfa8d0831afa1dd8354c6a4f",
+        )
+
+    def test_native_contract_rejects_unsupported_shape_and_codes(self):
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NativeE2M1MLAConfig,
+            pack_native_e2m1_codes,
+            select_native_e2m1_codes,
+        )
+
+        with self.assertRaisesRegex(ValueError, "head_dim=512"):
+            NativeE2M1MLAConfig(device="cpu", head_dim=256)
+
+        cfg = NativeE2M1MLAConfig(device="cpu")
+        with self.assertRaisesRegex(ValueError, "final dimension"):
+            select_native_e2m1_codes(torch.zeros(1, 256), cfg)
+        with self.assertRaisesRegex(ValueError, "even final dimension"):
+            pack_native_e2m1_codes(torch.zeros(3, dtype=torch.uint8))
+        with self.assertRaisesRegex(TypeError, "must be uint8"):
+            pack_native_e2m1_codes(torch.zeros(4, dtype=torch.int32))
+        with self.assertRaisesRegex(ValueError, "fit in four bits"):
+            pack_native_e2m1_codes(torch.tensor([0, 16], dtype=torch.uint8))
 
 
 class TestTurboQuantConfig(unittest.TestCase):

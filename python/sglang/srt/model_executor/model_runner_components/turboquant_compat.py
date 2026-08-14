@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from sglang.srt.layers.quantization.kv_turboquant import (
+    is_native_e2m1_mla_kv_cache_dtype,
+)
+
 
 def validate_turboquant_transfer_compatibility(
     *,
@@ -17,6 +21,13 @@ def validate_turboquant_transfer_compatibility(
         and kv_cache_dtype.startswith("turboquant_")
     ):
         return
+
+    if is_native_e2m1_mla_kv_cache_dtype(kv_cache_dtype):
+        raise ValueError(
+            "--kv-cache-dtype=turboquant_4bit_e2m1 is reserved for the matched "
+            "native-E2M1 MLA writer, pool, and reader, which are not enabled "
+            "in this source revision. Use a supported --kv-cache-dtype."
+        )
 
     if disaggregation_mode != "null":
         raise ValueError(

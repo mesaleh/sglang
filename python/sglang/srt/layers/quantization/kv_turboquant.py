@@ -21,11 +21,52 @@ import numpy as np
 import torch
 
 
+NATIVE_E2M1_MLA_KV_CACHE_DTYPE = "turboquant_4bit_e2m1"
+NATIVE_E2M1_MLA_HEAD_DIM = 512
+NATIVE_E2M1_GRID_NUMERATOR = 0.48707925311412725
+
+# These are the sorted reconstruction values used by the accepted N8
+# quantizer.  Their positions are *not* hardware FP4 codes.  Keep the
+# explicit remap alongside the values so this format cannot be confused with
+# the learned-centroid indices stored by ``turboquant_4bit``.
+NATIVE_E2M1_LEVELS = (
+    -6.0,
+    -4.0,
+    -3.0,
+    -2.0,
+    -1.5,
+    -1.0,
+    -0.5,
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+)
+NATIVE_E2M1_CODES = (15, 14, 13, 12, 11, 10, 9, 0, 1, 2, 3, 4, 5, 6, 7)
+
+
+def is_native_e2m1_mla_kv_cache_dtype(value: object) -> bool:
+    """Return whether ``value`` names the native-E2M1 MLA cache ABI."""
+
+    return value == NATIVE_E2M1_MLA_KV_CACHE_DTYPE
+
+
 def parse_turboquant_kv_cache_dtype(
     value: str,
 ) -> Optional[tuple[int, int, bool]]:
     if not value.startswith("turboquant_"):
         return None
+
+    # Native E2M1 uses the common 4-bit TurboQuant plumbing, but its packed
+    # nibbles have a distinct ABI.  Pool/backend selection must additionally
+    # check ``is_native_e2m1_mla_kv_cache_dtype`` and must never infer the
+    # native representation from this tuple alone.
+    if is_native_e2m1_mla_kv_cache_dtype(value):
+        return 4, 4, False
 
     payload = value.removeprefix("turboquant_")
     uniform = payload.endswith("_uniform")
@@ -38,6 +79,125 @@ def parse_turboquant_kv_cache_dtype(
 
     bits = int(payload.removesuffix("bit"))
     return bits, bits, uniform
+
+
+class NativeE2M1MLAConfig:
+    """Frozen constants for the accepted rank-512 native-E2M1 MLA format.
+
+    This is intentionally separate from :class:`TurboQuantConfig`: the stock
+    format stores learned-centroid indices, while this format stores hardware
+    E2M1 codes and a differently defined token scale.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: str | torch.device,
+        head_dim: int = NATIVE_E2M1_MLA_HEAD_DIM,
+        seed: int = 42,
+    ) -> None:
+        if head_dim != NATIVE_E2M1_MLA_HEAD_DIM:
+            raise ValueError(
+                "Native E2M1 MLA currently requires head_dim=512, "
+                f"got {head_dim}."
+            )
+
+        self.head_dim = head_dim
+        self.bit_width = 4
+        self.packed_dim = head_dim // 2
+        self.grid = NATIVE_E2M1_GRID_NUMERATOR / math.sqrt(head_dim)
+        self.levels = torch.tensor(
+            NATIVE_E2M1_LEVELS, dtype=torch.float32, device=device
+        )
+        self.boundaries = (self.levels[:-1] + self.levels[1:]) / 2.0
+        self.codes = torch.tensor(
+            NATIVE_E2M1_CODES, dtype=torch.uint8, device=device
+        )
+
+        rng = np.random.default_rng(seed)
+        self.signs1 = torch.tensor(
+            rng.choice([-1.0, 1.0], size=head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.signs2 = torch.tensor(
+            rng.choice([-1.0, 1.0], size=head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+
+
+def select_native_e2m1_codes(
+    rotated_unit: torch.Tensor,
+    config: NativeE2M1MLAConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select sorted N8 levels and return their hardware E2M1 codes.
+
+    Returns ``(codes, raw_levels)``.  The selector divides by the frozen grid
+    before bucketizing, matching the accepted oracle's operation order.
+    """
+
+    if rotated_unit.shape[-1] != config.head_dim:
+        raise ValueError(
+            "Native E2M1 MLA expects a final dimension of "
+            f"{config.head_dim}, got {rotated_unit.shape[-1]}."
+        )
+    indices = torch.searchsorted(
+        config.boundaries, rotated_unit.float() / config.grid
+    )
+    return config.codes[indices], config.levels[indices]
+
+
+def pack_native_e2m1_codes(codes: torch.Tensor) -> torch.Tensor:
+    """Pack adjacent hardware E2M1 codes, first value in the low nibble."""
+
+    if codes.shape[-1] % 2:
+        raise ValueError(
+            "Native E2M1 packing requires an even final dimension, "
+            f"got {codes.shape[-1]}."
+        )
+    if codes.dtype != torch.uint8:
+        raise TypeError(f"Native E2M1 codes must be uint8, got {codes.dtype}.")
+    if bool(torch.any(codes > 0x0F)):
+        raise ValueError("Native E2M1 codes must fit in four bits.")
+
+    pairs = codes.reshape(*codes.shape[:-1], codes.shape[-1] // 2, 2)
+    return pairs[..., 0] | (pairs[..., 1] << 4)
+
+
+def quantize_native_e2m1_rotated(
+    rotated_unit: torch.Tensor,
+    norms: torch.Tensor,
+    config: NativeE2M1MLAConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference N8 selector/scale path for an already rotated unit vector.
+
+    This is the correctness oracle and bounded fallback for the fused writer;
+    it does not perform the WHT.  Zero vectors deterministically store code 0
+    and BF16 scale 0, including when their rotated input is nonzero garbage.
+    """
+
+    if norms.shape != rotated_unit.shape[:-1]:
+        raise ValueError(
+            "Native E2M1 norms must match all non-feature dimensions: "
+            f"got rotated={tuple(rotated_unit.shape)}, norms={tuple(norms.shape)}."
+        )
+
+    codes, raw_levels = select_native_e2m1_codes(rotated_unit, config)
+    zero_vectors = norms.float() <= 0
+    codes = torch.where(zero_vectors.unsqueeze(-1), 0, codes)
+
+    # Freeze the accepted scale operation order: first form raw*grid, then
+    # take its FP32 norm, then (norm/quant_norm)*grid, finally round to BF16.
+    quant_norms = torch.linalg.vector_norm(
+        raw_levels * config.grid, dim=-1, dtype=torch.float32
+    )
+    safe_quant_norms = torch.where(
+        quant_norms > 0, quant_norms, torch.ones_like(quant_norms)
+    )
+    scales = (norms.float() / safe_quant_norms) * config.grid
+    scales = torch.where(zero_vectors, 0, scales).to(torch.bfloat16)
+    return pack_native_e2m1_codes(codes), scales
 
 
 # ---------------------------------------------------------------------------
