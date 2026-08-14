@@ -496,6 +496,72 @@ class TestNativeE2M1Contract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "fit in four bits"):
             pack_native_e2m1_codes(torch.tensor([0, 16], dtype=torch.uint8))
 
+    def test_native_pool_rejects_wrong_logical_dtype_shape_and_page(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolNativeE2M1,
+        )
+
+        common = dict(
+            size=32,
+            page_size=32,
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        with self.assertRaisesRegex(ValueError, "BF16 logical/model dtype"):
+            MLATokenToKVPoolNativeE2M1(**(common | {"dtype": torch.float16}))
+        with self.assertRaisesRegex(ValueError, "kv_lora_rank=512"):
+            MLATokenToKVPoolNativeE2M1(**(common | {"kv_lora_rank": 256}))
+        with self.assertRaisesRegex(ValueError, "page_size=32"):
+            MLATokenToKVPoolNativeE2M1(**(common | {"page_size": 16}))
+
+    def test_native_pool_routing_is_explicit(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.kv_cache_dtype_str = "turboquant_4bit_e2m1"
+        configurator.kv_cache_dtype = torch.bfloat16
+        configurator.server_args = SimpleNamespace(
+            page_size=32,
+            enable_memory_saver=False,
+        )
+        configurator.model_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        configurator.layer_info = SimpleNamespace(
+            num_effective_layers=61,
+            start_layer=0,
+            end_layer=60,
+        )
+        configurator.device = "cuda"
+        sentinel = object()
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator."
+            "MLATokenToKVPoolNativeE2M1",
+            return_value=sentinel,
+        ) as constructor:
+            result = configurator._build_mla_turboquant_kv_pool(
+                max_total_num_tokens=12345
+            )
+
+        self.assertIs(result, sentinel)
+        constructor.assert_called_once_with(
+            12345,
+            page_size=32,
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=61,
+            device="cuda",
+            enable_memory_saver=False,
+            start_layer=0,
+            end_layer=60,
+        )
+
 
 class TestTurboQuantConfig(unittest.TestCase):
 
@@ -789,6 +855,196 @@ class TestTurboQuantGPU(unittest.TestCase):
         torch.testing.assert_close(scale[5], first[1], rtol=0, atol=0)
         torch.testing.assert_close(
             rope_out[5].view(torch.uint8), first[2].view(torch.uint8), rtol=0, atol=0
+        )
+
+    def test_native_e2m1_mla_pool_layout_write_and_lifecycle(self):
+        from sglang.kernels.ops.quantization.hadamard import (
+            hadamard_transform_with_signs,
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            quantize_native_e2m1_rotated,
+        )
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolNativeE2M1,
+        )
+
+        size = 96
+        page_size = 32
+        layers = 2
+        workspace_tokens = 4
+        with envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.override(
+            workspace_tokens
+        ):
+            pool = MLATokenToKVPoolNativeE2M1(
+                size=size,
+                page_size=page_size,
+                dtype=torch.bfloat16,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=layers,
+                device=self.device,
+                enable_memory_saver=False,
+            )
+
+        rows = size + page_size
+        self.assertEqual(pool.kv_nope_packed_buffer[0].shape, (rows, 1, 256))
+        self.assertEqual(pool.kv_nope_scale_buffer[0].shape, (rows, 1))
+        self.assertEqual(pool.kv_rope_buffer[0].shape, (rows, 1, 64))
+        self.assertEqual(pool.kv_nope_packed_buffer[0].dtype, torch.uint8)
+        self.assertEqual(pool.kv_nope_scale_buffer[0].dtype, torch.bfloat16)
+        self.assertEqual(pool.kv_rope_buffer[0].dtype, torch.float8_e4m3fn)
+        self.assertEqual(pool.get_kv_size_bytes(), rows * layers * 322)
+        self.assertEqual(
+            pool.get_native_e2m1_workspace_size_bytes(), workspace_tokens * 4100
+        )
+
+        descriptors = pool.get_native_e2m1_buffers(0)
+        self.assertEqual(descriptors.row_nbytes, 322)
+        ptrs, lens, item_lens = pool.get_native_e2m1_contiguous_buf_infos()
+        self.assertEqual(len(ptrs), layers * 3)
+        self.assertEqual(
+            lens,
+            layers
+            * [rows * 256, rows * 2, rows * 64],
+        )
+        self.assertEqual(
+            item_lens,
+            layers
+            * [page_size * 256, page_size * 2, page_size * 64],
+        )
+
+        torch.manual_seed(17082)
+        tokens = 9
+        x = torch.randn(
+            tokens, 1, 512, dtype=torch.bfloat16, device=self.device
+        )
+        rope = torch.randn(
+            tokens, 1, 64, dtype=torch.bfloat16, device=self.device
+        )
+        x[0].zero_()
+        loc = torch.tensor(
+            [127, 0, 31, 32, 95, 96, 64, 63, 1],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        layer = SimpleNamespace(layer_id=0)
+        pool.set_mla_kv_buffer(layer, loc, x, rope)
+
+        x_fp32 = x.float()
+        norms = torch.linalg.vector_norm(x_fp32, dim=-1, dtype=torch.float32)
+        safe_norms = torch.where(norms > 0, norms, torch.ones_like(norms))
+        unit = x_fp32 / safe_norms.unsqueeze(-1)
+        rotated = hadamard_transform_with_signs(
+            unit,
+            pool.tq_config.signs1,
+            pool.tq_config.signs2,
+            scale=1.0 / math.sqrt(512),
+        )
+        expected_packed, expected_scale = quantize_native_e2m1_rotated(
+            rotated, norms, pool.tq_config
+        )
+        torch.testing.assert_close(
+            descriptors.packed_nope[loc], expected_packed, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            descriptors.nope_scale[loc], expected_scale, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            descriptors.rope[loc].view(torch.uint8),
+            rope.to(torch.float8_e4m3fn).view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+        src = torch.tensor([31, 32, 96], dtype=torch.int64, device=self.device)
+        dst = torch.tensor([10, 11, 12], dtype=torch.int64, device=self.device)
+        before_move = tuple(tensor[src].clone() for tensor in descriptors.tensors)
+        pool.move_kv_cache(dst, src)
+        for tensor, expected in zip(descriptors.tensors, before_move):
+            torch.testing.assert_close(tensor[dst], expected, rtol=0, atol=0)
+
+        overwrite_x = torch.randn(
+            1, 1, 512, dtype=torch.bfloat16, device=self.device
+        )
+        overwrite_rope = torch.randn(
+            1, 1, 64, dtype=torch.bfloat16, device=self.device
+        )
+        overwrite_loc = torch.tensor([11], dtype=torch.int64, device=self.device)
+        old_row = tuple(tensor[11].clone() for tensor in descriptors.tensors)
+        pool.set_mla_kv_buffer(
+            layer, overwrite_loc, overwrite_x, overwrite_rope
+        )
+        self.assertFalse(torch.equal(descriptors.packed_nope[11], old_row[0]))
+        self.assertFalse(torch.equal(descriptors.nope_scale[11], old_row[1]))
+        self.assertFalse(
+            torch.equal(
+                descriptors.rope[11].view(torch.uint8), old_row[2].view(torch.uint8)
+            )
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "dense full-pool key"):
+            pool.get_key_buffer(0)
+        with self.assertRaisesRegex(RuntimeError, "dense full-pool value"):
+            pool.get_value_buffer(0)
+        with self.assertRaisesRegex(RuntimeError, "dense full-pool KV"):
+            pool.get_kv_buffer(0)
+        with self.assertRaisesRegex(RuntimeError, "row-gathered reconstruction"):
+            pool.get_mla_kv_buffer(layer, loc)
+        with self.assertRaisesRegex(RuntimeError, "PD/disaggregation"):
+            pool.get_contiguous_buf_infos()
+        with self.assertRaisesRegex(RuntimeError, "CPU KV offload"):
+            pool.get_cpu_copy(loc)
+
+    def test_native_e2m1_mla_pool_write_captures_and_replays(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolNativeE2M1,
+        )
+
+        with envs.SGLANG_TQ_MLA_KV_WRITE_WORKSPACE_TOKENS.override(8):
+            pool = MLATokenToKVPoolNativeE2M1(
+                size=32,
+                page_size=32,
+                dtype=torch.bfloat16,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                layer_num=1,
+                device=self.device,
+                enable_memory_saver=False,
+            )
+
+        layer = SimpleNamespace(layer_id=0)
+        x = torch.randn(4, 1, 512, dtype=torch.bfloat16, device=self.device)
+        rope = torch.randn(4, 1, 64, dtype=torch.bfloat16, device=self.device)
+        loc = torch.tensor([1, 31, 32, 63], dtype=torch.int32, device=self.device)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pool.set_mla_kv_buffer(layer, loc, x, rope)
+        graph.replay()
+        torch.cuda.synchronize()
+        first = tuple(
+            tensor[loc].clone()
+            for tensor in pool.get_native_e2m1_buffers(0).tensors
+        )
+
+        x.copy_(
+            torch.randn(4, 1, 512, dtype=torch.bfloat16, device=self.device)
+        )
+        rope.copy_(
+            torch.randn(4, 1, 64, dtype=torch.bfloat16, device=self.device)
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        second = tuple(
+            tensor[loc].clone()
+            for tensor in pool.get_native_e2m1_buffers(0).tensors
+        )
+        self.assertFalse(torch.equal(first[0], second[0]))
+        self.assertFalse(torch.equal(first[1], second[1]))
+        self.assertFalse(
+            torch.equal(first[2].view(torch.uint8), second[2].view(torch.uint8))
         )
 
     def _roundtrip(self, bits, tokens=64, heads=4):
