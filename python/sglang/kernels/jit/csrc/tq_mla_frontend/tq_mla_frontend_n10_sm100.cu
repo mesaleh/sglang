@@ -487,7 +487,7 @@ __device__ __forceinline__ void store_cache_row(
 }
 
 template <bool kRotationFused, bool kStrict, typename index_t, bool kApplyRope>
-__global__ void tq_mla_frontend_kernel(
+__device__ __forceinline__ void tq_mla_frontend_body(
     const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
     const __nv_bfloat16* cache_latent, const __nv_bfloat16* cache_rope,
     const index_t* locations, const float* signs1, const float* signs2,
@@ -502,12 +502,11 @@ __global__ void tq_mla_frontend_kernel(
     const int64_t packed_stride_h, const int64_t scale_stride_s,
     const int64_t rope_cache_stride_s, const int64_t rope_cache_stride_h,
     const float* cos_sin_cache, const int64_t* positions,
-    const int64_t cos_sin_stride_t, const int64_t max_positions) {
+    const int64_t cos_sin_stride_t, const int64_t max_positions,
+    unsigned int* warp_faults) {
   const int token = blockIdx.x;
   const int warp = threadIdx.x >> 5;
   const int lane = threadIdx.x & 31;
-
-  __shared__ unsigned int warp_faults[kQueryHeads + 1];
 
   unsigned int faults = 0;
   const int64_t slot = static_cast<int64_t>(locations[token]);
@@ -577,6 +576,64 @@ __global__ void tq_mla_frontend_kernel(
       atomicAdd(reinterpret_cast<unsigned long long*>(zero_count), 1ULL);
     }
   }
+}
+
+template <bool kStrict, typename index_t, bool kApplyRope>
+__global__ void tq_mla_frontend_unfused_kernel(
+    const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
+    const __nv_bfloat16* cache_latent, const __nv_bfloat16* cache_rope,
+    const index_t* locations, const float* signs1, const float* signs2,
+    const float* boundaries, const float* levels,
+    const uint8_t* storage_codes, uint8_t* query_latent_out,
+    __nv_bfloat16* query_rope_out, uint8_t* packed_cache,
+    __nv_bfloat16* scale_cache, __nv_bfloat16* rope_cache,
+    int32_t* fault_status, int64_t* zero_count, const int64_t pool_size,
+    const float grid, const int64_t cache_latent_stride_t,
+    const int64_t cache_latent_stride_h, const int64_t cache_rope_stride_t,
+    const int64_t cache_rope_stride_h, const int64_t packed_stride_s,
+    const int64_t packed_stride_h, const int64_t scale_stride_s,
+    const int64_t rope_cache_stride_s, const int64_t rope_cache_stride_h,
+    const float* cos_sin_cache, const int64_t* positions,
+    const int64_t cos_sin_stride_t, const int64_t max_positions) {
+  __shared__ unsigned int warp_faults[kQueryHeads + 1];
+  tq_mla_frontend_body<false, kStrict, index_t, kApplyRope>(
+      query_latent, query_rope, cache_latent, cache_rope, locations, signs1,
+      signs2, boundaries, levels, storage_codes, query_latent_out,
+      query_rope_out, packed_cache, scale_cache, rope_cache, fault_status,
+      zero_count, pool_size, grid, cache_latent_stride_t,
+      cache_latent_stride_h, cache_rope_stride_t, cache_rope_stride_h,
+      packed_stride_s, packed_stride_h, scale_stride_s,
+      rope_cache_stride_s, rope_cache_stride_h, cos_sin_cache, positions,
+      cos_sin_stride_t, max_positions, warp_faults);
+}
+
+template <bool kStrict, typename index_t, bool kApplyRope>
+__global__ void __launch_bounds__(288, 4) tq_mla_frontend_fused_kernel(
+    const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
+    const __nv_bfloat16* cache_latent, const __nv_bfloat16* cache_rope,
+    const index_t* locations, const float* signs1, const float* signs2,
+    const float* boundaries, const float* levels,
+    const uint8_t* storage_codes, uint8_t* query_latent_out,
+    __nv_bfloat16* query_rope_out, uint8_t* packed_cache,
+    __nv_bfloat16* scale_cache, __nv_bfloat16* rope_cache,
+    int32_t* fault_status, int64_t* zero_count, const int64_t pool_size,
+    const float grid, const int64_t cache_latent_stride_t,
+    const int64_t cache_latent_stride_h, const int64_t cache_rope_stride_t,
+    const int64_t cache_rope_stride_h, const int64_t packed_stride_s,
+    const int64_t packed_stride_h, const int64_t scale_stride_s,
+    const int64_t rope_cache_stride_s, const int64_t rope_cache_stride_h,
+    const float* cos_sin_cache, const int64_t* positions,
+    const int64_t cos_sin_stride_t, const int64_t max_positions) {
+  __shared__ unsigned int warp_faults[kQueryHeads + 1];
+  tq_mla_frontend_body<true, kStrict, index_t, kApplyRope>(
+      query_latent, query_rope, cache_latent, cache_rope, locations, signs1,
+      signs2, boundaries, levels, storage_codes, query_latent_out,
+      query_rope_out, packed_cache, scale_cache, rope_cache, fault_status,
+      zero_count, pool_size, grid, cache_latent_stride_t,
+      cache_latent_stride_h, cache_rope_stride_t, cache_rope_stride_h,
+      packed_stride_s, packed_stride_h, scale_stride_s,
+      rope_cache_stride_s, rope_cache_stride_h, cos_sin_cache, positions,
+      cos_sin_stride_t, max_positions, warp_faults);
 }
 
 template <bool kStrict, typename index_t>
@@ -891,28 +948,53 @@ void launch_frontend(
     cos_sin_stride_t = cos_sin_cache->stride(0);
     max_positions = cos_sin_cache->size(0);
   }
-  tq_mla_frontend_kernel<kRotationFused, kStrict, index_t, kApplyRope>
-      <<<dim3(tokens), dim3((kQueryHeads + 1) * 32), 0, stream>>>(
-          reinterpret_cast<const __nv_bfloat16*>(query_latent.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(query_rope.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(cache_latent.data_ptr()),
-          reinterpret_cast<const __nv_bfloat16*>(cache_rope.data_ptr()),
-          locations.data_ptr<index_t>(), signs1.data_ptr<float>(),
-          signs2.data_ptr<float>(), boundaries.data_ptr<float>(),
-          levels.data_ptr<float>(), storage_codes.data_ptr<uint8_t>(),
-          reinterpret_cast<uint8_t*>(query_latent_out.data_ptr()),
-          reinterpret_cast<__nv_bfloat16*>(query_rope_out.data_ptr()),
-          packed_cache.data_ptr<uint8_t>(),
-          reinterpret_cast<__nv_bfloat16*>(scale_cache.data_ptr()),
-          reinterpret_cast<__nv_bfloat16*>(rope_cache.data_ptr()),
-          fault_status.data_ptr<int32_t>(), zero_count.data_ptr<int64_t>(),
-          packed_cache.size(0), grid,
-          cache_latent.stride(0), cache_latent.stride(2),
-          cache_rope.stride(0), cache_rope.stride(2),
-          packed_cache.stride(0), packed_cache.stride(2),
-          scale_cache.stride(0), rope_cache.stride(0),
-          rope_cache.stride(2), cos_sin_ptr, positions_ptr,
-          cos_sin_stride_t, max_positions);
+  if constexpr (kRotationFused) {
+    tq_mla_frontend_fused_kernel<kStrict, index_t, kApplyRope>
+        <<<dim3(tokens), dim3((kQueryHeads + 1) * 32), 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(query_latent.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(query_rope.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(cache_latent.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(cache_rope.data_ptr()),
+            locations.data_ptr<index_t>(), signs1.data_ptr<float>(),
+            signs2.data_ptr<float>(), boundaries.data_ptr<float>(),
+            levels.data_ptr<float>(), storage_codes.data_ptr<uint8_t>(),
+            reinterpret_cast<uint8_t*>(query_latent_out.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(query_rope_out.data_ptr()),
+            packed_cache.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(scale_cache.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(rope_cache.data_ptr()),
+            fault_status.data_ptr<int32_t>(), zero_count.data_ptr<int64_t>(),
+            packed_cache.size(0), grid,
+            cache_latent.stride(0), cache_latent.stride(2),
+            cache_rope.stride(0), cache_rope.stride(2),
+            packed_cache.stride(0), packed_cache.stride(2),
+            scale_cache.stride(0), rope_cache.stride(0),
+            rope_cache.stride(2), cos_sin_ptr, positions_ptr,
+            cos_sin_stride_t, max_positions);
+  } else {
+    tq_mla_frontend_unfused_kernel<kStrict, index_t, kApplyRope>
+        <<<dim3(tokens), dim3((kQueryHeads + 1) * 32), 0, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(query_latent.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(query_rope.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(cache_latent.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(cache_rope.data_ptr()),
+            locations.data_ptr<index_t>(), signs1.data_ptr<float>(),
+            signs2.data_ptr<float>(), boundaries.data_ptr<float>(),
+            levels.data_ptr<float>(), storage_codes.data_ptr<uint8_t>(),
+            reinterpret_cast<uint8_t*>(query_latent_out.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(query_rope_out.data_ptr()),
+            packed_cache.data_ptr<uint8_t>(),
+            reinterpret_cast<__nv_bfloat16*>(scale_cache.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(rope_cache.data_ptr()),
+            fault_status.data_ptr<int32_t>(), zero_count.data_ptr<int64_t>(),
+            packed_cache.size(0), grid,
+            cache_latent.stride(0), cache_latent.stride(2),
+            cache_rope.stride(0), cache_rope.stride(2),
+            packed_cache.stride(0), packed_cache.stride(2),
+            scale_cache.stride(0), rope_cache.stride(0),
+            rope_cache.stride(2), cos_sin_ptr, positions_ptr,
+            cos_sin_stride_t, max_positions);
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

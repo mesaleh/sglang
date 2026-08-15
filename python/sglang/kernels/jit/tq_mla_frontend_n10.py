@@ -16,7 +16,7 @@ from torch.utils.cpp_extension import load
 
 _MODULE: ModuleType | None = None
 _MODULE_LOCK = threading.Lock()
-_MODULE_NAME = "sglang_tq_mla_frontend_sm100_a17_n10_w0_v1"
+_MODULE_NAME = "sglang_tq_mla_frontend_sm100_a17_n10_w1_r3b_v1"
 
 
 def _get_module() -> ModuleType:
