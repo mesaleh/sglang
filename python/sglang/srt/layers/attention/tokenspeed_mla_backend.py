@@ -29,10 +29,13 @@ the partial log-sum-exp needed by the cross-rank merge.
 """
 
 import logging
+import math
 from inspect import signature
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.attention.dcp_kernels import (
@@ -51,6 +54,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
     get_num_page_per_block_flashmla,
 )
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
+from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -104,6 +108,74 @@ def _custom_decode_mask_kwargs(
 # MAX_Q_LEN=8 covers EAGLE3 num_draft_tokens=4 plus headroom. Larger
 # speculative widths grow the bound at backend initialization.
 _TOKENSPEED_MAX_Q_LEN = 8
+_N10_KV_CACHE_DTYPE = "turboquant_4bit_e2m1_recip_bf16"
+_N10_QUERY_HEADS = 8
+_N10_LATENT_DIM = 512
+_N10_ROPE_DIM = 64
+_N10_PAGE_SIZE = 32
+_N10_QUERY_LENGTHS = (1, 5)
+_N10_PAGE_TABLE_TILE_PAGES = 4
+
+
+@triton.jit
+def _repeat_last_valid_mla_page_kernel(
+    block_tables,
+    seq_lens,
+    table_width: tl.constexpr,
+    table_stride: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    seq_len = tl.load(seq_lens + row).to(tl.int32)
+    num_pages = tl.minimum(tl.maximum(tl.cdiv(seq_len, PAGE_SIZE), 1), table_width)
+    last_page = tl.load(
+        block_tables + row * table_stride + num_pages - 1,
+        mask=seq_len > 0,
+        other=0,
+    )
+    mask = ((seq_len <= 0) | (offsets >= num_pages)) & (offsets < table_width)
+    tl.store(block_tables + row * table_stride + offsets, last_page, mask=mask)
+
+
+def _repeat_last_valid_mla_pages(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+) -> None:
+    """Fill TokenSpeed's 128-token TMA tail with a valid repeated page.
+
+    The logical sequence length still masks these entries in attention.  The
+    packed reader nevertheless requires every four-page TMA descriptor lane to
+    name valid storage, unlike the dense backend which tolerates ``-1`` tails.
+    """
+
+    if block_tables.ndim != 2 or block_tables.dtype != torch.int32:
+        raise ValueError("N10 block_tables must be a two-dimensional int32 tensor.")
+    if seq_lens.ndim != 1 or seq_lens.dtype != torch.int32:
+        raise ValueError("N10 seq_lens must be a one-dimensional int32 tensor.")
+    if block_tables.shape[0] != seq_lens.shape[0]:
+        raise ValueError(
+            "N10 block-table/sequence batch mismatch: "
+            f"{block_tables.shape[0]} versus {seq_lens.shape[0]}."
+        )
+    width = block_tables.shape[1]
+    if width <= 0 or width % _N10_PAGE_TABLE_TILE_PAGES:
+        raise ValueError(
+            "N10 block-table width must be a positive multiple of four pages, "
+            f"got {width}."
+        )
+    block_size = 256
+    _repeat_last_valid_mla_page_kernel[
+        (block_tables.shape[0], triton.cdiv(width, block_size))
+    ](
+        block_tables,
+        seq_lens,
+        table_width=width,
+        table_stride=block_tables.stride(0),
+        PAGE_SIZE=_N10_PAGE_SIZE,
+        BLOCK_SIZE=block_size,
+    )
 
 
 def _tokenspeed_workspace_nbytes(
@@ -166,16 +238,7 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             q_indptr_decode_buf,
         )
 
-        if self.data_type != torch.float8_e4m3fn:
-            raise ValueError(
-                "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
-                f"got data_type={self.data_type}."
-            )
-        if self.page_size not in (32, 64):
-            raise ValueError(
-                "tokenspeed_mla backend requires page_size in {32, 64}, "
-                f"got page_size={self.page_size}."
-            )
+        self._validate_cache_contract(model_runner)
 
         self._tokenspeed_workspace: Optional[torch.Tensor] = None
         if is_tokenspeed_mla_available():
@@ -223,6 +286,18 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
                         use_pdl=use_pdl,
                         enable_ex2_emulation=enable_ex2_emulation,
                     )
+
+    def _validate_cache_contract(self, model_runner: ModelRunner) -> None:
+        if self.data_type != torch.float8_e4m3fn:
+            raise ValueError(
+                "tokenspeed_mla backend requires --kv-cache-dtype fp8_e4m3, "
+                f"got data_type={self.data_type}."
+            )
+        if self.page_size not in (32, 64):
+            raise ValueError(
+                "tokenspeed_mla backend requires page_size in {32, 64}, "
+                f"got page_size={self.page_size}."
+            )
 
     def _fused_rope_fp8_quantize(
         self,
@@ -753,6 +828,442 @@ class TokenspeedMLABackend(TRTLLMMLABackend):
             max_seq_len_q=int(max_q_len),
             enable_pdl=is_arch_support_pdl(),
         )
+
+
+class TokenspeedTQE2M1MLABackend(TokenspeedMLABackend):
+    """No-shadow N10 packed-E2M1 MLA backend for the Kimi TP8 geometry."""
+
+    supports_custom_decode_mask: bool = False
+    supports_ragged_verify_graph: bool = False
+
+    def _validate_cache_contract(self, model_runner: ModelRunner) -> None:
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolNativeE2M1RecipBF16,
+        )
+
+        if model_runner.kv_cache_dtype_str != _N10_KV_CACHE_DTYPE:
+            raise ValueError(
+                "N10 TokenSpeed backend requires --kv-cache-dtype="
+                f"{_N10_KV_CACHE_DTYPE}, got {model_runner.kv_cache_dtype_str}."
+            )
+        if not isinstance(
+            model_runner.token_to_kv_pool, MLATokenToKVPoolNativeE2M1RecipBF16
+        ):
+            raise TypeError(
+                "N10 TokenSpeed backend requires the reciprocal-BF16-RoPE "
+                "native E2M1 pool."
+            )
+        if self.data_type != torch.bfloat16:
+            raise ValueError(
+                "N10 TokenSpeed backend requires BF16 logical model dtype, "
+                f"got {self.data_type}."
+            )
+        if (
+            self.page_size != _N10_PAGE_SIZE
+            or self.num_q_heads != _N10_QUERY_HEADS
+            or self.kv_lora_rank != _N10_LATENT_DIM
+            or self.qk_rope_head_dim != _N10_ROPE_DIM
+        ):
+            raise ValueError(
+                "N10 TokenSpeed backend requires page32/H8/latent512/RoPE64, "
+                f"got page{self.page_size}/H{self.num_q_heads}/"
+                f"latent{self.kv_lora_rank}/RoPE{self.qk_rope_head_dim}."
+            )
+        if get_parallel().dcp_enabled:
+            raise ValueError("N10 TokenSpeed backend does not support DCP.")
+        if self._unified_mla:
+            raise ValueError(
+                "N10 TokenSpeed backend requires the format-owning static pool; "
+                "unified dense MLA views are unsupported."
+            )
+        if self.speculative_topk not in (None, 1):
+            raise ValueError(
+                "N10 TokenSpeed backend supports only chain/top-k=1 target verify."
+            )
+        if not is_tokenspeed_mla_available() or not hasattr(
+            tokenspeed_mla, "tokenspeed_mla_decode_tq_e2m1"
+        ):
+            raise RuntimeError(
+                "The installed tokenspeed_mla package does not expose the "
+                "matched tokenspeed_mla_decode_tq_e2m1 reader."
+            )
+
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
+    ):
+        super().init_cuda_graph_state(max_bs, max_num_tokens, kv_indices_buf)
+        self._n10_graph_capacity = max_num_tokens
+        self._n10_query_latent = torch.empty(
+            (max_num_tokens, _N10_QUERY_HEADS, _N10_LATENT_DIM),
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        self._n10_query_rope = torch.empty(
+            (max_num_tokens, _N10_QUERY_HEADS, _N10_ROPE_DIM),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._n10_rotated_output = torch.empty(
+            (max_num_tokens, _N10_QUERY_HEADS, _N10_LATENT_DIM),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        self._n10_original_output = torch.empty_like(self._n10_rotated_output)
+
+    def _create_block_kv_indices(
+        self,
+        batch_size: int,
+        max_blocks: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor:
+        block_tables = super()._create_block_kv_indices(
+            batch_size,
+            max_blocks,
+            req_pool_indices,
+            seq_lens,
+            device,
+        )
+        seq_lens_i32 = (
+            seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
+        )
+        _repeat_last_valid_mla_pages(block_tables, seq_lens_i32)
+        return block_tables
+
+    def _apply_cuda_graph_metadata(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode,
+        spec_info=None,
+    ):
+        super()._apply_cuda_graph_metadata(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            forward_mode,
+            spec_info=spec_info,
+        )
+        metadata = self.decode_cuda_graph_metadata[bs]
+        _repeat_last_valid_mla_pages(
+            metadata.block_kv_indices,
+            metadata.seq_lens_k,
+        )
+
+    def _n10_buffers(self, num_tokens: int):
+        graph_capacity = getattr(self, "_n10_graph_capacity", 0)
+        if num_tokens <= graph_capacity:
+            return (
+                self._n10_query_latent[:num_tokens],
+                self._n10_query_rope[:num_tokens],
+                self._n10_rotated_output[:num_tokens],
+                self._n10_original_output[:num_tokens],
+            )
+
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+
+        if get_is_capture_mode():
+            raise RuntimeError(
+                "N10 decode token count exceeds the graph-stable allocation "
+                f"during capture: {num_tokens} > {graph_capacity}."
+            )
+        eager_capacity = getattr(self, "_n10_eager_capacity", 0)
+        if num_tokens > eager_capacity:
+            eager_capacity = max(num_tokens, eager_capacity * 2, 5)
+            self._n10_eager_query_latent = torch.empty(
+                (eager_capacity, _N10_QUERY_HEADS, _N10_LATENT_DIM),
+                dtype=torch.float8_e4m3fn,
+                device=self.device,
+            )
+            self._n10_eager_query_rope = torch.empty(
+                (eager_capacity, _N10_QUERY_HEADS, _N10_ROPE_DIM),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._n10_eager_rotated_output = torch.empty(
+                (eager_capacity, _N10_QUERY_HEADS, _N10_LATENT_DIM),
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            self._n10_eager_original_output = torch.empty_like(
+                self._n10_eager_rotated_output
+            )
+            self._n10_eager_capacity = eager_capacity
+        return (
+            self._n10_eager_query_latent[:num_tokens],
+            self._n10_eager_query_rope[:num_tokens],
+            self._n10_eager_rotated_output[:num_tokens],
+            self._n10_eager_original_output[:num_tokens],
+        )
+
+    def _write_cache_and_prepare_query(
+        self,
+        *,
+        q: torch.Tensor,
+        q_rope: torch.Tensor,
+        k: torch.Tensor,
+        k_rope: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        from sglang.kernels.jit.tq_mla_frontend_n10_native import (
+            tq_mla_n10_native_frontend_out,
+        )
+
+        num_tokens = q.shape[0]
+        query_latent, query_rope, rotated_out, original_out = self._n10_buffers(
+            num_tokens
+        )
+        pool_buffers = self.token_to_kv_pool.get_native_e2m1_recip_bf16_buffers(
+            layer.layer_id
+        )
+        tq_mla_n10_native_frontend_out(
+            q.view(num_tokens, _N10_QUERY_HEADS, _N10_LATENT_DIM),
+            q_rope.view(num_tokens, _N10_QUERY_HEADS, _N10_ROPE_DIM),
+            k.view(num_tokens, 1, _N10_LATENT_DIM),
+            k_rope.view(num_tokens, 1, _N10_ROPE_DIM),
+            forward_batch.out_cache_loc,
+            self.token_to_kv_pool.tq_config.signs1,
+            self.token_to_kv_pool.tq_config.signs2,
+            query_latent,
+            query_rope,
+            pool_buffers.packed_nope,
+            pool_buffers.nope_scale,
+            pool_buffers.reciprocal_rope,
+            self.token_to_kv_pool.get_native_e2m1_fault_status(),
+            self.token_to_kv_pool.get_native_e2m1_zero_count(),
+            grid=self.token_to_kv_pool.tq_config.grid,
+            rotation_fused=False,
+        )
+        return query_latent, query_rope, rotated_out, original_out
+
+    def _run_n10_attention(
+        self,
+        *,
+        query_latent: torch.Tensor,
+        query_rope: torch.Tensor,
+        rotated_out: torch.Tensor,
+        original_out: torch.Tensor,
+        query_len: int,
+        metadata,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        if query_len not in _N10_QUERY_LENGTHS:
+            raise RuntimeError(
+                "N10 TokenSpeed reader supports only q1 decode or q5 target "
+                f"verify, got q{query_len}."
+            )
+        num_tokens = query_latent.shape[0]
+        if num_tokens % query_len:
+            raise RuntimeError(
+                f"N10 q{query_len} token count {num_tokens} is not batch-uniform."
+            )
+        batch_size = num_tokens // query_len
+        if metadata is None:
+            raise RuntimeError("N10 decode metadata is unavailable.")
+        if metadata.block_kv_indices.shape[0] != batch_size:
+            raise RuntimeError(
+                "N10 query/page-table batch mismatch: "
+                f"{batch_size} versus {metadata.block_kv_indices.shape[0]}."
+            )
+        if tuple(metadata.seq_lens_k.shape) != (batch_size,):
+            raise RuntimeError(
+                "N10 query/sequence-length batch mismatch: "
+                f"expected {(batch_size,)}, got {tuple(metadata.seq_lens_k.shape)}."
+            )
+        pool_buffers = self.token_to_kv_pool.get_native_e2m1_recip_bf16_buffers(
+            layer.layer_id
+        )
+        packed = pool_buffers.packed_nope.view(-1, _N10_PAGE_SIZE, _N10_LATENT_DIM // 2)
+        scale = pool_buffers.nope_scale.view(-1, _N10_PAGE_SIZE)
+        reciprocal_rope = pool_buffers.reciprocal_rope.view(
+            -1, _N10_PAGE_SIZE, _N10_ROPE_DIM
+        )
+        query_latent_4d = query_latent.view(
+            batch_size, query_len, _N10_QUERY_HEADS, _N10_LATENT_DIM
+        )
+        query_rope_4d = query_rope.view(
+            batch_size, query_len, _N10_QUERY_HEADS, _N10_ROPE_DIM
+        )
+        rotated_out_4d = rotated_out.view(
+            batch_size, query_len, _N10_QUERY_HEADS, _N10_LATENT_DIM
+        )
+        tokenspeed_mla.tokenspeed_mla_decode_tq_e2m1(
+            query_latent=query_latent_4d,
+            query_rope=query_rope_4d,
+            packed_latent=packed,
+            reconstruction_scale=scale,
+            reciprocal_rope=reciprocal_rope,
+            workspace_buffer=self._ensure_workspace(query_latent.device, query_len),
+            block_tables=metadata.block_kv_indices,
+            seq_lens=metadata.seq_lens_k,
+            max_seq_len=int(metadata.max_seq_len_k),
+            softmax_scale=float(layer.scaling),
+            output_scale=1.0,
+            out=rotated_out_4d,
+            enable_pdl=is_arch_support_pdl(),
+        )
+        if getattr(self.token_to_kv_pool.tq_config, "output_rotation_fused", False):
+            return rotated_out.view(num_tokens, -1)
+        hadamard_transform_with_signs(
+            rotated_out,
+            self.token_to_kv_pool.tq_config.signs2,
+            self.token_to_kv_pool.tq_config.signs1,
+            scale=1.0 / math.sqrt(_N10_LATENT_DIM),
+            out=original_out,
+        )
+        return original_out.view(num_tokens, -1)
+
+    def forward_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ):
+        if not save_kv_cache:
+            raise RuntimeError("N10 decode requires the fused target cache write.")
+        if q_rope is None or k_rope is None:
+            raise RuntimeError("N10 decode requires post-RoPE BF16 q/k coordinates.")
+        if cos_sin_cache is not None:
+            raise RuntimeError("N10 outer MLA path must apply RoPE exactly once.")
+        if llama_4_scaling is not None:
+            raise RuntimeError("N10 does not yet support llama_4 query scaling.")
+        prepared = self._write_cache_and_prepare_query(
+            q=q,
+            q_rope=q_rope,
+            k=k,
+            k_rope=k_rope,
+            layer=layer,
+            forward_batch=forward_batch,
+        )
+        metadata = (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            or self.forward_decode_metadata
+        )
+        return self._run_n10_attention(
+            query_latent=prepared[0],
+            query_rope=prepared[1],
+            rotated_out=prepared[2],
+            original_out=prepared[3],
+            query_len=1,
+            metadata=metadata,
+            layer=layer,
+        )
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = False,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ):
+        if not forward_batch.forward_mode.is_target_verify():
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope,
+                k_rope,
+                cos_sin_cache,
+                is_neox,
+                llama_4_scaling,
+            )
+        if getattr(forward_batch.spec_info, "topk", 1) > 1:
+            raise RuntimeError("N10 target verify supports only DFlash top-k=1.")
+        if getattr(forward_batch.spec_info, "ragged_verify_layout", None) is not None:
+            raise RuntimeError("N10 ragged target verify is not yet supported.")
+        if q_rope is None or k_rope is None or cos_sin_cache is not None:
+            raise RuntimeError(
+                "N10 target verify requires post-RoPE BF16 q/k and no fused-RoPE input."
+            )
+        if not save_kv_cache or llama_4_scaling is not None:
+            raise RuntimeError(
+                "N10 target verify requires fused cache write and no llama_4 scaling."
+            )
+        prepared = self._write_cache_and_prepare_query(
+            q=q,
+            q_rope=q_rope,
+            k=k,
+            k_rope=k_rope,
+            layer=layer,
+            forward_batch=forward_batch,
+        )
+        metadata = (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            or self.forward_decode_metadata
+        )
+        query_len = forward_batch.spec_info.draft_token_num
+        return self._run_n10_attention(
+            query_latent=prepared[0],
+            query_rope=prepared[1],
+            rotated_out=prepared[2],
+            original_out=prepared[3],
+            query_len=query_len,
+            metadata=metadata,
+            layer=layer,
+        )
+
+    def prepare_prefill_qkv(
+        self,
+        *,
+        q: torch.Tensor,
+        q_pe: torch.Tensor,
+        kv_a: torch.Tensor,
+        k_pe: torch.Tensor,
+        positions: torch.Tensor,
+        layer: DeepseekV2AttentionMLA,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        kv = layer.kv_b_proj(kv_a)[0]
+        kv = kv.view(
+            -1, layer.num_local_heads, layer.qk_nope_head_dim + layer.v_head_dim
+        )
+        k_nope = kv[..., : layer.qk_nope_head_dim]
+        v_bf16 = kv[..., layer.qk_nope_head_dim :]
+        q_nope = q[..., : layer.qk_nope_head_dim]
+        q_fp8, k_fp8 = self._fused_rope_fp8_quantize(
+            q_nope=q_nope,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            cos_sin_cache=layer.rotary_emb.cos_sin_cache,
+            positions=positions,
+            is_neox=getattr(layer.rotary_emb, "is_neox_style", True),
+            qk_nope_head_dim=layer.qk_nope_head_dim,
+            qk_rope_head_dim=layer.qk_rope_head_dim,
+        )
+        v_fp8 = fp8_quantize(v_bf16, enable_pdl=is_arch_support_pdl())
+        _, k_pe_bf16 = layer.rotary_emb(positions, q_pe, k_pe)
+        self.token_to_kv_pool.set_mla_kv_buffer(
+            layer.attn_mha,
+            forward_batch.out_cache_loc,
+            kv_a.unsqueeze(1),
+            k_pe_bf16,
+        )
+        return q_fp8, k_fp8, v_fp8
 
 
 class TokenspeedMLAMultiStepDraftBackend(TRTLLMMLAMultiStepDraftBackend):

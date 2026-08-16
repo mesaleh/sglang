@@ -20,11 +20,8 @@ from typing import Optional
 import numpy as np
 import torch
 
-
 NATIVE_E2M1_MLA_KV_CACHE_DTYPE = "turboquant_4bit_e2m1"
-NATIVE_E2M1_RECIP_BF16_MLA_KV_CACHE_DTYPE = (
-    "turboquant_4bit_e2m1_recip_bf16"
-)
+NATIVE_E2M1_RECIP_BF16_MLA_KV_CACHE_DTYPE = "turboquant_4bit_e2m1_recip_bf16"
 NATIVE_E2M1_MLA_HEAD_DIM = 512
 NATIVE_E2M1_GRID_NUMERATOR = 0.48707925311412725
 
@@ -115,8 +112,7 @@ class NativeE2M1MLAConfig:
     ) -> None:
         if head_dim != NATIVE_E2M1_MLA_HEAD_DIM:
             raise ValueError(
-                "Native E2M1 MLA currently requires head_dim=512, "
-                f"got {head_dim}."
+                "Native E2M1 MLA currently requires head_dim=512, " f"got {head_dim}."
             )
 
         self.head_dim = head_dim
@@ -127,9 +123,8 @@ class NativeE2M1MLAConfig:
             NATIVE_E2M1_LEVELS, dtype=torch.float32, device=device
         )
         self.boundaries = (self.levels[:-1] + self.levels[1:]) / 2.0
-        self.codes = torch.tensor(
-            NATIVE_E2M1_CODES, dtype=torch.uint8, device=device
-        )
+        self.codes = torch.tensor(NATIVE_E2M1_CODES, dtype=torch.uint8, device=device)
+        self.output_rotation_fused = False
 
         rng = np.random.default_rng(seed)
         self.signs1 = torch.tensor(
@@ -141,6 +136,43 @@ class NativeE2M1MLAConfig:
             rng.choice([-1.0, 1.0], size=head_dim),
             dtype=torch.float32,
             device=device,
+        )
+
+    def fuse_inverse_rotation_into_mla_v_weight(
+        self, weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Fold the N10 inverse WHT into an absorbed MLA value weight.
+
+        ``weight`` is the logical ``[heads, latent, value]`` view consumed by
+        the post-attention BMM.  The returned tensor preserves the production
+        loader's physical ``[heads, value, latent]`` backing.
+        """
+
+        if weight.ndim != 3 or weight.shape[1] != self.head_dim:
+            raise ValueError(
+                "Native E2M1 MLA value-weight fusion expects "
+                f"[heads, {self.head_dim}, value], got {tuple(weight.shape)}."
+            )
+        if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError(
+                "Native E2M1 MLA value-weight fusion requires a real "
+                f"floating-point weight, got {weight.dtype}."
+            )
+
+        from sglang.kernels.ops.quantization.hadamard import (
+            hadamard_transform_with_signs,
+        )
+
+        heads, _, value_dim = weight.shape
+        rows = weight.float().permute(0, 2, 1).contiguous().view(-1, self.head_dim)
+        fused = hadamard_transform_with_signs(
+            rows,
+            self.signs1,
+            self.signs2,
+            scale=1.0 / math.sqrt(self.head_dim),
+        )
+        return (
+            fused.view(heads, value_dim, self.head_dim).to(weight.dtype).transpose(1, 2)
         )
 
 
@@ -159,9 +191,7 @@ def select_native_e2m1_codes(
             "Native E2M1 MLA expects a final dimension of "
             f"{config.head_dim}, got {rotated_unit.shape[-1]}."
         )
-    indices = torch.searchsorted(
-        config.boundaries, rotated_unit.float() / config.grid
-    )
+    indices = torch.searchsorted(config.boundaries, rotated_unit.float() / config.grid)
     return config.codes[indices], config.levels[indices]
 
 
@@ -345,10 +375,7 @@ def batched_quantize(
     if bit_width == 2:
         idx = indices_u8.view(tokens, heads, dim // 4, 4)
         packed = (
-            (idx[..., 3] << 6)
-            | (idx[..., 2] << 4)
-            | (idx[..., 1] << 2)
-            | idx[..., 0]
+            (idx[..., 3] << 6) | (idx[..., 2] << 4) | (idx[..., 1] << 2) | idx[..., 0]
         )
     elif bit_width == 4:
         idx = indices_u8.view(tokens, heads, dim // 2, 2)
@@ -408,7 +435,9 @@ def batched_dequantize(
 
     # 3. Norm correction: normalize y_hat back to unit norm
     y_hat_norm = torch.linalg.norm(y_hat, dim=-1, keepdim=True)
-    y_hat_norm = torch.where(y_hat_norm > 1e-10, y_hat_norm, torch.ones_like(y_hat_norm))
+    y_hat_norm = torch.where(
+        y_hat_norm > 1e-10, y_hat_norm, torch.ones_like(y_hat_norm)
+    )
     y_hat = y_hat / y_hat_norm
 
     # 4. Inverse WHT rotation: D1 @ H_norm @ D2 (reverse order, scale=1/√d)
@@ -524,17 +553,25 @@ class TurboQuantConfig:
         )
 
         # K packed dim/dtype
-        self.k_packed_dim, self.k_packed_dtype = self._packed_params(self.k_bit_width, head_dim)
+        self.k_packed_dim, self.k_packed_dtype = self._packed_params(
+            self.k_bit_width, head_dim
+        )
         # V packed dim/dtype
-        self.v_packed_dim, self.v_packed_dtype = self._packed_params(self.v_bit_width, head_dim)
+        self.v_packed_dim, self.v_packed_dtype = self._packed_params(
+            self.v_bit_width, head_dim
+        )
 
     @staticmethod
     def _packed_params(bits, head_dim):
         if bits == 2:
-            assert head_dim % 4 == 0, f"2-bit requires head_dim divisible by 4, got {head_dim}"
+            assert (
+                head_dim % 4 == 0
+            ), f"2-bit requires head_dim divisible by 4, got {head_dim}"
             return head_dim // 4, torch.uint8
         elif bits == 4:
-            assert head_dim % 2 == 0, f"4-bit requires head_dim divisible by 2, got {head_dim}"
+            assert (
+                head_dim % 2 == 0
+            ), f"4-bit requires head_dim divisible by 2, got {head_dim}"
             return head_dim // 2, torch.uint8
         else:
             raise ValueError(f"Unsupported bit_width: {bits}. Use 2 or 4.")
@@ -548,9 +585,14 @@ class TurboQuantConfig:
         Returns:
             q_rot: same shape and dtype as q, in WHT-rotated domain.
         """
-        from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
+        from sglang.kernels.ops.quantization.hadamard import (
+            hadamard_transform_with_signs,
+        )
+
         wht_scale = 1.0 / math.sqrt(self.head_dim)
-        return hadamard_transform_with_signs(q, self.signs1, self.signs2, scale=wht_scale)
+        return hadamard_transform_with_signs(
+            q, self.signs1, self.signs2, scale=wht_scale
+        )
 
     def inverse_rotate_output(self, o: torch.Tensor) -> torch.Tensor:
         """Apply inverse WHT rotation to attention output: O = D1 @ H_norm @ D2 @ O_rot.
@@ -561,11 +603,18 @@ class TurboQuantConfig:
         Returns:
             o_orig: same shape and dtype as o, in original domain.
         """
-        from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
-        wht_scale = 1.0 / math.sqrt(self.head_dim)
-        return hadamard_transform_with_signs(o, self.signs2, self.signs1, scale=wht_scale)
+        from sglang.kernels.ops.quantization.hadamard import (
+            hadamard_transform_with_signs,
+        )
 
-    def fuse_inverse_rotation_into_o_proj(self, o_proj_weight: torch.Tensor, num_heads: int) -> torch.Tensor:
+        wht_scale = 1.0 / math.sqrt(self.head_dim)
+        return hadamard_transform_with_signs(
+            o, self.signs2, self.signs1, scale=wht_scale
+        )
+
+    def fuse_inverse_rotation_into_o_proj(
+        self, o_proj_weight: torch.Tensor, num_heads: int
+    ) -> torch.Tensor:
         """Absorb inverse WHT rotation into o_proj weight matrix.
 
         Pre-computes W_O_rot so that: o_rot @ W_O_rot = inv_WHT(o_rot) @ W_O
@@ -578,7 +627,10 @@ class TurboQuantConfig:
         Returns:
             Transformed weight with inverse rotation baked in.
         """
-        from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
+        from sglang.kernels.ops.quantization.hadamard import (
+            hadamard_transform_with_signs,
+        )
+
         dtype = o_proj_weight.dtype
         dim = self.head_dim
         hidden = o_proj_weight.shape[1]
@@ -592,7 +644,9 @@ class TurboQuantConfig:
         # Reshape to (num_heads * hidden, dim), apply WHT, reshape back
         w_t = w.permute(0, 2, 1).contiguous().reshape(-1, dim)  # (heads*hidden, dim)
         wht_scale = 1.0 / math.sqrt(dim)
-        w_rot = hadamard_transform_with_signs(w_t, self.signs1, self.signs2, scale=wht_scale)
+        w_rot = hadamard_transform_with_signs(
+            w_t, self.signs1, self.signs2, scale=wht_scale
+        )
         w_rot = w_rot.reshape(num_heads, hidden, dim).permute(0, 2, 1).contiguous()
         return w_rot.reshape(num_heads * dim, hidden).to(dtype)
 

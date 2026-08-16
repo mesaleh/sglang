@@ -124,11 +124,15 @@ class WeightUpdater:
             return False, message
 
     def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
-        """Reject weight mutations while the CUDA IPC weight cache is active:
-        param.data is the daemon's master copy shared with every co-attached
-        engine, so an in-place update would silently corrupt them all.
+        """Reject mutations that would desynchronize derived weight state.
+
+        With the CUDA IPC weight cache, ``param.data`` is the daemon's master
+        copy shared with every co-attached engine. N10's output-domain fold is
+        another derived representation that an online checkpoint load cannot
+        currently reconstruct safely.
         """
-        mode = self.get_model_runner().server_args.weight_cache_mode
+        runner = self.get_model_runner()
+        mode = runner.server_args.weight_cache_mode
         if mode != "off":
             raise RuntimeError(
                 f"[weight_cache] {op} is not supported while the weight cache is "
@@ -137,6 +141,23 @@ class WeightUpdater:
                 f"corrupt the daemon's master copy and every co-attached engine. "
                 f"Restart with --weight-cache-mode off to use this operation."
             )
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
+        )
+
+        if is_native_e2m1_recip_bf16_mla_kv_cache_dtype(
+            getattr(runner, "kv_cache_dtype_str", None)
+        ):
+            allocator = getattr(runner, "token_to_kv_pool_allocator", None)
+            kvcache = allocator.get_kvcache() if allocator is not None else None
+            tq_config = getattr(kvcache, "tq_config", None)
+            if getattr(tq_config, "output_rotation_fused", False):
+                raise RuntimeError(
+                    f"N10 TurboQuant {op} is not supported after the inverse "
+                    "output rotation has been folded into absorbed MLA value "
+                    "weights. Restart the engine with the new checkpoint so "
+                    "weights and the attention output domain remain synchronized."
+                )
 
     def update_weights_from_disk(
         self: WeightUpdater,

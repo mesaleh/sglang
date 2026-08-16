@@ -92,6 +92,12 @@ def create_trtllm_mla_backend(runner):
 def create_tokenspeed_mla_backend(runner):
     if not runner.use_mla_backend:
         raise ValueError("tokenspeed_mla backend can only be used with MLA models.")
+    if runner.kv_cache_dtype_str == "turboquant_4bit_e2m1_recip_bf16":
+        from sglang.srt.layers.attention.tokenspeed_mla_backend import (
+            TokenspeedTQE2M1MLABackend,
+        )
+
+        return TokenspeedTQE2M1MLABackend(runner)
     from sglang.srt.layers.attention.tokenspeed_mla_backend import (
         TokenspeedMLABackend,
     )

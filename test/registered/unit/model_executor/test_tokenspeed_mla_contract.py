@@ -5,9 +5,13 @@ import pytest
 
 from sglang.srt.layers.attention import cutedsl_mla_backend as cutedsl_module
 from sglang.srt.layers.attention import tokenspeed_mla_backend as backend_module
+from sglang.srt.layers.attention.attention_registry import (
+    create_tokenspeed_mla_backend,
+)
 from sglang.srt.layers.attention.cutedsl_mla_backend import CuteDslMLABackend
 from sglang.srt.layers.attention.tokenspeed_mla_backend import (
     TokenspeedMLABackend,
+    TokenspeedTQE2M1MLABackend,
     _custom_decode_mask_kwargs,
     _supports_custom_decode_mask,
 )
@@ -19,6 +23,72 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_tokenspeed_factory_keeps_dense_and_n10_backends_distinct(monkeypatch):
+    dense = object()
+    n10 = object()
+    monkeypatch.setattr(backend_module, "TokenspeedMLABackend", lambda runner: dense)
+    monkeypatch.setattr(
+        backend_module, "TokenspeedTQE2M1MLABackend", lambda runner: n10
+    )
+
+    runner = SimpleNamespace(use_mla_backend=True, kv_cache_dtype_str="fp8_e4m3")
+    assert create_tokenspeed_mla_backend(runner) is dense
+
+    runner.kv_cache_dtype_str = "turboquant_4bit_e2m1_recip_bf16"
+    assert create_tokenspeed_mla_backend(runner) is n10
+
+
+def test_n10_cache_contract_does_not_weaken_dense_fp8_contract(monkeypatch):
+    from sglang.srt.mem_cache.memory_pool import (
+        MLATokenToKVPoolNativeE2M1RecipBF16,
+    )
+
+    pool = MLATokenToKVPoolNativeE2M1RecipBF16(
+        size=32,
+        page_size=32,
+        dtype=backend_module.torch.bfloat16,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    runner = SimpleNamespace(
+        kv_cache_dtype_str="turboquant_4bit_e2m1_recip_bf16",
+        token_to_kv_pool=pool,
+    )
+    backend = object.__new__(TokenspeedTQE2M1MLABackend)
+    backend.data_type = backend_module.torch.bfloat16
+    backend.page_size = 32
+    backend.num_q_heads = 8
+    backend.kv_lora_rank = 512
+    backend.qk_rope_head_dim = 64
+    backend._unified_mla = False
+    backend.speculative_topk = 1
+
+    monkeypatch.setattr(
+        backend_module, "get_parallel", lambda: SimpleNamespace(dcp_enabled=False)
+    )
+    monkeypatch.setattr(backend_module, "is_tokenspeed_mla_available", lambda: True)
+    monkeypatch.setattr(
+        backend_module,
+        "tokenspeed_mla",
+        SimpleNamespace(tokenspeed_mla_decode_tq_e2m1=lambda **kwargs: None),
+        raising=False,
+    )
+    backend._validate_cache_contract(runner)
+
+    dense_backend = object.__new__(TokenspeedMLABackend)
+    dense_backend.data_type = backend_module.torch.bfloat16
+    dense_backend.page_size = 32
+    with pytest.raises(ValueError, match="requires --kv-cache-dtype fp8_e4m3"):
+        dense_backend._validate_cache_contract(runner)
+
+    backend.num_q_heads = 4
+    with pytest.raises(ValueError, match="page32/H8/latent512/RoPE64"):
+        backend._validate_cache_contract(runner)
 
 
 def test_custom_decode_mask_contract_requires_both_parameters():
@@ -351,9 +421,7 @@ def test_cutedsl_decode_forwards_custom_mask_on_non_dcp_path(monkeypatch):
         calls.append((custom_mask, custom_mask_offsets))
         return "parent-decode"
 
-    monkeypatch.setattr(
-        TRTLLMMLABackend, "_run_decode_kernel", fake_run_decode_kernel
-    )
+    monkeypatch.setattr(TRTLLMMLABackend, "_run_decode_kernel", fake_run_decode_kernel)
 
     assert (
         backend._run_decode_kernel(

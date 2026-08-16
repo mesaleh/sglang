@@ -80,6 +80,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.kv_turboquant import (
+    is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
     parse_turboquant_kv_cache_dtype,
 )
 from sglang.srt.layers.sampler import create_sampler
@@ -159,6 +160,7 @@ from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state imp
     resolve_spec_aux_hidden_state_config,
 )
 from sglang.srt.model_executor.model_runner_components.turboquant_rotation import (
+    fuse_turboquant_mla_output_rotation_weights,
     fuse_turboquant_output_rotation_weights,
 )
 from sglang.srt.model_executor.model_runner_components.weight_exporter import (
@@ -1325,7 +1327,7 @@ class ModelRunner:
 
         head_dim = self.model_config.head_dim
         dummy = torch.randn(1, 1, head_dim, dtype=torch.float32, device=self.device)
-        scale = 1.0 / (head_dim ** 0.5)
+        scale = 1.0 / (head_dim**0.5)
         # Warm up JIT hadamard kernel
         hadamard_transform(dummy, scale=scale)
 
@@ -1337,14 +1339,23 @@ class ModelRunner:
             from sglang.srt.layers.quantization.kv_turboquant import TurboQuantConfig
 
             cfg = TurboQuantConfig(
-                bit_width=4, head_dim=head_dim, device=self.device,
-                k_bit_width=self.turboquant_k_bits, v_bit_width=self.turboquant_v_bits,
-                uniform=getattr(self, 'turboquant_uniform', False),
+                bit_width=4,
+                head_dim=head_dim,
+                device=self.device,
+                k_bit_width=self.turboquant_k_bits,
+                v_bit_width=self.turboquant_v_bits,
+                uniform=getattr(self, "turboquant_uniform", False),
             )
-            dummy_kv = torch.randn(1, 1, head_dim, dtype=torch.bfloat16, device=self.device)
+            dummy_kv = torch.randn(
+                1, 1, head_dim, dtype=torch.bfloat16, device=self.device
+            )
             fused_turboquant_quantize(
-                dummy_kv, cfg.signs1, cfg.signs2,
-                cfg.k_centroids, cfg.k_boundaries, 4,
+                dummy_kv,
+                cfg.signs1,
+                cfg.signs2,
+                cfg.k_centroids,
+                cfg.k_boundaries,
+                4,
             )
 
     def _maybe_fuse_tq_output_rotation(self):
@@ -1357,7 +1368,60 @@ class ModelRunner:
         if tq_cfg is None:
             return
 
-        # Skip on MLA path: MLATokenToKVPoolTurboQuant._dequant_nope already
+        if self.use_mla_backend and is_native_e2m1_recip_bf16_mla_kv_cache_dtype(
+            self.kv_cache_dtype_str
+        ):
+            if getattr(tq_cfg, "output_rotation_fused", False):
+                logger.info(
+                    "N10 TurboQuant+MLA: absorbed value weights are already "
+                    "in the rotated output domain"
+                )
+                return
+            if get_lora().enable_lora:
+                logger.info(
+                    "N10 TurboQuant+MLA: leaving output rotation at runtime "
+                    "because LoRA value corrections remain in the original domain."
+                )
+                return
+            candidates = []
+            skipped_layers = 0
+            for _, module in self.model.named_modules():
+                if not hasattr(module, "w_vc") or not hasattr(module, "kv_lora_rank"):
+                    continue
+                weight = module.w_vc
+                if (
+                    not isinstance(weight, torch.Tensor)
+                    or weight.dtype
+                    not in (torch.float16, torch.bfloat16, torch.float32)
+                    or weight.ndim != 3
+                    or weight.shape[1] != tq_cfg.head_dim
+                    or getattr(module, "use_deep_gemm_bmm", False)
+                ):
+                    skipped_layers += 1
+                    continue
+                candidates.append(weight)
+            fused_all = fuse_turboquant_mla_output_rotation_weights(
+                tq_cfg,
+                candidates,
+                skipped_layers=skipped_layers,
+            )
+            if fused_all:
+                logger.info(
+                    "N10 TurboQuant+MLA: fused inverse WHT into %d absorbed "
+                    "value weights",
+                    len(candidates),
+                )
+            else:
+                logger.info(
+                    "N10 TurboQuant+MLA: leaving output rotation at runtime; "
+                    "%d eligible and %d incompatible value weights found",
+                    len(candidates),
+                    skipped_layers,
+                )
+            return
+
+        # Skip on the remaining MLA paths: MLATokenToKVPoolTurboQuant already
+        # inverse-rotates the latent values during dequantization.
         # applies the inverse WHT on read, so downstream attention sees
         # un-rotated KV and produces un-rotated output. Pre-rotating o_proj
         # here would double-inverse-rotate via the compensation path and
