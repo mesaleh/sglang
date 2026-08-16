@@ -62,6 +62,29 @@ __device__ __forceinline__ float warp_sum(float value) {
   return __shfl_sync(0xffffffffu, value, 0);
 }
 
+// NativeE2M1MLAConfig has a fixed sign-symmetric codebook.  The sorted-bin
+// contract is equivalent to seven magnitude comparisons, except that exact
+// negative midpoints belong to the lower bin.  Incrementing a negative finite
+// magnitude by one FP32 ULP changes the magnitude tests from > to >= and
+// preserves that ownership without a dependent boundary lookup.  Nonfinite
+// rows are rejected before any output write.
+__device__ __forceinline__ int select_native_e2m1_bin(const float value) {
+  const bool negative = value < 0.0f;
+  uint32_t magnitude_bits = __float_as_uint(value) & 0x7fffffffu;
+  magnitude_bits += static_cast<uint32_t>(negative);
+  const float magnitude = __uint_as_float(magnitude_bits);
+
+  int rank = 0;
+  rank += magnitude > 0.25f;
+  rank += magnitude > 0.75f;
+  rank += magnitude > 1.25f;
+  rank += magnitude > 1.75f;
+  rank += magnitude > 2.5f;
+  rank += magnitude > 3.5f;
+  rank += magnitude > 5.0f;
+  return negative ? 7 - rank : 7 + rank;
+}
+
 __device__ __forceinline__ void hadamard_512_bf16_layout(
     float (&values)[16], const int lane) {
 #pragma unroll
@@ -375,11 +398,7 @@ __device__ __forceinline__ LaneCandidate compute_cache_row(
     const int index = (item / 4) * 128 + lane * 4 + (item % 4);
     const float rotated = values[item] * kInvSqrt512 * signs2[index];
     const float scaled = rotated / grid;
-    int bin = 0;
-#pragma unroll
-    for (int boundary = 0; boundary < 14; ++boundary) {
-      bin += scaled > boundaries[boundary];
-    }
+    const int bin = select_native_e2m1_bin(scaled);
     if (item < 8) {
       candidate.data0 |= static_cast<uint64_t>(bin) << (item * 8);
     } else {
