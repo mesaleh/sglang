@@ -11,7 +11,7 @@ from typing import Any
 
 
 _KERNEL_TOKEN = "e2m1_native_probe_kernel"
-_SECTION_MARKER = "//--------------------- .text."
+_TEXT_SECTION_HEADER = re.compile(r"^//-+\s+\.text\.[^\n]+$", re.MULTILINE)
 _INSTRUCTION = re.compile(
     r"/\*[0-9a-f]+\*/\s+(?:@[!P0-9]+\s+)?"
     r"([A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*)\b"
@@ -35,13 +35,20 @@ def _run(command: list[str], *, cwd: Path | None = None) -> str:
 
 
 def _kernel_section(sass: str) -> str:
-    position = sass.find(_KERNEL_TOKEN)
-    if position < 0:
-        raise AssertionError(f"SASS is missing {_KERNEL_TOKEN}")
-    start = sass.rfind(_SECTION_MARKER, 0, position)
-    if start < 0:
-        raise AssertionError("could not locate probe-kernel SASS section start")
-    end = sass.find(_SECTION_MARKER, position + len(_KERNEL_TOKEN))
+    # The mangled kernel name also appears in debug and metadata sections.
+    # Select the unique executable .text section header itself rather than the
+    # first textual occurrence of the token.
+    matches = [
+        match
+        for match in _TEXT_SECTION_HEADER.finditer(sass)
+        if _KERNEL_TOKEN in match.group(0)
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"expected one probe-kernel .text section, observed {len(matches)}"
+        )
+    start = matches[0].start()
+    end = sass.find("\n//--------------------- ", matches[0].end())
     return sass[start:] if end < 0 else sass[start:end]
 
 
