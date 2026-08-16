@@ -80,10 +80,15 @@ def audit_extension(extension: str | Path) -> dict[str, Any]:
         )
         cubins = sorted(extraction.glob("*.cubin"))
         if len(cubins) != 1:
-            raise AssertionError(f"expected one sm_100f cubin, found {cubins}")
+            raise AssertionError(f"expected one SM100 cubin, found {cubins}")
         cubin = cubins[0]
-        if not cubin.name.endswith(".sm_100f.cubin"):
-            raise AssertionError(f"extracted cubin is not sm_100f: {cubin.name}")
+        # CUDA 12.9 preserves the family-specific target in the fatbin resource
+        # record but names an extracted SM100-family ELF with the base sm_100
+        # architecture.  Pair this base-name check with the authoritative
+        # `arch = sm_100f` resource check below instead of expecting an
+        # sm_100f suffix that cuobjdump does not emit.
+        if not cubin.name.endswith(".sm_100.cubin"):
+            raise AssertionError(f"extracted cubin is not SM100-family: {cubin.name}")
         sass = _run(["nvdisasm", "-g", str(cubin)])
         resources = _run(["cuobjdump", "-res-usage", str(shared_object)])
         cubin_sha256 = _sha256(cubin)
@@ -120,6 +125,7 @@ def audit_extension(extension: str | Path) -> dict[str, Any]:
     resource_record = _resource_record(resources)
     return {
         "cubin_sha256": cubin_sha256,
+        "cubin_name": cubin.name,
         "architecture": "sm_100f",
         "sass_sha256": hashlib.sha256(sass.encode()).hexdigest(),
         "native_instructions": native_lines,
