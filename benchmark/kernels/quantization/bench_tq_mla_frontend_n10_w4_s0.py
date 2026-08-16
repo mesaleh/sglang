@@ -1,9 +1,10 @@
-"""Crossed R3B/S0 SM100 fused-RoPE timing harness.
+"""Crossed R3B/S0-F/N0-F SM100 fused-RoPE timing harness.
 
 The control is the v0.5.17 FlashInfer RoPE+FP8 query launch plus generic dense
-FP8 scatter. R3B is the exact split-entry residency control and S0 changes only
-its E2M1 selector. This is an isolated front-end falsifier, not endpoint
-evidence.
+FP8 scatter. R3B is the historical exact residency control, S0-F is the
+immutable table-driven S0 CUDA body retargeted to SM100f, and N0-F replaces
+only its encode/decode selector with native packed E2M1 plus exact correction.
+This is an isolated front-end falsifier, not endpoint evidence.
 """
 
 from __future__ import annotations
@@ -43,9 +44,13 @@ r3b = load(
     "a17_n10_w1_r3b_tq_mla_frontend",
     "/tmp/n10r3boverlay/sglang/kernels/jit/tq_mla_frontend_n10.py",
 )
-s0 = load(
-    "a17_n10_w4_s0_tq_mla_frontend",
-    "/tmp/n10w4s0full/sglang/kernels/jit/tq_mla_frontend_n10.py",
+s0f = load(
+    "a17_n10_w4_s0f_tq_mla_frontend",
+    "/tmp/n10w4n0full/sglang/kernels/jit/tq_mla_frontend_n10_sm100f.py",
+)
+n0f = load(
+    "a17_n10_w4_n0f_tq_mla_frontend",
+    "/tmp/n10w4n0full/sglang/kernels/jit/tq_mla_frontend_n10_native.py",
 )
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.kvcache.mla_buffer import set_mla_kv_buffer_triton
@@ -56,34 +61,56 @@ HEADS = 8
 MAX_CONTEXT = 256000
 POOL_SIZE = MAX_CONTEXT + 32
 FP8 = torch.float8_e4m3fn
-ARMS = ("r3b", "s0")
-MODULES = {"r3b": r3b, "s0": s0}
+ARMS = ("r3b", "s0f", "n0f")
+MODULES = {"r3b": r3b, "s0f": s0f, "n0f": n0f}
 KERNEL_SOURCE_COMMITS = {
     "r3b": "5bf49216d0e0c864c085ccb29e12fc390f1e9b71",
-    "s0": "da744f9eec98618f05a651bfbfcd72485c5fe01d",
+    "s0f": "fc1f158f298ba6437730a649d21b2943bca3c5b2",
+    "n0f": "fc1f158f298ba6437730a649d21b2943bca3c5b2",
 }
 EXPECTED_CONFIG_SHA256 = (
     "dbd242a672069b510cc2a8fe542d391858b71265ffa0ac4518e952e09d4c805a"
 )
 EXPECTED_WRAPPER_SHA256 = {
     "r3b": "128d0c5f30738c6cfaf1dbfa65f7022e0ebcc9d10a0cfade36ba0e34f4b540d9",
-    "s0": "0b9fdd42e3792f6a318cba474ed30e36d3c319935f58802fd12bccd2db2c61dd",
+    "s0f": "f6a6ce917d6cfd4ae7f278db02f6d64afc502028aadf566aa55b8e0896c3d9a4",
+    "n0f": "de571139c008788036c7f41f93328af2eed9987a45aa942fbee06b69e209a00d",
 }
 EXPECTED_SOURCE_SHA256 = {
     "r3b": "13f65d194b509cbed5b5f914f7bab0e6f3a431c44521038351a1d8fc5cf5b724",
-    "s0": "fdce7462acd97516993eab2263c91af6c7f2ee1ace3d69fa7827834977f3012b",
+    "s0f": "fdce7462acd97516993eab2263c91af6c7f2ee1ace3d69fa7827834977f3012b",
+    "n0f": "4f3477017beb88e33f42a4bae3c7def939f8d98dbfcaf824f93ca75548186fd2",
 }
 WILLIAMS_ORDERS = (
-    ("r3b", "s0"),
-    ("s0", "r3b"),
+    ("r3b", "s0f", "n0f"),
+    ("s0f", "n0f", "r3b"),
+    ("n0f", "r3b", "s0f"),
+    ("r3b", "n0f", "s0f"),
+    ("n0f", "s0f", "r3b"),
+    ("s0f", "r3b", "n0f"),
+)
+CANDIDATE_ALLOCATION_ORDERS = (
+    ("r3b", "n0f", "s0f"),
+    ("n0f", "s0f", "r3b"),
+    ("s0f", "r3b", "n0f"),
+    ("r3b", "s0f", "n0f"),
+    ("s0f", "n0f", "r3b"),
+    ("n0f", "r3b", "s0f"),
 )
 EXPECTED_SHARED_OBJECT_SHA256 = {
-    "r3b": "0489c2dea8e0ed110c05c682d75f51642bf554daebbf3e470c78cf4f4a9eb6c3",
-    "s0": "15a179a610c93dc0ac636f0606f2e0a1ec54c475cccf26c0474b4e3ba5386ee0",
+    "r3b": "50fa8ff55757b571ef71ce79c5653eb261e68588b308815980cd0639b2528b09",
+    "s0f": "3fecb1a14256f181b27291196835f0368634ac13ea00a3a952cbcb5877548a45",
+    "n0f": "cf1af54a49830877149e63f848bfc06f7dfd8fd1a97d11776ddc4efdc78a1ce9",
 }
 EXPECTED_CUBIN_SHA256 = {
     "r3b": "d02b71b7c363baffbc8cefeff86a4950b5f376a03c73a9d4a267d5ef2a3eb582",
-    "s0": "e7fa937662c51c324bc59eae5afa042e09c705ecf3526a3909c0d230ce1ad84a",
+    "s0f": "daa4c64e72fc52e050adf99668e809ab68bb092aa792f7ba8107ee78c4861545",
+    "n0f": "d3599bf8e4582ff9a500445f453bd42e9ce0ad6cbd035087dd8270c554958ed2",
+}
+SOURCE_FILENAMES = {
+    "r3b": "tq_mla_frontend_n10_sm100.cu",
+    "s0f": "tq_mla_frontend_n10_sm100.cu",
+    "n0f": "tq_mla_frontend_n10_native_sm100f.cu",
 }
 WRITER_DEBIT_BUDGET_MS = 5.206480
 
@@ -112,12 +139,7 @@ def artifact_identity(name: str, module: Any) -> dict[str, Any]:
             raise RuntimeError(f"{name} expected one cubin, found {cubins}")
         cubin_sha256 = sha256_file(cubins[0])
     wrapper = Path(module.__file__).resolve()
-    source = (
-        wrapper.parent
-        / "csrc"
-        / "tq_mla_frontend"
-        / "tq_mla_frontend_n10_sm100.cu"
-    )
+    source = wrapper.parent / "csrc" / "tq_mla_frontend" / SOURCE_FILENAMES[name]
     wrapper_sha256 = sha256_file(wrapper)
     source_sha256 = sha256_file(source)
     if wrapper_sha256 != EXPECTED_WRAPPER_SHA256[name]:
@@ -258,10 +280,10 @@ def main() -> None:
         default="control-first",
     )
     parser.add_argument(
-        "--timing-order-index", type=int, choices=range(2), required=True
+        "--timing-order-index", type=int, choices=range(6), required=True
     )
     parser.add_argument(
-        "--candidate-allocation-index", type=int, choices=range(2), required=True
+        "--candidate-allocation-index", type=int, choices=range(6), required=True
     )
     parser.add_argument("--warmups", type=int, default=100)
     parser.add_argument("--samples", type=int, default=20)
@@ -288,10 +310,11 @@ def main() -> None:
         raise AssertionError(
             f"config source hash {config_sha256} does not match the exact N10 config"
         )
-    if artifact_identities["r3b"]["cubin_sha256"] == artifact_identities["s0"][
-        "cubin_sha256"
-    ]:
-        raise AssertionError("R3B and S0 resolved to the same cubin")
+    cubin_identities = {
+        name: identity["cubin_sha256"] for name, identity in artifact_identities.items()
+    }
+    if len(set(cubin_identities.values())) != len(cubin_identities):
+        raise AssertionError(f"candidate arms resolved to aliased cubins: {cubin_identities}")
 
     import flashinfer.rope
 
@@ -352,7 +375,9 @@ def main() -> None:
         )
 
     timing_arm_order = WILLIAMS_ORDERS[args.timing_order_index]
-    allocation_arm_order = WILLIAMS_ORDERS[args.candidate_allocation_index]
+    allocation_arm_order = CANDIDATE_ALLOCATION_ORDERS[
+        args.candidate_allocation_index
+    ]
 
     def allocate_candidates() -> dict[str, tuple[torch.Tensor, ...]]:
         return {name: allocate_candidate() for name in allocation_arm_order}
@@ -398,7 +423,7 @@ def main() -> None:
         )
 
     def run_candidate(name: str) -> None:
-        MODULES[name].tq_mla_n10_frontend_rope_out(
+        common = (
             query_latent,
             query_rope,
             cache_latent,
@@ -408,9 +433,8 @@ def main() -> None:
             locations,
             config.signs1,
             config.signs2,
-            config.boundaries,
-            config.levels,
-            config.codes,
+        )
+        outputs = (
             query_latent_out[name],
             query_rope_out[name],
             packed_out[name],
@@ -418,10 +442,39 @@ def main() -> None:
             rope_out[name],
             status_out[name],
             zero_count_out[name],
-            grid=config.grid,
-            rotation_fused=True,
-            strict=False,
         )
+        if name == "r3b":
+            MODULES[name].tq_mla_n10_frontend_rope_out(
+                *common,
+                config.boundaries,
+                config.levels,
+                config.codes,
+                *outputs,
+                grid=config.grid,
+                rotation_fused=True,
+                strict=False,
+            )
+        elif name == "s0f":
+            MODULES[name].tq_mla_n10_sm100f_frontend_rope_out(
+                *common,
+                config.boundaries,
+                config.levels,
+                config.codes,
+                *outputs,
+                grid=config.grid,
+                rotation_fused=True,
+                strict=False,
+            )
+        elif name == "n0f":
+            MODULES[name].tq_mla_n10_native_frontend_rope_out(
+                *common,
+                *outputs,
+                grid=config.grid,
+                rotation_fused=True,
+                strict=False,
+            )
+        else:
+            raise AssertionError(f"unknown candidate arm {name}")
 
     candidate_functions = {
         name: (lambda candidate=name: run_candidate(candidate)) for name in ARMS
@@ -523,7 +576,7 @@ def main() -> None:
     address_period = 2**21
     result = {
         "status": "TIMING_ONLY",
-        "experiment": "A17_N10_W4_S0_EXACT_SYMMETRIC_E2M1_SELECTOR",
+        "experiment": "A17_N10_W4_N0_NATIVE_SM100F_E2M1",
         "timestamp_unix": time.time(),
         "pid": os.getpid(),
         "hostname": platform.node(),
@@ -589,21 +642,26 @@ def main() -> None:
         "arm_over_control": {
             name: arm_means[name] / control_mean for name in ARMS
         },
-        "s0_minus_r3b_us": arm_means["s0"] - arm_means["r3b"],
-        "s0_over_r3b": arm_means["s0"] / arm_means["r3b"],
+        "s0f_minus_r3b_us": arm_means["s0f"] - arm_means["r3b"],
+        "s0f_over_r3b": arm_means["s0f"] / arm_means["r3b"],
+        "n0f_minus_s0f_us": arm_means["n0f"] - arm_means["s0f"],
+        "n0f_over_s0f": arm_means["n0f"] / arm_means["s0f"],
         "projected_61_layer_debit_ms": (
-            61.0 * (arm_means["s0"] - control_mean) / 1000.0
+            61.0 * (arm_means["n0f"] - control_mean) / 1000.0
+        ),
+        "s0f_projected_61_layer_debit_ms": (
+            61.0 * (arm_means["s0f"] - control_mean) / 1000.0
         ),
         "writer_debit_budget_ms": WRITER_DEBIT_BUDGET_MS,
         "passes_writer_debit_budget": (
-            61.0 * (arm_means["s0"] - control_mean) / 1000.0
+            61.0 * (arm_means["n0f"] - control_mean) / 1000.0
             <= WRITER_DEBIT_BUDGET_MS
         ),
         "seed": args.seed,
         "interpretation": (
-            "Exact R3B and S0 versus the v0.5.17 normal FP8 front-end control. "
+            "Exact R3B, S0-F, and N0-F versus the v0.5.17 normal FP8 front-end control. "
             "Each candidate is one fused NeoX BF16-RoPE, query, and packed-cache "
-            "launch. Two-arm crossed isolated timing only, not endpoint evidence."
+            "launch. Three-arm crossed isolated timing only, not endpoint evidence."
         ),
     }
     print(json.dumps(result, sort_keys=True))

@@ -1,4 +1,4 @@
-"""Run and summarize the preregistered W4-S0 crossed component pilot."""
+"""Run and summarize the preregistered W4-N0 crossed component pilot."""
 
 from __future__ import annotations
 
@@ -20,11 +20,29 @@ SHAPES = (
 )
 BLOCKS = (
     ("control-first", 0, 0),
-    ("candidates-first", 1, 1),
     ("control-first", 1, 1),
-    ("candidates-first", 0, 0),
+    ("control-first", 2, 2),
+    ("candidates-first", 3, 3),
+    ("candidates-first", 4, 4),
+    ("candidates-first", 5, 5),
 )
-EXPECTED_EXPERIMENT = "A17_N10_W4_S0_EXACT_SYMMETRIC_E2M1_SELECTOR"
+TIMING_ORDERS = (
+    ("r3b", "s0f", "n0f"),
+    ("s0f", "n0f", "r3b"),
+    ("n0f", "r3b", "s0f"),
+    ("r3b", "n0f", "s0f"),
+    ("n0f", "s0f", "r3b"),
+    ("s0f", "r3b", "n0f"),
+)
+ALLOCATION_ORDERS = (
+    ("r3b", "n0f", "s0f"),
+    ("n0f", "s0f", "r3b"),
+    ("s0f", "r3b", "n0f"),
+    ("r3b", "s0f", "n0f"),
+    ("s0f", "n0f", "r3b"),
+    ("n0f", "r3b", "s0f"),
+)
+EXPECTED_EXPERIMENT = "A17_N10_W4_N0_NATIVE_SM100F_E2M1"
 WRITER_DEBIT_BUDGET_MS = 5.206480
 MAX_DRIFT = 0.01
 MAX_REPLACEMENTS = 3
@@ -102,7 +120,7 @@ def command_for(
         "--",
         "env",
         "CUDA_VISIBLE_DEVICES=0",
-        "TORCH_EXTENSIONS_DIR=/tmp/torch_extensions_n10w2_pilot",
+        "TORCH_EXTENSIONS_DIR=/tmp/n10w4n0full/torch_extensions",
         "PYTHONPATH=/sgl-workspace/sglang/python:/opt/sglang/python",
         "python3",
         str(args.runner_path),
@@ -134,10 +152,8 @@ def validate_result(
     timing_index: int,
     allocation_index: int,
 ) -> None:
-    expected_timing_order = ["r3b", "s0"] if timing_index == 0 else ["s0", "r3b"]
-    expected_allocation_order = (
-        ["r3b", "s0"] if allocation_index == 0 else ["s0", "r3b"]
-    )
+    expected_timing_order = list(TIMING_ORDERS[timing_index])
+    expected_allocation_order = list(ALLOCATION_ORDERS[allocation_index])
     observed_drift = float(
         value.get("control_flank_abs_drift_fraction", float("inf"))
     )
@@ -146,7 +162,8 @@ def validate_result(
         numeric_means = (
             float(value["control_mean_us"]),
             float(arm_means["r3b"]),
-            float(arm_means["s0"]),
+            float(arm_means["s0f"]),
+            float(arm_means["n0f"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError("timing mean fields differ") from exc
@@ -165,7 +182,8 @@ def validate_result(
         or value.get("warmups_per_graph") != 100
         or value.get("samples_per_arm") != 20
         or value.get("replays_per_sample") != replays
-        or value.get("candidate_physical_launches") != {"r3b": 1, "s0": 1}
+        or value.get("candidate_physical_launches")
+        != {"r3b": 1, "s0f": 1, "n0f": 1}
         or value.get("control_physical_launches") != 2
         or value.get("passes_control_flank_drift_gate")
         != (observed_drift <= MAX_DRIFT)
@@ -177,7 +195,7 @@ def validate_result(
     sequence = value.get("sequence")
     if (
         not isinstance(sequence, list)
-        or len(sequence) != 4
+        or len(sequence) != 5
         or [entry.get("kind") for entry in sequence]
         != ["control", *expected_timing_order, "control"]
         or any(entry.get("replays") != 20 * replays for entry in sequence)
@@ -216,31 +234,38 @@ def aggregate(valid: dict[str, list[dict[str, Any]]]) -> dict[str, Any]:
     shape_results: dict[str, Any] = {}
     for shape, values in valid.items():
         means = {
-            arm: sum(float(value["arm_mean_us"][arm]) for value in values) / 4.0
-            for arm in ("r3b", "s0")
+            arm: sum(float(value["arm_mean_us"][arm]) for value in values)
+            / len(values)
+            for arm in ("r3b", "s0f", "n0f")
         }
-        control = sum(float(value["control_mean_us"]) for value in values) / 4.0
+        control = sum(float(value["control_mean_us"]) for value in values) / len(
+            values
+        )
         shape_results[shape] = {
-            "valid_blocks": 4,
+            "valid_blocks": len(values),
             "control_mean_us": control,
             "r3b_mean_us": means["r3b"],
-            "s0_mean_us": means["s0"],
-            "s0_minus_r3b_us": means["s0"] - means["r3b"],
-            "s0_over_r3b": means["s0"] / means["r3b"],
+            "s0f_mean_us": means["s0f"],
+            "n0f_mean_us": means["n0f"],
+            "s0f_minus_r3b_us": means["s0f"] - means["r3b"],
+            "s0f_over_r3b": means["s0f"] / means["r3b"],
+            "n0f_minus_s0f_us": means["n0f"] - means["s0f"],
+            "n0f_over_s0f": means["n0f"] / means["s0f"],
             "max_control_flank_abs_drift_fraction": max(
                 float(value["control_flank_abs_drift_fraction"]) for value in values
             ),
         }
     debit = 61.0 * (
-        shape_results["t10219"]["s0_mean_us"]
+        shape_results["t10219"]["n0f_mean_us"]
         - shape_results["t10219"]["control_mean_us"]
     ) / 1000.0
     gates = {
         "t10219_writer_debit": debit <= WRITER_DEBIT_BUDGET_MS,
-        "t10219_improves_r3b": shape_results["t10219"]["s0_over_r3b"] < 1.0,
-        "t4096_improves_r3b": shape_results["t4096"]["s0_over_r3b"] < 1.0,
-        "t4096_no_gt_5pct_regression": shape_results["t4096"]["s0_over_r3b"] <= 1.05,
-        "q1_no_gt_5pct_regression": shape_results["q1"]["s0_over_r3b"] <= 1.05,
+        "t10219_improves_s0f": shape_results["t10219"]["n0f_over_s0f"] < 1.0,
+        "t4096_improves_s0f": shape_results["t4096"]["n0f_over_s0f"] < 1.0,
+        "t4096_no_gt_5pct_regression": shape_results["t4096"]["n0f_over_s0f"]
+        <= 1.05,
+        "q1_no_gt_5pct_regression": shape_results["q1"]["n0f_over_s0f"] <= 1.05,
     }
     return {
         "shape_results": shape_results,
@@ -345,7 +370,7 @@ def main() -> int:
                     raise RuntimeError(
                         f"{shape} block {block} exhausted drift replacements"
                     )
-        if any(len(values) != 4 for values in valid.values()):
+        if any(len(values) != 6 for values in valid.values()):
             raise RuntimeError("valid timing matrix cardinality differs")
         verify_remote_runner(args)
         aggregate_result = aggregate(valid)
