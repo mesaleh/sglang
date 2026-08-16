@@ -288,7 +288,9 @@ class TestDefaultConfigurator(unittest.TestCase):
         self.assertIsNone(config.full_max_total_num_tokens)
         self.assertIsNone(config.swa_max_total_num_tokens)
 
-    def _make_native_e2m1_dflash_ring_runner(self):
+    def _make_native_e2m1_dflash_ring_runner(
+        self, kv_cache_dtype="turboquant_4bit_e2m1"
+    ):
         mr = _make_model_runner(
             num_layers=61,
             use_mla_backend=True,
@@ -300,12 +302,12 @@ class TestDefaultConfigurator(unittest.TestCase):
             kv_lora_rank=512,
             qk_rope_head_dim=64,
         )
-        mr.kv_cache_dtype_str = "turboquant_4bit_e2m1"
+        mr.kv_cache_dtype_str = kv_cache_dtype
         mr.ps = ParallelState.trivial(tp_size=8, attn_tp_size=8)
         mr.spec_algorithm.is_dflash.return_value = True
         mr.spec_algorithm.is_dflash_family.return_value = True
         mr.spec_algorithm.is_none.return_value = False
-        mr.server_args.kv_cache_dtype = "turboquant_4bit_e2m1"
+        mr.server_args.kv_cache_dtype = kv_cache_dtype
         mr.server_args.speculative_draft_window_size = 2048
         mr.spec_aux_config.dflash_draft_num_layers = 6
         mr.spec_aux_config.dflash_draft_total_num_kv_heads = 8
@@ -313,6 +315,44 @@ class TestDefaultConfigurator(unittest.TestCase):
         mr.spec_aux_config.dflash_draft_v_head_dim = 128
         mr.spec_aux_config.dflash_draft_kv_dtype = "bfloat16"
         return mr
+
+    def test_n10_native_e2m1_dflash_ring_uses_386_byte_target_rows(self):
+        from sglang.srt.environ import envs
+
+        mr = self._make_native_e2m1_dflash_ring_runner(
+            "turboquant_4bit_e2m1_recip_bf16"
+        )
+        target_capacity = 262_144
+        target_coeff = 386 * 61
+        target_fixed = 32 * target_coeff + (32 << 20)
+        draft_fixed = 19_328 * (1 * (128 + 128) * 2 * 6)
+        exact_budget = target_capacity * target_coeff + target_fixed + draft_fixed
+
+        with (
+            mock_cpu_env(tp_size=8),
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.override(True),
+            envs.SGLANG_OMNIVA_DFLASH_DRAFT_SNAPSHOT.override(False),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                DefaultPoolConfigurator,
+            )
+
+            configurator = DefaultPoolConfigurator(mr)
+            config = configurator.calculate_pool_sizes(exact_budget, page_size=32)
+            one_byte_short = configurator.calculate_pool_sizes(
+                exact_budget - 1, page_size=32
+            )
+
+        self.assertEqual(configurator._cell_size, target_coeff)
+        self.assertEqual(configurator._target_fixed_bytes, target_fixed)
+        self.assertEqual(configurator._draft_fixed_bytes, draft_fixed)
+        self.assertEqual(config.max_total_num_tokens, target_capacity)
+        self.assertEqual(one_byte_short.max_total_num_tokens, target_capacity - 32)
+        self.assertEqual(
+            config.max_total_num_tokens * configurator._cell_size
+            + configurator._fixed_bytes,
+            exact_budget,
+        )
 
     def test_native_e2m1_dflash_ring_uses_exact_target_coeff_and_draft_bias(self):
         from sglang.srt.environ import envs

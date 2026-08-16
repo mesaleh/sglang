@@ -32,6 +32,7 @@ from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
 )
 from sglang.srt.layers.quantization.kv_turboquant import (
     is_native_e2m1_mla_kv_cache_dtype,
+    is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
     parse_turboquant_kv_cache_dtype,
 )
 from sglang.srt.mem_cache.allocation_sizing import get_req_to_token_extra_context_len
@@ -63,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
     MLATokenToKVPoolNativeE2M1,
+    MLATokenToKVPoolNativeE2M1RecipBF16,
     MLATokenToKVPoolTurboQuant,
     NoOpMHATokenToKVPool,
     PageMajorMHATokenToKVPool,
@@ -1252,6 +1254,21 @@ class KVCacheConfigurator:
     def _build_mla_turboquant_kv_pool(
         self, *, max_total_num_tokens: int
     ) -> KVCache:
+        if is_native_e2m1_recip_bf16_mla_kv_cache_dtype(
+            self.kv_cache_dtype_str
+        ):
+            return MLATokenToKVPoolNativeE2M1RecipBF16(
+                max_total_num_tokens,
+                page_size=self.server_args.page_size,
+                dtype=self.kv_cache_dtype,
+                kv_lora_rank=self.model_config.kv_lora_rank,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                layer_num=self.layer_info.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.layer_info.start_layer,
+                end_layer=self.layer_info.end_layer,
+            )
         if is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str):
             return MLATokenToKVPoolNativeE2M1(
                 max_total_num_tokens,

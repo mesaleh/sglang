@@ -22,6 +22,9 @@ import torch
 
 
 NATIVE_E2M1_MLA_KV_CACHE_DTYPE = "turboquant_4bit_e2m1"
+NATIVE_E2M1_RECIP_BF16_MLA_KV_CACHE_DTYPE = (
+    "turboquant_4bit_e2m1_recip_bf16"
+)
 NATIVE_E2M1_MLA_HEAD_DIM = 512
 NATIVE_E2M1_GRID_NUMERATOR = 0.48707925311412725
 
@@ -50,9 +53,23 @@ NATIVE_E2M1_CODES = (15, 14, 13, 12, 11, 10, 9, 0, 1, 2, 3, 4, 5, 6, 7)
 
 
 def is_native_e2m1_mla_kv_cache_dtype(value: object) -> bool:
-    """Return whether ``value`` names the native-E2M1 MLA cache ABI."""
+    """Return whether ``value`` names the original N8 FP8-RoPE ABI."""
 
     return value == NATIVE_E2M1_MLA_KV_CACHE_DTYPE
+
+
+def is_native_e2m1_recip_bf16_mla_kv_cache_dtype(value: object) -> bool:
+    """Return whether ``value`` names the N10 reciprocal-BF16-RoPE ABI."""
+
+    return value == NATIVE_E2M1_RECIP_BF16_MLA_KV_CACHE_DTYPE
+
+
+def is_native_e2m1_mla_kv_cache_family(value: object) -> bool:
+    """Return whether ``value`` names either incompatible native E2M1 ABI."""
+
+    return is_native_e2m1_mla_kv_cache_dtype(
+        value
+    ) or is_native_e2m1_recip_bf16_mla_kv_cache_dtype(value)
 
 
 def parse_turboquant_kv_cache_dtype(
@@ -65,7 +82,7 @@ def parse_turboquant_kv_cache_dtype(
     # nibbles have a distinct ABI.  Pool/backend selection must additionally
     # check ``is_native_e2m1_mla_kv_cache_dtype`` and must never infer the
     # native representation from this tuple alone.
-    if is_native_e2m1_mla_kv_cache_dtype(value):
+    if is_native_e2m1_mla_kv_cache_family(value):
         return 4, 4, False
 
     payload = value.removeprefix("turboquant_")

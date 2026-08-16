@@ -686,7 +686,9 @@ class ServerArgs:
                 '"fp4_e2m1" requires CUDA 12.8+ and PyTorch 2.8.0+. '
                 '"turboquant_*" enables TurboQuant KV-cache compression; '
                 '"turboquant_4bit_e2m1" names the experimental native-E2M1 '
-                "MLA representation."
+                'MLA FP8-RoPE representation; '
+                '"turboquant_4bit_e2m1_recip_bf16" names the distinct '
+                "reciprocal-BF16-RoPE N10 representation."
             ),
             choices=[
                 "auto",
@@ -701,6 +703,7 @@ class ServerArgs:
                 "turboquant_2bit",
                 "turboquant_4bit",
                 "turboquant_4bit_e2m1",
+                "turboquant_4bit_e2m1_recip_bf16",
                 "turboquant_4bit_uniform",
                 "turboquant_k4v2",
             ],

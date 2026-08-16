@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.layers.quantization.kv_turboquant import (
     is_native_e2m1_mla_kv_cache_dtype,
+    is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
 )
 
 
@@ -27,6 +28,37 @@ def validate_turboquant_transfer_compatibility(
             "--kv-cache-dtype=turboquant_4bit_e2m1 is reserved for the matched "
             "native-E2M1 MLA writer, pool, and reader, which are not enabled "
             "in this source revision. Use a supported --kv-cache-dtype."
+        )
+
+    if is_native_e2m1_recip_bf16_mla_kv_cache_dtype(kv_cache_dtype):
+        if disaggregation_mode != "null":
+            raise ValueError(
+                "N10 native E2M1 MLA does not support PD disaggregation."
+            )
+        if enable_hierarchical_cache:
+            raise ValueError(
+                "N10 native E2M1 MLA does not support hierarchical/CPU KV "
+                "offload."
+            )
+        if enable_deterministic_inference:
+            raise ValueError(
+                "N10 native E2M1 MLA does not yet support deterministic "
+                "inference paths."
+            )
+        if not use_mla_backend:
+            raise ValueError("N10 native E2M1 KV cache requires an MLA model.")
+        if (
+            prefill_attention_backend != "tokenspeed_mla"
+            or decode_attention_backend != "tokenspeed_mla"
+        ):
+            raise ValueError(
+                "N10 native E2M1 MLA requires tokenspeed_mla for both "
+                "prefill and decode."
+            )
+        raise ValueError(
+            "N10 native E2M1 MLA pool/writer support is present, but its "
+            "matched TokenSpeed reader backend is not wired in this source "
+            "revision. Use a supported --kv-cache-dtype."
         )
 
     if disaggregation_mode != "null":

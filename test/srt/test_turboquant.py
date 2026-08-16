@@ -37,6 +37,7 @@ class TestTurboQuantCLI(unittest.TestCase):
             "turboquant_2bit",
             "turboquant_4bit",
             "turboquant_4bit_e2m1",
+            "turboquant_4bit_e2m1_recip_bf16",
             "turboquant_4bit_uniform",
             "turboquant_k4v2",
         ):
@@ -62,13 +63,21 @@ class TestTurboQuantCLI(unittest.TestCase):
             (4, 4, False),
         )
         self.assertEqual(
+            parse_turboquant_kv_cache_dtype(
+                "turboquant_4bit_e2m1_recip_bf16"
+            ),
+            (4, 4, False),
+        )
+        self.assertEqual(
             parse_turboquant_kv_cache_dtype("turboquant_k4v2"), (4, 2, False)
         )
         self.assertIsNone(parse_turboquant_kv_cache_dtype("bf16"))
 
     def test_native_e2m1_dtype_identity_is_explicit(self):
         from sglang.srt.layers.quantization.kv_turboquant import (
+            is_native_e2m1_mla_kv_cache_family,
             is_native_e2m1_mla_kv_cache_dtype,
+            is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
         )
 
         self.assertTrue(
@@ -76,6 +85,24 @@ class TestTurboQuantCLI(unittest.TestCase):
         )
         self.assertFalse(is_native_e2m1_mla_kv_cache_dtype("turboquant_4bit"))
         self.assertFalse(is_native_e2m1_mla_kv_cache_dtype(None))
+        self.assertFalse(
+            is_native_e2m1_mla_kv_cache_dtype(
+                "turboquant_4bit_e2m1_recip_bf16"
+            )
+        )
+        self.assertTrue(
+            is_native_e2m1_recip_bf16_mla_kv_cache_dtype(
+                "turboquant_4bit_e2m1_recip_bf16"
+            )
+        )
+        self.assertTrue(
+            is_native_e2m1_mla_kv_cache_family("turboquant_4bit_e2m1")
+        )
+        self.assertTrue(
+            is_native_e2m1_mla_kv_cache_family(
+                "turboquant_4bit_e2m1_recip_bf16"
+            )
+        )
 
     def test_native_e2m1_format_fails_closed_until_pool_is_wired(self):
         from sglang.srt.model_executor.model_runner_components.turboquant_compat import (
@@ -91,6 +118,35 @@ class TestTurboQuantCLI(unittest.TestCase):
                 prefill_attention_backend="tokenspeed_mla",
                 decode_attention_backend="tokenspeed_mla",
                 mla_fused_decode_enabled=True,
+            )
+
+    def test_n10_native_e2m1_fails_closed_until_reader_is_wired(self):
+        from sglang.srt.model_executor.model_runner_components.turboquant_compat import (
+            validate_turboquant_transfer_compatibility,
+        )
+
+        common = dict(
+            kv_cache_dtype="turboquant_4bit_e2m1_recip_bf16",
+            disaggregation_mode="null",
+            enable_hierarchical_cache=False,
+            use_mla_backend=True,
+            enable_deterministic_inference=False,
+            prefill_attention_backend="tokenspeed_mla",
+            decode_attention_backend="tokenspeed_mla",
+        )
+        with self.assertRaisesRegex(ValueError, "reader backend is not wired"):
+            validate_turboquant_transfer_compatibility(**common)
+        with self.assertRaisesRegex(ValueError, "PD disaggregation"):
+            validate_turboquant_transfer_compatibility(
+                **(common | {"disaggregation_mode": "prefill"})
+            )
+        with self.assertRaisesRegex(ValueError, "hierarchical/CPU"):
+            validate_turboquant_transfer_compatibility(
+                **(common | {"enable_hierarchical_cache": True})
+            )
+        with self.assertRaisesRegex(ValueError, "tokenspeed_mla"):
+            validate_turboquant_transfer_compatibility(
+                **(common | {"decode_attention_backend": "flashmla"})
             )
 
     def test_model_runner_configures_mha_backend_through_override(self):
@@ -518,6 +574,34 @@ class TestNativeE2M1Contract(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "page_size=32"):
             MLATokenToKVPoolNativeE2M1(**(common | {"page_size": 16}))
 
+    def test_n10_native_pool_rejects_wrong_logical_dtype_shape_and_page(self):
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolNativeE2M1RecipBF16,
+        )
+
+        common = dict(
+            size=32,
+            page_size=32,
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=1,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        with self.assertRaisesRegex(ValueError, "BF16 logical/model dtype"):
+            MLATokenToKVPoolNativeE2M1RecipBF16(
+                **(common | {"dtype": torch.float16})
+            )
+        with self.assertRaisesRegex(ValueError, "kv_lora_rank=512"):
+            MLATokenToKVPoolNativeE2M1RecipBF16(
+                **(common | {"kv_lora_rank": 256})
+            )
+        with self.assertRaisesRegex(ValueError, "page_size=32"):
+            MLATokenToKVPoolNativeE2M1RecipBF16(
+                **(common | {"page_size": 16})
+            )
+
     def test_native_pool_routing_is_explicit(self):
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 
@@ -542,6 +626,50 @@ class TestNativeE2M1Contract(unittest.TestCase):
         with patch(
             "sglang.srt.mem_cache.kv_cache_configurator."
             "MLATokenToKVPoolNativeE2M1",
+            return_value=sentinel,
+        ) as constructor:
+            result = configurator._build_mla_turboquant_kv_pool(
+                max_total_num_tokens=12345
+            )
+
+        self.assertIs(result, sentinel)
+        constructor.assert_called_once_with(
+            12345,
+            page_size=32,
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=61,
+            device="cuda",
+            enable_memory_saver=False,
+            start_layer=0,
+            end_layer=60,
+        )
+
+    def test_n10_native_pool_routing_is_distinct(self):
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.kv_cache_dtype_str = "turboquant_4bit_e2m1_recip_bf16"
+        configurator.kv_cache_dtype = torch.bfloat16
+        configurator.server_args = SimpleNamespace(
+            page_size=32,
+            enable_memory_saver=False,
+        )
+        configurator.model_config = SimpleNamespace(
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+        )
+        configurator.layer_info = SimpleNamespace(
+            num_effective_layers=61,
+            start_layer=0,
+            end_layer=60,
+        )
+        configurator.device = "cuda"
+        sentinel = object()
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_configurator."
+            "MLATokenToKVPoolNativeE2M1RecipBF16",
             return_value=sentinel,
         ) as constructor:
             result = configurator._build_mla_turboquant_kv_pool(
@@ -627,6 +755,113 @@ class TestTurboQuantGPU(unittest.TestCase):
             cls.configs[bits] = TurboQuantConfig(
                 bit_width=bits, head_dim=128, device=cls.device
             )
+
+    def test_n10_native_pool_lifecycle_write_move_and_graph_replay(self):
+        from sglang.kernels.jit.tq_mla_frontend_n10_native import (
+            tq_mla_n10_native_cache_writer_out,
+        )
+        from sglang.srt.mem_cache.memory_pool import (
+            MLATokenToKVPoolNativeE2M1RecipBF16,
+        )
+
+        torch.manual_seed(20260816)
+        pool = MLATokenToKVPoolNativeE2M1RecipBF16(
+            size=64,
+            page_size=32,
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            layer_num=2,
+            device=self.device,
+            enable_memory_saver=False,
+            start_layer=5,
+            end_layer=7,
+        )
+        first = pool.get_native_e2m1_recip_bf16_buffers(5)
+        second = pool.get_native_e2m1_recip_bf16_buffers(6)
+        self.assertEqual(first.packed_nope.shape, (96, 1, 256))
+        self.assertEqual(first.nope_scale.shape, (96, 1))
+        self.assertEqual(first.reciprocal_rope.shape, (96, 1, 64))
+        self.assertEqual(first.row_nbytes, 386)
+        self.assertEqual(second.row_nbytes, 386)
+        self.assertEqual(pool.get_kv_size_bytes(), 96 * 386 * 2)
+
+        latent = torch.randn(3, 1, 512, dtype=torch.bfloat16, device=self.device)
+        rope = torch.randn(3, 1, 64, dtype=torch.bfloat16, device=self.device)
+        loc = torch.tensor([1, 32, 65], dtype=torch.int64, device=self.device)
+        layer = SimpleNamespace(layer_id=5)
+        pool.set_mla_kv_buffer(layer, loc, latent, rope)
+
+        packed_ref = torch.zeros_like(first.packed_nope)
+        scale_ref = torch.zeros_like(first.nope_scale)
+        rope_ref = torch.zeros_like(first.reciprocal_rope)
+        fault_ref = torch.zeros(1, dtype=torch.int32, device=self.device)
+        zero_ref = torch.zeros(1, dtype=torch.int64, device=self.device)
+        tq_mla_n10_native_cache_writer_out(
+            latent,
+            rope,
+            loc,
+            pool.tq_config.signs1,
+            pool.tq_config.signs2,
+            packed_ref,
+            scale_ref,
+            rope_ref,
+            fault_ref,
+            zero_ref,
+            grid=pool.tq_config.grid,
+        )
+        torch.cuda.synchronize()
+        torch.testing.assert_close(first.packed_nope[loc], packed_ref[loc])
+        torch.testing.assert_close(first.nope_scale[loc], scale_ref[loc])
+        torch.testing.assert_close(
+            first.reciprocal_rope[loc], rope_ref[loc], rtol=0, atol=0
+        )
+        self.assertEqual(pool.get_native_e2m1_fault_status().item(), 0)
+        self.assertEqual(pool.get_native_e2m1_zero_count().item(), 0)
+
+        tgt = torch.tensor([2, 33, 66], dtype=torch.int64, device=self.device)
+        pool.move_kv_cache(tgt, loc)
+        torch.cuda.synchronize()
+        for tensor in first.tensors:
+            torch.testing.assert_close(tensor[tgt], tensor[loc], rtol=0, atol=0)
+
+        with self.assertRaisesRegex(RuntimeError, "dense full-pool"):
+            pool.get_key_buffer(5)
+        with self.assertRaisesRegex(RuntimeError, "bounded prefix consumer"):
+            pool.get_mla_kv_buffer(layer, loc)
+        with self.assertRaisesRegex(RuntimeError, "generic PD"):
+            pool.get_contiguous_buf_infos()
+
+        graph_latent = torch.randn(
+            2, 1, 512, dtype=torch.bfloat16, device=self.device
+        )
+        graph_rope = torch.randn(2, 1, 64, dtype=torch.bfloat16, device=self.device)
+        graph_loc = torch.tensor([3, 34], dtype=torch.int32, device=self.device)
+        for _ in range(3):
+            pool.set_mla_kv_buffer(layer, graph_loc, graph_latent, graph_rope)
+        torch.cuda.synchronize()
+        pointers_before = tuple(tensor.data_ptr() for tensor in first.tensors)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            pool.set_mla_kv_buffer(layer, graph_loc, graph_latent, graph_rope)
+        for _ in range(10):
+            graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(
+            tuple(tensor.data_ptr() for tensor in first.tensors), pointers_before
+        )
+        self.assertEqual(pool.get_native_e2m1_fault_status().item(), 0)
+
+        invalid_loc = torch.tensor([96], dtype=torch.int64, device=self.device)
+        pool.set_mla_kv_buffer(
+            layer, invalid_loc, graph_latent[:1], graph_rope[:1]
+        )
+        torch.cuda.synchronize()
+        sticky_fault = pool.get_native_e2m1_fault_status().item()
+        self.assertNotEqual(sticky_fault, 0)
+        pool.set_mla_kv_buffer(layer, graph_loc, graph_latent, graph_rope)
+        torch.cuda.synchronize()
+        self.assertEqual(pool.get_native_e2m1_fault_status().item(), sticky_fault)
 
     def test_native_e2m1_fused_writer_matches_independent_oracle(self):
         from sglang.kernels.ops.attention.turboquant_quantize import (

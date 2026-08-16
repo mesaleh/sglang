@@ -5054,6 +5054,347 @@ class MLATokenToKVPoolNativeE2M1(MLATokenToKVPool):
         raise RuntimeError("Native E2M1 MLA does not support CPU KV offload.")
 
 
+@dataclass(frozen=True)
+class NativeE2M1RecipBF16MLABufferSet:
+    """One layer's explicit N10 reciprocal-BF16-RoPE descriptors."""
+
+    packed_nope: torch.Tensor
+    nope_scale: torch.Tensor
+    reciprocal_rope: torch.Tensor
+
+    @property
+    def row_nbytes(self) -> int:
+        return (
+            self.packed_nope[0].nbytes
+            + self.nope_scale[0].nbytes
+            + self.reciprocal_rope[0].nbytes
+        )
+
+    @property
+    def tensors(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.packed_nope, self.nope_scale, self.reciprocal_rope
+
+
+class MLATokenToKVPoolNativeE2M1RecipBF16(MLATokenToKVPool):
+    """No-shadow MLA pool for the N10 reciprocal-BF16-RoPE cache ABI.
+
+    This 386-byte row is deliberately distinct from both the 322-byte N8
+    native row and the learned-centroid 386-byte TurboQuant row. Dense pool
+    access, generic transfer, and CPU offload fail closed; native readers use
+    :meth:`get_native_e2m1_recip_bf16_buffers`.
+    """
+
+    is_mla_turboquant_pool = True
+    is_native_e2m1_recip_bf16_mla_pool = True
+    native_row_nbytes = 386
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+    ):
+        if dtype != torch.bfloat16:
+            raise ValueError(
+                "N10 native E2M1 MLA requires a BF16 logical/model dtype, "
+                f"got {dtype}."
+            )
+        if kv_lora_rank != 512 or qk_rope_head_dim != 64:
+            raise ValueError(
+                "N10 native E2M1 MLA requires kv_lora_rank=512 and "
+                f"qk_rope_head_dim=64, got {kv_lora_rank} and "
+                f"{qk_rope_head_dim}."
+            )
+        if page_size != 32:
+            raise ValueError(
+                "N10 native E2M1 MLA currently requires page_size=32, "
+                f"got {page_size}."
+            )
+
+        from sglang.srt.layers.quantization.kv_turboquant import (
+            NativeE2M1MLAConfig,
+        )
+
+        self.tq_config = NativeE2M1MLAConfig(
+            device=device,
+            head_dim=kv_lora_rank,
+        )
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+        )
+        if self.kv_nope_packed_buffer and self.kv_nope_packed_buffer[0].is_cuda:
+            self._warmup_native_e2m1_recip_bf16_write()
+
+    def _create_buffers(self):
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                rows = self.size + self.page_size
+                self.kv_nope_packed_buffer = [
+                    torch.zeros(
+                        (rows, 1, 256),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_nope_scale_buffer = [
+                    torch.zeros(
+                        (rows, 1),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+                self.kv_reciprocal_rope_buffer = [
+                    torch.zeros(
+                        (rows, 1, 64),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    for _ in range(self.layer_num)
+                ]
+
+        self._native_e2m1_fault_status = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+        self._native_e2m1_zero_count = torch.zeros(
+            (1,), dtype=torch.int64, device=self.device
+        )
+
+        # The parent initializes legacy pointer bookkeeping from kv_buffer.
+        # Native consumers never use that alias and generic transfers fail.
+        self.kv_buffer = self.kv_nope_packed_buffer
+        self._native_e2m1_recip_bf16_buffer_sets = tuple(
+            NativeE2M1RecipBF16MLABufferSet(
+                packed_nope=self.kv_nope_packed_buffer[layer_id],
+                nope_scale=self.kv_nope_scale_buffer[layer_id],
+                reciprocal_rope=self.kv_reciprocal_rope_buffer[layer_id],
+            )
+            for layer_id in range(self.layer_num)
+        )
+        assert all(
+            buffers.row_nbytes == self.native_row_nbytes
+            for buffers in self._native_e2m1_recip_bf16_buffer_sets
+        )
+
+    def _init_mla_kv_copy_and_warmup(self, stride_bytes: int):
+        self._kv_copy_config = None
+
+    def _clear_buffers(self):
+        if hasattr(self, "kv_buffer"):
+            del self.kv_buffer
+        del self.kv_nope_packed_buffer
+        del self.kv_nope_scale_buffer
+        del self.kv_reciprocal_rope_buffer
+        del self._native_e2m1_fault_status
+        del self._native_e2m1_zero_count
+        del self._native_e2m1_recip_bf16_buffer_sets
+
+    def _layer_index(self, layer_id: int) -> int:
+        layer_id_rel = layer_id - self.start_layer
+        if not 0 <= layer_id_rel < self.layer_num:
+            raise IndexError(
+                f"N10 native E2M1 MLA layer {layer_id} is outside "
+                f"[{self.start_layer}, {self.start_layer + self.layer_num})."
+            )
+        return layer_id_rel
+
+    def get_native_e2m1_recip_bf16_buffers(
+        self, layer_id: int
+    ) -> NativeE2M1RecipBF16MLABufferSet:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self._native_e2m1_recip_bf16_buffer_sets[
+            self._layer_index(layer_id)
+        ]
+
+    def get_native_e2m1_fault_status(self) -> torch.Tensor:
+        return self._native_e2m1_fault_status
+
+    def get_native_e2m1_zero_count(self) -> torch.Tensor:
+        return self._native_e2m1_zero_count
+
+    def get_native_e2m1_recip_bf16_contiguous_buf_infos(self):
+        ptrs = []
+        lens = []
+        item_lens = []
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            buffers = self.get_native_e2m1_recip_bf16_buffers(layer_id)
+            for tensor in buffers.tensors:
+                ptrs.append(tensor.data_ptr())
+                lens.append(tensor.nbytes)
+                item_lens.append(tensor[0].nbytes * self.page_size)
+        return ptrs, lens, item_lens
+
+    def get_contiguous_buf_infos(self):
+        raise RuntimeError(
+            "N10 native E2M1 MLA does not support generic PD/disaggregation "
+            "transfer."
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        raise RuntimeError(
+            "N10 native E2M1 MLA forbids dense full-pool key reconstruction; "
+            "use the format-aware reader."
+        )
+
+    def get_value_buffer(self, layer_id: int):
+        raise RuntimeError(
+            "N10 native E2M1 MLA forbids dense full-pool value reconstruction; "
+            "use the format-aware reader."
+        )
+
+    def get_kv_buffer(self, layer_id: int):
+        raise RuntimeError(
+            "N10 native E2M1 MLA forbids dense full-pool KV reconstruction; "
+            "use the format-aware reader."
+        )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        raise RuntimeError(
+            "N10 native E2M1 MLA row-gathered reconstruction is unavailable "
+            "until the bounded prefix consumer is installed."
+        )
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc_info,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        loc, _, _ = unwrap_write_loc(loc_info)
+        expected_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        if cache_k.shape[-1] != expected_dim:
+            raise ValueError(
+                f"N10 native E2M1 set_kv_buffer expected dim {expected_dim}, "
+                f"got {cache_k.shape[-1]}."
+            )
+        self.set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k[..., : self.kv_lora_rank],
+            cache_k[..., self.kv_lora_rank :],
+        )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        maybe_detect_oob(
+            loc,
+            0,
+            self.size + self.page_size,
+            "set_mla_kv_buffer (MLA-native-E2M1-recip-BF16)",
+        )
+        if cache_k_nope.dim() == 2:
+            cache_k_nope = cache_k_nope.unsqueeze(1)
+        if cache_k_rope.dim() == 2:
+            cache_k_rope = cache_k_rope.unsqueeze(1)
+        if cache_k_nope.dtype != torch.bfloat16 or cache_k_rope.dtype != torch.bfloat16:
+            raise TypeError(
+                "N10 native E2M1 MLA requires BF16 latent and post-RoPE "
+                f"writes, got {cache_k_nope.dtype} and {cache_k_rope.dtype}."
+            )
+
+        from sglang.kernels.jit.tq_mla_frontend_n10_native import (
+            tq_mla_n10_native_cache_writer_out,
+        )
+
+        buffers = self.get_native_e2m1_recip_bf16_buffers(layer.layer_id)
+        tq_mla_n10_native_cache_writer_out(
+            cache_k_nope,
+            cache_k_rope,
+            loc,
+            self.tq_config.signs1,
+            self.tq_config.signs2,
+            buffers.packed_nope,
+            buffers.nope_scale,
+            buffers.reciprocal_rope,
+            self._native_e2m1_fault_status,
+            self._native_e2m1_zero_count,
+            grid=self.tq_config.grid,
+        )
+
+    def _warmup_native_e2m1_recip_bf16_write(self):
+        if self.layer_num <= 0:
+            return
+        cache_k_nope = torch.ones(
+            (1, 1, 512), dtype=torch.bfloat16, device=self.device
+        )
+        cache_k_rope = torch.zeros(
+            (1, 1, 64), dtype=torch.bfloat16, device=self.device
+        )
+        loc = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        self.set_mla_kv_buffer(
+            SimpleNamespace(layer_id=self.start_layer),
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+        )
+        torch.cuda.synchronize()
+        if self._native_e2m1_fault_status.item() != 0:
+            raise RuntimeError(
+                "N10 native E2M1 writer reported an invalid warmup location."
+            )
+        if self._native_e2m1_zero_count.item() != 0:
+            raise RuntimeError("N10 native E2M1 writer misclassified warmup as zero.")
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache N10 native tgt")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache N10 native src")
+        if tgt_loc.numel() == 0:
+            return
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        for layer_id in range(self.start_layer, self.start_layer + self.layer_num):
+            buffers = self.get_native_e2m1_recip_bf16_buffers(layer_id)
+            for tensor in buffers.tensors:
+                tensor[tgt_loc_flat] = tensor[src_loc_flat]
+
+    def get_kv_size_bytes(self):
+        return sum(
+            tensor.nbytes
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num)
+            for tensor in self.get_native_e2m1_recip_bf16_buffers(layer_id).tensors
+        )
+
+    def get_cpu_copy(self, indices, **kwargs):
+        raise RuntimeError("N10 native E2M1 MLA does not support CPU KV offload.")
+
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+        raise RuntimeError("N10 native E2M1 MLA does not support CPU KV offload.")
+
+
 class MLATokenToKVPoolTurboQuant(MLATokenToKVPool):
     """TurboQuant KV cache for MLA (DeepSeek-V2/V3, Kimi K2-family) models.
 

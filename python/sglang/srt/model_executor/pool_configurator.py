@@ -33,7 +33,8 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.kv_turboquant import (
     NATIVE_E2M1_CODES,
     NATIVE_E2M1_LEVELS,
-    is_native_e2m1_mla_kv_cache_dtype,
+    is_native_e2m1_mla_kv_cache_family,
+    is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
     parse_turboquant_kv_cache_dtype,
 )
 from sglang.srt.mem_cache.allocation_sizing import (
@@ -87,7 +88,7 @@ _NATIVE_E2M1_RUNTIME_RESERVE_BYTES = 32 << 20
 def _native_e2m1_target_fixed_bytes(
     *, target_cell_size_per_token: int, page_size: int
 ) -> int:
-    """Fixed bytes allocated by ``MLATokenToKVPoolNativeE2M1``.
+    """Fixed bytes allocated by either no-shadow native-E2M1 MLA pool.
 
     The target coefficient prices logical cache tokens. The concrete pool also
     owns one padding page and capacity-independent writer/config/runtime state.
@@ -304,7 +305,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             num_layers = kvc.layer_info.num_effective_layers
 
         self._cell_size = self._compute_cell_size(kvc, num_layers)
-        if is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str):
+        if is_native_e2m1_mla_kv_cache_family(self.kv_cache_dtype_str):
             self._target_fixed_bytes = _native_e2m1_target_fixed_bytes(
                 target_cell_size_per_token=self._cell_size,
                 page_size=int(kvc.server_args.page_size),
@@ -344,7 +345,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             draft_num_layers = kvc.spec_aux_config.dflash_draft_num_layers
             use_physical_draft_ring = envs.SGLANG_OMNIVA_DFLASH_DRAFT_RING.get()
             if (
-                is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str)
+                is_native_e2m1_mla_kv_cache_family(self.kv_cache_dtype_str)
                 and not use_physical_draft_ring
             ):
                 raise ValueError(
@@ -387,12 +388,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         turboquant_bits = _get_turboquant_bits(kvc)
         if (
-            is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str)
+            is_native_e2m1_mla_kv_cache_family(self.kv_cache_dtype_str)
             and not kvc.use_mla_backend
         ):
             raise ValueError("Native E2M1 KV cache sizing only supports MLA.")
         if kvc.use_mla_backend:
-            if is_native_e2m1_mla_kv_cache_dtype(self.kv_cache_dtype_str):
+            if is_native_e2m1_mla_kv_cache_family(self.kv_cache_dtype_str):
                 if (
                     model_config.kv_lora_rank != 512
                     or model_config.qk_rope_head_dim != 64
@@ -403,9 +404,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         f"{model_config.kv_lora_rank} and "
                         f"{model_config.qk_rope_head_dim}."
                     )
-                # Exact MLATokenToKVPoolNativeE2M1 row: packed latent uint8,
-                # one BF16 scale, and FP8 RoPE.
-                per_layer_per_token = 512 // 2 + 2 + 64
+                # N8 stores FP8 RoPE (322 bytes); N10 stores reciprocal BF16
+                # RoPE (386 bytes). They share fixed E2M1 codes and one BF16
+                # scale but are deliberately distinct persistent ABIs.
+                rope_bytes = (
+                    64 * 2
+                    if is_native_e2m1_recip_bf16_mla_kv_cache_dtype(
+                        self.kv_cache_dtype_str
+                    )
+                    else 64
+                )
+                per_layer_per_token = 512 // 2 + 2 + rope_bytes
                 cell_size = per_layer_per_token * effective_num_layers
             elif turboquant_bits is not None:
                 # MLA + TurboQuant: nope half is packed k-bit + per-token scale,
