@@ -28,8 +28,10 @@ TokenSpeed decode kernel natively accepts CP rank/world metadata and returns
 the partial log-sum-exp needed by the cross-rank merge.
 """
 
+import json
 import logging
 import math
+import os
 from inspect import signature
 from typing import TYPE_CHECKING, Optional
 
@@ -116,6 +118,24 @@ _N10_ROPE_DIM = 64
 _N10_PAGE_SIZE = 32
 _N10_QUERY_LENGTHS = (1, 5)
 _N10_PAGE_TABLE_TILE_PAGES = 4
+_N10_R3_TELEMETRY_ENV = "SGLANG_TQ_R3_OUTPUT_TELEMETRY"
+_n10_r3_successful_backend_instances = 0
+
+
+def _n10_r3_tensor_identity(tensor: torch.Tensor) -> dict:
+    return {
+        "data_ptr": tensor.data_ptr(),
+        "dtype": str(tensor.dtype),
+        "nbytes": tensor.numel() * tensor.element_size(),
+        "shape": list(tensor.shape),
+    }
+
+
+def _n10_r3_log(event: str, payload: dict) -> None:
+    logger.warning(
+        "TQ_R3_OUTPUT_TELEMETRY %s",
+        json.dumps({"event": event, **payload}, sort_keys=True),
+    )
 
 
 @triton.jit
@@ -896,6 +916,30 @@ class TokenspeedTQE2M1MLABackend(TokenspeedMLABackend):
             self.token_to_kv_pool.get_native_e2m1_fault_status(),
         )
 
+        self._n10_r3_telemetry_enabled = (
+            os.environ.get(_N10_R3_TELEMETRY_ENV) == "1"
+        )
+        self._n10_r3_observed_views = set()
+        if self._n10_r3_telemetry_enabled:
+            global _n10_r3_successful_backend_instances
+            _n10_r3_successful_backend_instances += 1
+            self._n10_r3_instance_ordinal = _n10_r3_successful_backend_instances
+            if self._tokenspeed_workspace is None:
+                raise RuntimeError("R3 telemetry found no production workspace.")
+            _n10_r3_log(
+                "owner_ready_before_graph_output",
+                {
+                    "backend_instance_ordinal": self._n10_r3_instance_ordinal,
+                    "enable_pdmux": model_runner.server_args.enable_pdmux,
+                    "enable_two_batch_overlap": (
+                        model_runner.server_args.enable_two_batch_overlap
+                    ),
+                    "workspace": _n10_r3_tensor_identity(
+                        self._tokenspeed_workspace
+                    ),
+                },
+            )
+
     def _validate_cache_contract(self, model_runner: ModelRunner) -> None:
         from sglang.srt.mem_cache.memory_pool import (
             MLATokenToKVPoolNativeE2M1RecipBF16,
@@ -972,6 +1016,18 @@ class TokenspeedTQE2M1MLABackend(TokenspeedMLABackend):
             device=self.device,
         )
         self._n10_original_output = torch.empty_like(self._n10_rotated_output)
+        if self._n10_r3_telemetry_enabled:
+            _n10_r3_log(
+                "graph_output_ready",
+                {
+                    "backend_instance_ordinal": self._n10_r3_instance_ordinal,
+                    "max_bs": max_bs,
+                    "max_num_tokens": max_num_tokens,
+                    "rotated_output": _n10_r3_tensor_identity(
+                        self._n10_rotated_output
+                    ),
+                },
+            )
 
     def _create_block_kv_indices(
         self,
@@ -1018,6 +1074,28 @@ class TokenspeedTQE2M1MLABackend(TokenspeedMLABackend):
     def _n10_buffers(self, num_tokens: int):
         graph_capacity = getattr(self, "_n10_graph_capacity", 0)
         if num_tokens <= graph_capacity:
+            if self._n10_r3_telemetry_enabled:
+                from sglang.srt.model_executor.runner import get_is_capture_mode
+
+                capture_mode = bool(get_is_capture_mode())
+                observation = (num_tokens, capture_mode)
+                if observation not in self._n10_r3_observed_views:
+                    self._n10_r3_observed_views.add(observation)
+                    rotated_view = self._n10_rotated_output[:num_tokens]
+                    _n10_r3_log(
+                        "graph_output_view",
+                        {
+                            "backend_instance_ordinal": (
+                                self._n10_r3_instance_ordinal
+                            ),
+                            "capture_mode": capture_mode,
+                            "num_tokens": num_tokens,
+                            "parent_data_ptr": (
+                                self._n10_rotated_output.data_ptr()
+                            ),
+                            "view": _n10_r3_tensor_identity(rotated_view),
+                        },
+                    )
             return (
                 self._n10_query_latent[:num_tokens],
                 self._n10_query_rope[:num_tokens],
