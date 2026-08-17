@@ -119,9 +119,7 @@ class TestTQMLAFrontendN10Native(unittest.TestCase):
         cache_rope = torch.randn(
             (tokens * 2, 1, 64), dtype=torch.bfloat16, device=self.device
         )[::2]
-        cos_sin_cache = torch.randn(
-            (256, 64), dtype=torch.float32, device=self.device
-        )
+        cos_sin_cache = torch.randn((256, 64), dtype=torch.float32, device=self.device)
         positions = torch.tensor(
             [3, 17, 31, 63, 127, 191, 255],
             dtype=torch.int64,
@@ -219,6 +217,105 @@ class TestTQMLAFrontendN10Native(unittest.TestCase):
                             self._assert_outputs_equal(s0, s0f)
                             self._assert_outputs_equal(s0f, native)
 
+    def test_native_frontend_accepts_production_576_wide_query_views(self) -> None:
+        from sglang.kernels.jit.tq_mla_frontend_n10_native import (
+            tq_mla_n10_native_frontend_out,
+            tq_mla_n10_native_frontend_rope_out,
+        )
+
+        torch.manual_seed(0xA171)
+        tokens = 5
+        pool_size = 32
+        query_storage = torch.randn(
+            (tokens, 8, 576), dtype=torch.bfloat16, device=self.device
+        )
+        query_latent = query_storage[..., :512]
+        query_rope = query_storage[..., 512:]
+        cache_storage = torch.randn(
+            (tokens, 1, 576), dtype=torch.bfloat16, device=self.device
+        )
+        cache_latent = cache_storage[..., :512]
+        cache_rope = cache_storage[..., 512:]
+        locations = torch.tensor(
+            [31, 1, 17, 0, 9], dtype=torch.int32, device=self.device
+        )
+        cos_sin_cache = torch.randn((64, 64), dtype=torch.float32, device=self.device)
+        positions = torch.tensor(
+            [3, 7, 11, 19, 31], dtype=torch.int64, device=self.device
+        )
+
+        self.assertFalse(query_latent.is_contiguous())
+        self.assertFalse(query_rope.is_contiguous())
+        self.assertEqual(query_latent.stride(), (4608, 576, 1))
+        self.assertEqual(query_rope.stride(), (4608, 576, 1))
+
+        for apply_rope in (False, True):
+            for rotation_fused in (False, True):
+                with self.subTest(apply_rope=apply_rope, rotation_fused=rotation_fused):
+                    expected = self._outputs(tokens, pool_size)
+                    actual = self._outputs(tokens, pool_size)
+                    common_expected = (
+                        query_latent.contiguous(),
+                        query_rope.contiguous(),
+                        cache_latent.contiguous(),
+                        cache_rope.contiguous(),
+                    )
+                    common_actual = (
+                        query_latent,
+                        query_rope,
+                        cache_latent,
+                        cache_rope,
+                    )
+                    if apply_rope:
+                        for common, outputs in (
+                            (common_expected, expected),
+                            (common_actual, actual),
+                        ):
+                            tq_mla_n10_native_frontend_rope_out(
+                                *common,
+                                cos_sin_cache,
+                                positions,
+                                locations,
+                                self.cfg.signs1,
+                                self.cfg.signs2,
+                                *outputs,
+                                grid=self.cfg.grid,
+                                rotation_fused=rotation_fused,
+                            )
+                    else:
+                        for common, outputs in (
+                            (common_expected, expected),
+                            (common_actual, actual),
+                        ):
+                            tq_mla_n10_native_frontend_out(
+                                *common,
+                                locations,
+                                self.cfg.signs1,
+                                self.cfg.signs2,
+                                *outputs,
+                                grid=self.cfg.grid,
+                                rotation_fused=rotation_fused,
+                            )
+                    torch.cuda.synchronize(self.device)
+                    self._assert_outputs_equal(expected, actual)
+
+        bad_query_latent = torch.randn(
+            (tokens, 8, 1024), dtype=torch.bfloat16, device=self.device
+        )[..., ::2]
+        with self.assertRaisesRegex(RuntimeError, "contiguous feature dimension"):
+            tq_mla_n10_native_frontend_out(
+                bad_query_latent,
+                query_rope,
+                cache_latent,
+                cache_rope,
+                locations,
+                self.cfg.signs1,
+                self.cfg.signs2,
+                *self._outputs(tokens, pool_size),
+                grid=self.cfg.grid,
+                rotation_fused=False,
+            )
+
     def test_native_faults_fail_before_write(self) -> None:
         from sglang.kernels.jit.tq_mla_frontend_n10_native import (
             tq_mla_n10_native_frontend_rope_out,
@@ -228,18 +325,12 @@ class TestTQMLAFrontendN10Native(unittest.TestCase):
         query_latent = torch.randn(
             (1, 8, 512), dtype=torch.bfloat16, device=self.device
         )
-        query_rope = torch.randn(
-            (1, 8, 64), dtype=torch.bfloat16, device=self.device
-        )
+        query_rope = torch.randn((1, 8, 64), dtype=torch.bfloat16, device=self.device)
         cache_latent = torch.randn(
             (1, 1, 512), dtype=torch.bfloat16, device=self.device
         )
-        cache_rope = torch.randn(
-            (1, 1, 64), dtype=torch.bfloat16, device=self.device
-        )
-        cos_sin_cache = torch.randn(
-            (8, 64), dtype=torch.float32, device=self.device
-        )
+        cache_rope = torch.randn((1, 1, 64), dtype=torch.bfloat16, device=self.device)
+        cos_sin_cache = torch.randn((8, 64), dtype=torch.float32, device=self.device)
         cases = (
             ("location", 1, torch.tensor([8], device=self.device), None, None),
             (
@@ -369,9 +460,9 @@ class TestTQMLAFrontendN10Native(unittest.TestCase):
         )[::2]
         cache_latent[0].zero_()
         cache_latent[1:33] = cache_latent[1]
-        locations = torch.randperm(
-            pool_size, dtype=torch.int64, device=self.device
-        )[:tokens]
+        locations = torch.randperm(pool_size, dtype=torch.int64, device=self.device)[
+            :tokens
+        ]
         s0f = self._outputs(tokens, pool_size)[2:]
         native = self._outputs(tokens, pool_size)[2:]
         tq_mla_n10_sm100f_cache_writer_out(

@@ -55,6 +55,7 @@ from sglang.kernels.ops.kvcache.kv_indices import (
 )
 from sglang.kernels.ops.quantization.fp8_quantize import fp8_quantize
 from sglang.kernels.ops.quantization.hadamard import hadamard_transform_with_signs
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLAMultiStepDraftBackend,
@@ -836,6 +837,65 @@ class TokenspeedTQE2M1MLABackend(TokenspeedMLABackend):
     supports_custom_decode_mask: bool = False
     supports_ragged_verify_graph: bool = False
 
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        skip_prefill: bool = False,
+        kv_indptr_buf: Optional[torch.Tensor] = None,
+        q_indptr_decode_buf: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            model_runner,
+            skip_prefill,
+            kv_indptr_buf,
+            q_indptr_decode_buf,
+        )
+
+        prefix_capacity = envs.SGLANG_MAX_KV_CHUNK_CAPACITY.get()
+        if prefix_capacity <= 0:
+            raise ValueError(
+                "N10 prefix reconstruction requires a positive "
+                f"SGLANG_MAX_KV_CHUNK_CAPACITY, got {prefix_capacity}."
+            )
+        self._n10_prefix_capacity = prefix_capacity
+        self._n10_prefix_scratch = torch.empty(
+            (prefix_capacity * (_N10_LATENT_DIM + _N10_ROPE_DIM),),
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        latent_elements = prefix_capacity * _N10_LATENT_DIM
+        self._n10_prefix_latent_scratch = self._n10_prefix_scratch[
+            :latent_elements
+        ].view(prefix_capacity, 1, _N10_LATENT_DIM)
+        self._n10_prefix_rope_scratch = self._n10_prefix_scratch[
+            latent_elements:
+        ].view(prefix_capacity, 1, _N10_ROPE_DIM)
+        self._n10_prefix_validation_status = torch.zeros(
+            (1,), dtype=torch.int32, device=self.device
+        )
+
+        # Compile the dedicated prefix extension before serving.  The empty
+        # call performs no row writes and only resets the persistent validation
+        # word; it avoids first-prefix JIT work under the scheduler watchdog.
+        from sglang.kernels.jit.tq_mla_prefix_n10_native import (
+            tq_mla_n10_prefix_gather_out,
+        )
+
+        pool_buffers = self.token_to_kv_pool.get_native_e2m1_recip_bf16_buffers(
+            self.token_to_kv_pool.start_layer
+        )
+        tq_mla_n10_prefix_gather_out(
+            pool_buffers.packed_nope,
+            pool_buffers.nope_scale,
+            pool_buffers.reciprocal_rope,
+            torch.empty((0,), dtype=torch.int32, device=self.device),
+            self.token_to_kv_pool.tq_config.signs1,
+            self.token_to_kv_pool.tq_config.signs2,
+            self._n10_prefix_scratch,
+            self._n10_prefix_validation_status,
+            self.token_to_kv_pool.get_native_e2m1_fault_status(),
+        )
+
     def _validate_cache_contract(self, model_runner: ModelRunner) -> None:
         from sglang.srt.mem_cache.memory_pool import (
             MLATokenToKVPoolNativeE2M1RecipBF16,
@@ -1041,6 +1101,68 @@ class TokenspeedTQE2M1MLABackend(TokenspeedMLABackend):
             rotation_fused=False,
         )
         return query_latent, query_rope, rotated_out, original_out
+
+    def gather_prefix_chunk_latent(
+        self,
+        *,
+        layer: RadixAttention,
+        kv_indices: torch.Tensor,
+        dst_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reconstruct one bounded prefix chunk from the packed N10 pool."""
+
+        if dst_dtype != torch.bfloat16:
+            raise TypeError(
+                "N10 prefix reconstruction emits BF16 for kv_b_proj, "
+                f"got requested dtype {dst_dtype}."
+            )
+        if kv_indices.ndim != 1 or kv_indices.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise TypeError(
+                "N10 prefix indices must be a one-dimensional int32/int64 "
+                f"tensor, got shape={tuple(kv_indices.shape)} "
+                f"dtype={kv_indices.dtype}."
+            )
+        if not kv_indices.is_contiguous():
+            raise ValueError("N10 prefix indices must be contiguous.")
+        num_rows = kv_indices.numel()
+        if num_rows > self._n10_prefix_capacity:
+            raise RuntimeError(
+                "N10 prefix chunk exceeds its graph-stable scratch capacity: "
+                f"{num_rows} > {self._n10_prefix_capacity}."
+            )
+
+        from sglang.kernels.jit.tq_mla_prefix_n10_native import (
+            tq_mla_n10_prefix_gather_out,
+        )
+
+        pool_buffers = self.token_to_kv_pool.get_native_e2m1_recip_bf16_buffers(
+            layer.layer_id
+        )
+        tq_mla_n10_prefix_gather_out(
+            pool_buffers.packed_nope,
+            pool_buffers.nope_scale,
+            pool_buffers.reciprocal_rope,
+            kv_indices,
+            self.token_to_kv_pool.tq_config.signs1,
+            self.token_to_kv_pool.tq_config.signs2,
+            self._n10_prefix_scratch,
+            self._n10_prefix_validation_status,
+            self.token_to_kv_pool.get_native_e2m1_fault_status(),
+        )
+        return (
+            self._n10_prefix_latent_scratch[:num_rows],
+            self._n10_prefix_rope_scratch[:num_rows],
+        )
+
+    def get_n10_prefix_workspace_size_bytes(self) -> int:
+        """Return the exact persistent bytes of the bounded prefix workspace."""
+
+        return (
+            self._n10_prefix_scratch.nbytes + self._n10_prefix_validation_status.nbytes
+        )
 
     def _run_n10_attention(
         self,

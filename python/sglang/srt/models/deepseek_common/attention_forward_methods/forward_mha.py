@@ -466,6 +466,7 @@ class DeepseekMHAForwardMixin:
         # kv_b_proj needs BF16 input, but legacy q.dtype was BF16 by accident.
         backend = _resolve_attn_backend(forward_batch)
         pack_fn = getattr(backend, "pack_prefix_chunk_kv", None)
+        gather_fn = getattr(backend, "gather_prefix_chunk_latent", None)
         kv_a_dtype = torch.bfloat16 if pack_fn is not None else q.dtype
 
         assert forward_batch.num_prefix_chunks is not None
@@ -474,15 +475,27 @@ class DeepseekMHAForwardMixin:
 
             kv_indices = forward_batch.prefix_chunk_kv_indices[i]
             # Fetch latent cache from memory pool with precomputed chunked kv indices
-            kv_a_normed, k_pe = self._get_mla_kv_buffer(
-                kv_indices, kv_a_dtype, forward_batch
-            )
-            kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
-                kv_a_normed,
-                k_pe,
-                forward_batch.prefix_chunk_seq_lens_cpu[i],
-                forward_batch.prefix_chunk_starts_cpu[i],
-            )
+            if gather_fn is not None:
+                kv_a_normed, k_pe = gather_fn(
+                    layer=self.attn_mha,
+                    kv_indices=kv_indices,
+                    dst_dtype=kv_a_dtype,
+                )
+                kv_a_normed = kv_a_normed.squeeze(1)
+                # The typed N10 backend rejects DCP and returns planar views of
+                # one bounded flat scratch. Preserve those views instead
+                # of materializing both at the generic DCP helper's
+                # unconditional contiguous boundary.
+            else:
+                kv_a_normed, k_pe = self._get_mla_kv_buffer(
+                    kv_indices, kv_a_dtype, forward_batch
+                )
+                kv_a_normed, k_pe = all_gather_kv_cache_for_mha_chunk_extend(
+                    kv_a_normed,
+                    k_pe,
+                    forward_batch.prefix_chunk_seq_lens_cpu[i],
+                    forward_batch.prefix_chunk_starts_cpu[i],
+                )
             kv = self.kv_b_proj(kv_a_normed)[0]
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim

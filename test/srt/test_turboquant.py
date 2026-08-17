@@ -18,6 +18,8 @@ import argparse
 import hashlib
 import math
 import os
+import subprocess
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +28,20 @@ import torch
 
 
 class TestTurboQuantCLI(unittest.TestCase):
+
+    def test_server_args_imports_in_a_clean_process(self):
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from sglang.srt.server_args import ServerArgs; print(ServerArgs.__name__)",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ServerArgs")
 
     def test_preserved_kv_cache_dtype_choices_parse(self):
         from sglang.srt.server_args import ServerArgs
@@ -110,7 +126,9 @@ class TestTurboQuantCLI(unittest.TestCase):
                 mla_fused_decode_enabled=True,
             )
 
-    def test_n10_native_e2m1_fails_closed_until_reader_is_wired(self):
+    def test_n10_native_e2m1_accepts_matched_reader_and_rejects_unsupported_paths(
+        self,
+    ):
         from sglang.srt.model_executor.model_runner_components.turboquant_compat import (
             validate_turboquant_transfer_compatibility,
         )
@@ -124,8 +142,7 @@ class TestTurboQuantCLI(unittest.TestCase):
             prefill_attention_backend="tokenspeed_mla",
             decode_attention_backend="tokenspeed_mla",
         )
-        with self.assertRaisesRegex(ValueError, "reader backend is not wired"):
-            validate_turboquant_transfer_compatibility(**common)
+        validate_turboquant_transfer_compatibility(**common)
         with self.assertRaisesRegex(ValueError, "PD disaggregation"):
             validate_turboquant_transfer_compatibility(
                 **(common | {"disaggregation_mode": "prefill"})
@@ -133,6 +150,14 @@ class TestTurboQuantCLI(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "hierarchical/CPU"):
             validate_turboquant_transfer_compatibility(
                 **(common | {"enable_hierarchical_cache": True})
+            )
+        with self.assertRaisesRegex(ValueError, "deterministic"):
+            validate_turboquant_transfer_compatibility(
+                **(common | {"enable_deterministic_inference": True})
+            )
+        with self.assertRaisesRegex(ValueError, "requires an MLA model"):
+            validate_turboquant_transfer_compatibility(
+                **(common | {"use_mla_backend": False})
             )
         with self.assertRaisesRegex(ValueError, "tokenspeed_mla"):
             validate_turboquant_transfer_compatibility(

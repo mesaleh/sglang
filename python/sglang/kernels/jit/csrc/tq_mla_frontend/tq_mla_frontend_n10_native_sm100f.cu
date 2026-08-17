@@ -265,8 +265,12 @@ __device__ __forceinline__ LaneCandidate compute_query_head(
     const __nv_bfloat16* query_latent, const __nv_bfloat16* query_rope,
     const float* signs1, const float* signs2,
     const float* cos_sin_cache, const int64_t* positions,
-    const int64_t cos_sin_stride_t, const int token, const int head,
-    const int lane) {
+    const int64_t cos_sin_stride_t,
+    const int64_t query_latent_stride_t,
+    const int64_t query_latent_stride_h,
+    const int64_t query_rope_stride_t,
+    const int64_t query_rope_stride_h,
+    const int token, const int head, const int lane) {
   LaneCandidate candidate;
   candidate.data0 = 0;
   candidate.data1 = 0;
@@ -275,9 +279,11 @@ __device__ __forceinline__ LaneCandidate compute_query_head(
   candidate.faults = 0;
   candidate.zero_row = false;
   const int64_t latent_base =
-      (static_cast<int64_t>(token) * kQueryHeads + head) * kLatentDim;
+      static_cast<int64_t>(token) * query_latent_stride_t +
+      static_cast<int64_t>(head) * query_latent_stride_h;
   const int64_t rope_base =
-      (static_cast<int64_t>(token) * kQueryHeads + head) * kRopeDim;
+      static_cast<int64_t>(token) * query_rope_stride_t +
+      static_cast<int64_t>(head) * query_rope_stride_h;
 
   float values[16];
 #pragma unroll
@@ -563,7 +569,9 @@ __device__ __forceinline__ void tq_mla_frontend_body(
     uint8_t* packed_cache,
     __nv_bfloat16* scale_cache, __nv_bfloat16* rope_cache,
     int32_t* fault_status, int64_t* zero_count, const int64_t pool_size,
-    const float grid, const int64_t cache_latent_stride_t,
+    const float grid, const int64_t query_latent_stride_t,
+    const int64_t query_latent_stride_h, const int64_t query_rope_stride_t,
+    const int64_t query_rope_stride_h, const int64_t cache_latent_stride_t,
     const int64_t cache_latent_stride_h, const int64_t cache_rope_stride_t,
     const int64_t cache_rope_stride_h, const int64_t packed_stride_s,
     const int64_t packed_stride_h, const int64_t scale_stride_s,
@@ -600,7 +608,8 @@ __device__ __forceinline__ void tq_mla_frontend_body(
   if (warp < kQueryHeads) {
     candidate = compute_query_head<kRotationFused, kApplyRope>(
         query_latent, query_rope, signs1, signs2, cos_sin_cache, positions,
-        cos_sin_stride_t, token, warp, lane);
+        cos_sin_stride_t, query_latent_stride_t, query_latent_stride_h,
+        query_rope_stride_t, query_rope_stride_h, token, warp, lane);
   } else {
     candidate = compute_cache_row<kApplyRope>(
         cache_latent, cache_rope, signs1, signs2, token, grid,
@@ -654,7 +663,9 @@ __global__ void tq_mla_frontend_unfused_kernel(
     uint8_t* packed_cache,
     __nv_bfloat16* scale_cache, __nv_bfloat16* rope_cache,
     int32_t* fault_status, int64_t* zero_count, const int64_t pool_size,
-    const float grid, const int64_t cache_latent_stride_t,
+    const float grid, const int64_t query_latent_stride_t,
+    const int64_t query_latent_stride_h, const int64_t query_rope_stride_t,
+    const int64_t query_rope_stride_h, const int64_t cache_latent_stride_t,
     const int64_t cache_latent_stride_h, const int64_t cache_rope_stride_t,
     const int64_t cache_rope_stride_h, const int64_t packed_stride_s,
     const int64_t packed_stride_h, const int64_t scale_stride_s,
@@ -666,7 +677,9 @@ __global__ void tq_mla_frontend_unfused_kernel(
       query_latent, query_rope, cache_latent, cache_rope, locations, signs1,
       signs2, query_latent_out, query_rope_out, packed_cache, scale_cache,
       rope_cache, fault_status,
-      zero_count, pool_size, grid, cache_latent_stride_t,
+      zero_count, pool_size, grid, query_latent_stride_t,
+      query_latent_stride_h, query_rope_stride_t, query_rope_stride_h,
+      cache_latent_stride_t,
       cache_latent_stride_h, cache_rope_stride_t, cache_rope_stride_h,
       packed_stride_s, packed_stride_h, scale_stride_s,
       rope_cache_stride_s, rope_cache_stride_h, cos_sin_cache, positions,
@@ -682,7 +695,9 @@ __global__ void __launch_bounds__(288, 4) tq_mla_frontend_fused_kernel(
     uint8_t* packed_cache,
     __nv_bfloat16* scale_cache, __nv_bfloat16* rope_cache,
     int32_t* fault_status, int64_t* zero_count, const int64_t pool_size,
-    const float grid, const int64_t cache_latent_stride_t,
+    const float grid, const int64_t query_latent_stride_t,
+    const int64_t query_latent_stride_h, const int64_t query_rope_stride_t,
+    const int64_t query_rope_stride_h, const int64_t cache_latent_stride_t,
     const int64_t cache_latent_stride_h, const int64_t cache_rope_stride_t,
     const int64_t cache_rope_stride_h, const int64_t packed_stride_s,
     const int64_t packed_stride_h, const int64_t scale_stride_s,
@@ -694,7 +709,9 @@ __global__ void __launch_bounds__(288, 4) tq_mla_frontend_fused_kernel(
       query_latent, query_rope, cache_latent, cache_rope, locations, signs1,
       signs2, query_latent_out, query_rope_out, packed_cache, scale_cache,
       rope_cache, fault_status,
-      zero_count, pool_size, grid, cache_latent_stride_t,
+      zero_count, pool_size, grid, query_latent_stride_t,
+      query_latent_stride_h, query_rope_stride_t, query_rope_stride_h,
+      cache_latent_stride_t,
       cache_latent_stride_h, cache_rope_stride_t, cache_rope_stride_h,
       packed_stride_s, packed_stride_h, scale_stride_s,
       rope_cache_stride_s, rope_cache_stride_h, cos_sin_cache, positions,
@@ -1002,6 +1019,8 @@ void launch_frontend(
             reinterpret_cast<__nv_bfloat16*>(rope_cache.data_ptr()),
             fault_status.data_ptr<int32_t>(), zero_count.data_ptr<int64_t>(),
             packed_cache.size(0), grid,
+            query_latent.stride(0), query_latent.stride(1),
+            query_rope.stride(0), query_rope.stride(1),
             cache_latent.stride(0), cache_latent.stride(2),
             cache_rope.stride(0), cache_rope.stride(2),
             packed_cache.stride(0), packed_cache.stride(2),
@@ -1024,6 +1043,8 @@ void launch_frontend(
             reinterpret_cast<__nv_bfloat16*>(rope_cache.data_ptr()),
             fault_status.data_ptr<int32_t>(), zero_count.data_ptr<int64_t>(),
             packed_cache.size(0), grid,
+            query_latent.stride(0), query_latent.stride(1),
+            query_rope.stride(0), query_rope.stride(1),
             cache_latent.stride(0), cache_latent.stride(2),
             cache_rope.stride(0), cache_rope.stride(2),
             packed_cache.stride(0), packed_cache.stride(2),
@@ -1131,8 +1152,8 @@ void tq_mla_n10_native_frontend_out(
   validate_fixed_n10_cache_contract(
       cache_latent, cache_rope, locations, signs1, signs2, packed_cache,
       scale_cache, rope_cache, fault_status, zero_count, grid);
-  check_cuda_contiguous(query_latent, "query_latent");
-  check_cuda_contiguous(query_rope, "query_rope");
+  check_cuda_inner_contiguous(query_latent, "query_latent");
+  check_cuda_inner_contiguous(query_rope, "query_rope");
   check_cuda_contiguous(query_latent_out, "query_latent_out");
   check_cuda_contiguous(query_rope_out, "query_rope_out");
 
@@ -1222,8 +1243,8 @@ void tq_mla_n10_native_frontend_rope_out(
   validate_fixed_n10_cache_contract(
       cache_latent, cache_rope, locations, signs1, signs2, packed_cache,
       scale_cache, rope_cache, fault_status, zero_count, grid);
-  check_cuda_contiguous(query_latent, "query_latent");
-  check_cuda_contiguous(query_rope, "query_rope");
+  check_cuda_inner_contiguous(query_latent, "query_latent");
+  check_cuda_inner_contiguous(query_rope, "query_rope");
   check_cuda_contiguous(cos_sin_cache, "cos_sin_cache");
   check_cuda_contiguous(positions, "positions");
   check_cuda_contiguous(query_latent_out, "query_latent_out");

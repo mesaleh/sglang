@@ -1,10 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.layers.quantization.kv_turboquant import (
-    is_native_e2m1_mla_kv_cache_dtype,
-    is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
-)
-
 
 def validate_turboquant_transfer_compatibility(
     *,
@@ -22,6 +17,14 @@ def validate_turboquant_transfer_compatibility(
         and kv_cache_dtype.startswith("turboquant_")
     ):
         return
+
+    # This module is imported while server_args is still initializing. Import
+    # the quantization package only when validation actually runs, after the
+    # ServerArgs class and its deep-GEMM dependencies are fully defined.
+    from sglang.srt.layers.quantization.kv_turboquant import (
+        is_native_e2m1_mla_kv_cache_dtype,
+        is_native_e2m1_recip_bf16_mla_kv_cache_dtype,
+    )
 
     if is_native_e2m1_mla_kv_cache_dtype(kv_cache_dtype):
         raise ValueError(
@@ -55,11 +58,7 @@ def validate_turboquant_transfer_compatibility(
                 "N10 native E2M1 MLA requires tokenspeed_mla for both "
                 "prefill and decode."
             )
-        raise ValueError(
-            "N10 native E2M1 MLA pool/writer support is present, but its "
-            "matched TokenSpeed reader backend is not wired in this source "
-            "revision. Use a supported --kv-cache-dtype."
-        )
+        return
 
     if disaggregation_mode != "null":
         raise ValueError(
